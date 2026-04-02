@@ -1,4 +1,4 @@
-# ply_loader.rb - Плагин для загрузки PLY файлов в SketchUp
+# ply_import_tool.rb - Плагин для загрузки PLY файлов в SketchUp
 require 'sketchup.rb'
 require 'fiddle'
 
@@ -9,7 +9,7 @@ module PLYLoader
     plugin_dir = File.dirname(script_path)
     
     # Загружаем PLY Importer DLL
-    ply_dll_path = File.join(plugin_dir, "PLYimporterDLL.dll")
+    ply_dll_path = File.join(plugin_dir, "PlyImporter.dll")
     unless File.exist?(ply_dll_path)
       UI.messagebox("Не найден PLY Importer DLL: #{ply_dll_path}")
       @ply_dll_loaded = false

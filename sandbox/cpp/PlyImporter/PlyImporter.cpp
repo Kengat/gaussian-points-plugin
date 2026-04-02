@@ -1,5 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
-#include "PLYimporter.h"
+#include "PlyImporter.h"
 #include <windows.h>
 #include <fstream>
 #include <string>
@@ -33,7 +33,7 @@ bool ReadPLYHeader(std::ifstream& file, PLYHeader& header) {
     // Проверяем первую строку - должна быть "ply"
     std::getline(file, line);
     if (line != "ply") {
-        LogMessage("[PLYimporter] Not a valid PLY file, missing 'ply' header\n");
+        LogMessage("[PlyImporter] Not a valid PLY file, missing 'ply' header\n");
         return false;
     }
 
@@ -42,19 +42,19 @@ bool ReadPLYHeader(std::ifstream& file, PLYHeader& header) {
     if (line.find("format binary_little_endian") != std::string::npos) {
         header.isBinary = true;
         header.isLittleEndian = true;
-        LogMessage("[PLYimporter] Format: binary little endian\n");
+        LogMessage("[PlyImporter] Format: binary little endian\n");
     }
     else if (line.find("format binary_big_endian") != std::string::npos) {
         header.isBinary = true;
         header.isLittleEndian = false;
-        LogMessage("[PLYimporter] Format: binary big endian\n");
+        LogMessage("[PlyImporter] Format: binary big endian\n");
     }
     else if (line.find("format ascii") != std::string::npos) {
         header.isBinary = false;
-        LogMessage("[PLYimporter] Format: ASCII\n");
+        LogMessage("[PlyImporter] Format: ASCII\n");
     }
     else {
-        LogMessage("[PLYimporter] Unknown PLY format: %s\n", line.c_str());
+        LogMessage("[PlyImporter] Unknown PLY format: %s\n", line.c_str());
         return false;
     }
 
@@ -65,24 +65,24 @@ bool ReadPLYHeader(std::ifstream& file, PLYHeader& header) {
         if (line.find("element vertex") != std::string::npos) {
             // Получаем количество вершин
             sscanf(line.c_str(), "element vertex %d", &header.vertexCount);
-            LogMessage("[PLYimporter] Vertex count: %d\n", header.vertexCount);
+            LogMessage("[PlyImporter] Vertex count: %d\n", header.vertexCount);
         }
         else if (line.find("property float") != std::string::npos) {
             // Получаем имя свойства
             std::string propertyName = line.substr(line.rfind(' ') + 1);
             header.propertyNames.push_back(propertyName);
             header.propertyOffsets[propertyName] = header.propertyNames.size() - 1;
-            LogMessage("[PLYimporter] Property: %s (offset: %zu)\n",
+            LogMessage("[PlyImporter] Property: %s (offset: %zu)\n",
                 propertyName.c_str(), header.propertyOffsets[propertyName]);
         }
         else if (line == "end_header") {
             // Конец заголовка
-            LogMessage("[PLYimporter] End of header, found %zu properties\n", header.propertyNames.size());
+            LogMessage("[PlyImporter] End of header, found %zu properties\n", header.propertyNames.size());
             return true;
         }
     }
 
-    LogMessage("[PLYimporter] Error: Incomplete PLY header\n");
+    LogMessage("[PlyImporter] Error: Incomplete PLY header\n");
     return false;
 }
 
@@ -183,22 +183,22 @@ PLYGaussianPoint ConvertToPLYGaussianPoint(const std::vector<float>& vertexData,
 }
 
 extern "C" EXPORT bool LoadPLYFile(const char* filename) {
-    LogMessage("[PLYimporter] Loading PLY file: %s\n", filename);
+    LogMessage("[PlyImporter] Loading PLY file: %s\n", filename);
 
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        LogMessage("[PLYimporter] Error: Could not open file\n");
+        LogMessage("[PlyImporter] Error: Could not open file\n");
         return false;
     }
 
     PLYHeader header;
     if (!ReadPLYHeader(file, header)) {
-        LogMessage("[PLYimporter] Error: Failed to parse PLY header\n");
+        LogMessage("[PlyImporter] Error: Failed to parse PLY header\n");
         return false;
     }
 
     if (header.vertexCount == 0) {
-        LogMessage("[PLYimporter] Error: No vertices in file\n");
+        LogMessage("[PlyImporter] Error: No vertices in file\n");
         return false;
     }
 
@@ -206,11 +206,11 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
     std::vector<float> firstVertex = ReadVertex(file, header);
 
     if (firstVertex.size() != header.propertyNames.size()) {
-        LogMessage("[PLYimporter] Error: Vertex data size mismatch\n");
+        LogMessage("[PlyImporter] Error: Vertex data size mismatch\n");
         return false;
     }
 
-    LogMessage("[PLYimporter] First vertex properties:\n");
+    LogMessage("[PlyImporter] First vertex properties:\n");
 
     // Позиция (x, y, z)
     if (header.propertyOffsets.count("x") > 0 &&
@@ -284,30 +284,30 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
         }
     }
 
-    LogMessage("[PLYimporter] PLY file loaded and analyzed successfully\n");
+    LogMessage("[PlyImporter] PLY file loaded and analyzed successfully\n");
     return true;
 }
 
 // Новая функция для загрузки всех данных
 extern "C" EXPORT int LoadPLYData(const char* filename, PLYGaussianPoint** points) {
-    LogMessage("[PLYimporter] Loading PLY data from: %s\n", filename);
+    LogMessage("[PlyImporter] Loading PLY data from: %s\n", filename);
 
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        LogMessage("[PLYimporter] Error: Could not open file\n");
+        LogMessage("[PlyImporter] Error: Could not open file\n");
         return 0;
     }
 
     PLYHeader header;
     if (!ReadPLYHeader(file, header)) {
-        LogMessage("[PLYimporter] Error: Failed to parse PLY header\n");
+        LogMessage("[PlyImporter] Error: Failed to parse PLY header\n");
         return 0;
     }
 
     // Выделяем память для массива точек
     *points = new PLYGaussianPoint[header.vertexCount];
     if (!(*points)) {
-        LogMessage("[PLYimporter] Error: Memory allocation failed\n");
+        LogMessage("[PlyImporter] Error: Memory allocation failed\n");
         return 0;
     }
 
@@ -317,7 +317,7 @@ extern "C" EXPORT int LoadPLYData(const char* filename, PLYGaussianPoint** point
         (*points)[i] = ConvertToPLYGaussianPoint(vertexData, header);
     }
 
-    LogMessage("[PLYimporter] Successfully loaded %d points\n", header.vertexCount);
+    LogMessage("[PlyImporter] Successfully loaded %d points\n", header.vertexCount);
     return header.vertexCount;
 }
 
@@ -325,17 +325,17 @@ extern "C" EXPORT int LoadPLYData(const char* filename, PLYGaussianPoint** point
 extern "C" EXPORT void FreePLYData(PLYGaussianPoint* points) {
     if (points) {
         delete[] points;
-        LogMessage("[PLYimporter] PLY data memory freed\n");
+        LogMessage("[PlyImporter] PLY data memory freed\n");
     }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
-        LogMessage("[PLYimporter] DLL_PROCESS_ATTACH\n");
+        LogMessage("[PlyImporter] DLL_PROCESS_ATTACH\n");
         break;
     case DLL_PROCESS_DETACH:
-        LogMessage("[PLYimporter] DLL_PROCESS_DETACH\n");
+        LogMessage("[PlyImporter] DLL_PROCESS_DETACH\n");
         break;
     }
     return TRUE;

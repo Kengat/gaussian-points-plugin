@@ -1,5 +1,5 @@
-#ifndef TESTRENDERER_H
-#define TESTRENDERER_H
+#ifndef GAUSSIAN_SPLAT_RENDERER_H
+#define GAUSSIAN_SPLAT_RENDERER_H
 
 #ifdef _WIN32
 #define EXPORT __declspec(dllexport)
@@ -44,4 +44,4 @@ extern "C" {
 }
 #endif
 
-#endif // TESTRENDERER_H
+#endif // GAUSSIAN_SPLAT_RENDERER_H

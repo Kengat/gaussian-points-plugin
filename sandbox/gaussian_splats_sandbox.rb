@@ -1,4 +1,4 @@
-# test.rb - Модифицированный скрипт для работы с тремя DLL
+﻿# gaussian_splats_sandbox.rb - Песочница для работы с тремя DLL
 require 'fiddle'
 require 'fiddle/import'
 require 'sketchup.rb'
@@ -42,9 +42,21 @@ module GaussianSplats
   def self.setup_dlls
     script_path = File.expand_path(__FILE__)
     plugin_dir = File.dirname(script_path)
+    path_entries = ENV.fetch('PATH', '').split(File::PATH_SEPARATOR)
+    unless path_entries.include?(plugin_dir)
+      ENV['PATH'] = ([plugin_dir] + path_entries).join(File::PATH_SEPARATOR)
+    end
+    @support_dlls = []
+    
+    %w[glew32.dll minhook.x64.dll].each do |dll_name|
+      dll_path = File.join(plugin_dir, dll_name)
+      next unless File.exist?(dll_path)
+    
+      @support_dlls << Fiddle.dlopen(dll_path)
+    end
     
     # Загрузка Hook DLL
-    hook_dll_path = File.join(plugin_dir, "testHookDLL.dll")
+    hook_dll_path = File.join(plugin_dir, "SketchUpOverlayBridge.dll")
     unless File.exist?(hook_dll_path)
       UI.messagebox("Не найден Hook DLL: #{hook_dll_path}")
       @hook_dll_loaded = false
@@ -56,7 +68,7 @@ module GaussianSplats
     @hook_dll_loaded = true
     
     # Загрузка Renderer DLL
-    renderer_dll_path = File.join(plugin_dir, "testRendererDLL.dll")
+    renderer_dll_path = File.join(plugin_dir, "GaussianSplatRenderer.dll")
     unless File.exist?(renderer_dll_path)
       UI.messagebox("Не найден Renderer DLL: #{renderer_dll_path}")
       @renderer_dll_loaded = false
@@ -68,7 +80,7 @@ module GaussianSplats
     @renderer_dll_loaded = true
     
     # Загрузка PLY Importer DLL
-    ply_dll_path = File.join(plugin_dir, "PLYimporterDLL.dll")
+    ply_dll_path = File.join(plugin_dir, "PlyImporter.dll")
     unless File.exist?(ply_dll_path)
       UI.messagebox("Не найден PLY Importer DLL: #{ply_dll_path}")
       @ply_dll_loaded = false
@@ -130,7 +142,7 @@ module GaussianSplats
   end
   
   # Принудительный вызов рендеринга
-  def self.render_test
+  def self.render_splats
     return unless @renderer_dll_loaded
     
     puts "Принудительный вызов renderPointCloud..."
@@ -209,7 +221,7 @@ unless file_loaded?(__FILE__)
   menu.add_item("Инициализировать") { GaussianSplats.init_plugin }
   menu.add_item("Загрузить PLY (анализ)") { GaussianSplats.analyze_ply }
   menu.add_item("Загрузить кляксы из PLY") { GaussianSplats.load_ply_splats }
-  menu.add_item("Показать кляксы") { GaussianSplats.render_test }
+  menu.add_item("Показать кляксы") { GaussianSplats.render_splats }
   menu.add_item("Очистить кляксы") { GaussianSplats.clear_splats }
   menu.add_item("Остановить") { GaussianSplats.stop_plugin }
   
@@ -226,3 +238,4 @@ unless file_loaded?(__FILE__)
   
   file_loaded(__FILE__)
 end
+

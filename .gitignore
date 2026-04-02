@@ -5,7 +5,8 @@ cpp/OctreeProcessorDLL/Libraries/nanoflann/.git/
 # Build output
 cpp/build/
 cpp/libE57/build/
-test/cpp/build/
+sandbox/cpp/build/
+external/SketchUpSDK/
 
 # IDE and compiler cache
 **/.vs/

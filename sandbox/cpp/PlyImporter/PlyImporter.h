@@ -1,5 +1,5 @@
-#ifndef PLYIMPORTER_H
-#define PLYIMPORTER_H
+#ifndef PLY_IMPORTER_H
+#define PLY_IMPORTER_H
 
 #ifdef _WIN32
 #define EXPORT __declspec(dllexport)
@@ -35,4 +35,4 @@ extern "C" {
 }
 #endif
 
-#endif // PLYIMPORTER_H
+#endif // PLY_IMPORTER_H
