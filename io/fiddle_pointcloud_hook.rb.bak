@@ -1,0 +1,28 @@
+require 'fiddle'
+require 'fiddle/import'
+
+module GaussianPoints
+  module Hook
+    extend Fiddle::Importer
+
+    dll_path = File.join(File.dirname(__FILE__), "..", "PointCloudHookDLL.dll")
+    dlload dll_path
+
+    extern 'void InstallAllHooks()'
+    extern 'void SetPointCloudData(const double*, int)'
+
+    def self.install_hooks
+      InstallAllHooks()
+    end
+
+    # Передаёт массив точек [x,y,z,r,g,b,...] в Hook-DLL
+    def self.set_pointcloud(data)
+      count = data.size / 6
+      mem = Fiddle::Pointer.malloc(data.size * Fiddle::SIZEOF_DOUBLE)
+      mem[0, data.size * Fiddle::SIZEOF_DOUBLE] = data.pack("d*")
+      SetPointCloudData(mem, count)
+    end
+  end
+end
+
+GaussianPoints::Hook.install_hooks

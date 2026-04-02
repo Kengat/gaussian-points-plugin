@@ -1,0 +1,23 @@
+# Embedded git metadata from vendored dependencies
+cpp/libE57/.git/
+cpp/OctreeProcessorDLL/Libraries/nanoflann/.git/
+
+# Build output
+cpp/build/
+cpp/libE57/build/
+test/cpp/build/
+
+# IDE and compiler cache
+**/.vs/
+*.VC.db
+*.VC.opendb
+*.suo
+*.ipch
+*.iobj
+*.ipdb
+*.obj
+*.pdb
+*.ilk
+*.tlog
+*.recipe
+*.lastbuildstate
