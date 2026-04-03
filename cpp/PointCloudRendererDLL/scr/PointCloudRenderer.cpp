@@ -8,8 +8,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -35,6 +37,31 @@ bool g_gpu_data_dirty = false;
 GLuint g_program = 0;
 GLuint g_vao = 0;
 GLuint g_vbo = 0;
+
+struct PointCloudObject {
+  std::string id;
+  std::vector<float> points;
+  float base_half_extents[3] = {1.0f, 1.0f, 1.0f};
+  double center_xyz[3] = {0.0, 0.0, 0.0};
+  double half_extents_xyz[3] = {1.0, 1.0, 1.0};
+  double axes_xyz[9] = {
+      1.0, 0.0, 0.0,
+      0.0, 1.0, 0.0,
+      0.0, 0.0, 1.0};
+  bool visible = true;
+  int highlight_mode = 0;
+};
+
+std::vector<PointCloudObject> g_pointcloud_objects;
+constexpr int kHighlightNone = 0;
+constexpr int kHighlightHover = 1;
+constexpr int kHighlightSelected = 2;
+
+extern "C" EXPORT int SetPointCloudObjectData(const char* object_id, const double* points_in, int count);
+extern "C" EXPORT int SetPointCloudObjectTransform(const char* object_id, const double* center_xyz, const double* half_extents_xyz, const double* axes_xyz, int visible);
+extern "C" EXPORT int SetPointCloudObjectHighlight(const char* object_id, int highlight_mode);
+extern "C" EXPORT int RemovePointCloudObject(const char* object_id);
+extern "C" EXPORT void ClearPointCloudObjects();
 
 void LogMessage(const char* format, ...) {
   char buffer[1024];
@@ -166,6 +193,65 @@ bool IsPointInsideClip(const ClipBoxState& clip_box, float x, float y, float z) 
       std::fabs(local_z) <= clip_box.half_extents_xyz[2];
 }
 
+PointCloudObject* FindObject(const char* object_id) {
+  if (object_id == nullptr) {
+    return nullptr;
+  }
+
+  for (PointCloudObject& object : g_pointcloud_objects) {
+    if (object.id == object_id) {
+      return &object;
+    }
+  }
+
+  return nullptr;
+}
+
+PointCloudObject& UpsertObject(const char* object_id) {
+  PointCloudObject* existing = FindObject(object_id);
+  if (existing) {
+    return *existing;
+  }
+
+  PointCloudObject object;
+  object.id = object_id ? object_id : "";
+  g_pointcloud_objects.push_back(object);
+  return g_pointcloud_objects.back();
+}
+
+void ResetObjectTransform(PointCloudObject& object) {
+  object.visible = true;
+  object.highlight_mode = kHighlightNone;
+  object.axes_xyz[0] = 1.0; object.axes_xyz[1] = 0.0; object.axes_xyz[2] = 0.0;
+  object.axes_xyz[3] = 0.0; object.axes_xyz[4] = 1.0; object.axes_xyz[5] = 0.0;
+  object.axes_xyz[6] = 0.0; object.axes_xyz[7] = 0.0; object.axes_xyz[8] = 1.0;
+}
+
+void TransformPoint(const PointCloudObject& object, float local_x, float local_y, float local_z, float* out_xyz) {
+  const double sx = object.base_half_extents[0] > 1.0e-6f ? (object.half_extents_xyz[0] / object.base_half_extents[0]) : 1.0;
+  const double sy = object.base_half_extents[1] > 1.0e-6f ? (object.half_extents_xyz[1] / object.base_half_extents[1]) : 1.0;
+  const double sz = object.base_half_extents[2] > 1.0e-6f ? (object.half_extents_xyz[2] / object.base_half_extents[2]) : 1.0;
+  const double scaled_x = static_cast<double>(local_x) * sx;
+  const double scaled_y = static_cast<double>(local_y) * sy;
+  const double scaled_z = static_cast<double>(local_z) * sz;
+
+  out_xyz[0] = static_cast<float>(
+      object.center_xyz[0] +
+      (object.axes_xyz[0] * scaled_x) +
+      (object.axes_xyz[3] * scaled_y) +
+      (object.axes_xyz[6] * scaled_z));
+  out_xyz[1] = static_cast<float>(
+      object.center_xyz[1] +
+      (object.axes_xyz[1] * scaled_x) +
+      (object.axes_xyz[4] * scaled_y) +
+      (object.axes_xyz[7] * scaled_z));
+  out_xyz[2] = static_cast<float>(
+      object.center_xyz[2] +
+      (object.axes_xyz[2] * scaled_x) +
+      (object.axes_xyz[5] * scaled_y) +
+      (object.axes_xyz[8] * scaled_z));
+}
+
 bool InitializeRenderer() {
   if (g_program != 0) {
     return true;
@@ -273,20 +359,80 @@ void UploadPointDataIfNeeded() {
   g_gpu_data_dirty = false;
 }
 
+void HighlightColorForMode(int highlight_mode, float* r, float* g, float* b, float* a) {
+  if (highlight_mode == kHighlightHover) {
+    *r = 1.0f; *g = 0.58f; *b = 0.04f; *a = 1.0f;
+  } else {
+    *r = 1.0f; *g = 0.84f; *b = 0.08f; *a = 1.0f;
+  }
+}
+
+float HighlightMaskPointSizeForMode(int highlight_mode) {
+  return highlight_mode == kHighlightHover ? 13.0f : 11.0f;
+}
+
+float HighlightOutlinePointSizeForMode(int highlight_mode) {
+  return highlight_mode == kHighlightHover ? 20.0f : 16.0f;
+}
+
+void DrawPointCloudObject(
+    const PointCloudObject& object,
+    const ClipBoxState& clip_box,
+    bool highlight_pass) {
+  const GLsizei object_point_count = static_cast<GLsizei>(object.points.size() / 7);
+  float r = 0.0f;
+  float g = 0.0f;
+  float b = 0.0f;
+  float a = 1.0f;
+  if (highlight_pass) {
+    HighlightColorForMode(object.highlight_mode, &r, &g, &b, &a);
+  }
+
+  glBegin(GL_POINTS);
+  for (GLsizei i = 0; i < object_point_count; ++i) {
+    const size_t base = static_cast<size_t>(i) * 7;
+    float world[3] = {0.0f, 0.0f, 0.0f};
+    TransformPoint(object, object.points[base + 0], object.points[base + 1], object.points[base + 2], world);
+    if (!IsPointInsideClip(clip_box, world[0], world[1], world[2])) {
+      continue;
+    }
+
+    if (highlight_pass) {
+      glColor4f(r, g, b, a);
+    } else {
+      glColor4f(
+          object.points[base + 3],
+          object.points[base + 4],
+          object.points[base + 5],
+          object.points[base + 6]);
+    }
+    glVertex3f(world[0], world[1], world[2]);
+  }
+  glEnd();
+}
+
 }  // namespace
 
 extern "C" EXPORT void SetPointCloud(const double* points_in, int count) {
+  ClearPointCloudObjects();
   if (points_in == nullptr || count <= 0) {
     LogMessage("SetPointCloud called with invalid input.");
-    g_points.clear();
-    g_data_ready = false;
-    g_gpu_data_dirty = false;
     return;
   }
 
-  LogMessage("SetPointCloud received %d points.", count);
-  g_points.clear();
-  g_points.reserve(static_cast<size_t>(count) * 7);
+  SetPointCloudObjectData("__legacy__", points_in, count);
+}
+
+extern "C" EXPORT int SetPointCloudObjectData(const char* object_id, const double* points_in, int count) {
+  if (object_id == nullptr || points_in == nullptr || count <= 0) {
+    LogMessage("SetPointCloudObjectData received invalid input.");
+    return 0;
+  }
+
+  PointCloudObject& object = UpsertObject(object_id);
+  object.points.clear();
+  object.points.reserve(static_cast<size_t>(count) * 7);
+  ResetObjectTransform(object);
 
   float min_x = 0.0f;
   float min_y = 0.0f;
@@ -315,37 +461,96 @@ extern "C" EXPORT void SetPointCloud(const double* points_in, int count) {
       if (z > max_z) max_z = z;
     }
 
-    g_points.push_back(x);
-    g_points.push_back(y);
-    g_points.push_back(z);
-    g_points.push_back(static_cast<float>(points_in[i * 6 + 3]) / 255.0f);
-    g_points.push_back(static_cast<float>(points_in[i * 6 + 4]) / 255.0f);
-    g_points.push_back(static_cast<float>(points_in[i * 6 + 5]) / 255.0f);
-    g_points.push_back(1.0f);
+    object.points.push_back(x);
+    object.points.push_back(y);
+    object.points.push_back(z);
+    object.points.push_back(static_cast<float>(points_in[i * 6 + 3]) / 255.0f);
+    object.points.push_back(static_cast<float>(points_in[i * 6 + 4]) / 255.0f);
+    object.points.push_back(static_cast<float>(points_in[i * 6 + 5]) / 255.0f);
+    object.points.push_back(1.0f);
   }
 
   if (have_bounds) {
-    LogMessage(
-        "Bounds min=(%.3f, %.3f, %.3f) max=(%.3f, %.3f, %.3f)",
-        min_x, min_y, min_z, max_x, max_y, max_z);
+    object.base_half_extents[0] = ((max_x - min_x) * 0.5f > 0.001f) ? ((max_x - min_x) * 0.5f) : 0.001f;
+    object.base_half_extents[1] = ((max_y - min_y) * 0.5f > 0.001f) ? ((max_y - min_y) * 0.5f) : 0.001f;
+    object.base_half_extents[2] = ((max_z - min_z) * 0.5f > 0.001f) ? ((max_z - min_z) * 0.5f) : 0.001f;
+    object.half_extents_xyz[0] = object.base_half_extents[0];
+    object.half_extents_xyz[1] = object.base_half_extents[1];
+    object.half_extents_xyz[2] = object.base_half_extents[2];
   }
 
-  g_data_ready = true;
+  g_data_ready = !g_pointcloud_objects.empty();
   g_gpu_data_dirty = true;
+  LogMessage("SetPointCloudObjectData stored %d points for '%s'.", count, object.id.c_str());
+  return 1;
+}
+
+extern "C" EXPORT int SetPointCloudObjectTransform(
+    const char* object_id,
+    const double* center_xyz,
+    const double* half_extents_xyz,
+    const double* axes_xyz,
+    int visible) {
+  PointCloudObject* object = FindObject(object_id);
+  if (object == nullptr) {
+    return 0;
+  }
+
+  if (center_xyz != nullptr) {
+    memcpy(object->center_xyz, center_xyz, sizeof(object->center_xyz));
+  }
+  if (half_extents_xyz != nullptr) {
+    memcpy(object->half_extents_xyz, half_extents_xyz, sizeof(object->half_extents_xyz));
+  }
+  if (axes_xyz != nullptr) {
+    memcpy(object->axes_xyz, axes_xyz, sizeof(object->axes_xyz));
+  }
+  object->visible = visible != 0;
+  g_data_ready = !g_pointcloud_objects.empty();
+  return 1;
+}
+
+extern "C" EXPORT int SetPointCloudObjectHighlight(const char* object_id, int highlight_mode) {
+  PointCloudObject* object = FindObject(object_id);
+  if (object == nullptr) {
+    return 0;
+  }
+
+  object->highlight_mode = highlight_mode;
+  return 1;
+}
+
+extern "C" EXPORT int RemovePointCloudObject(const char* object_id) {
+  if (object_id == nullptr) {
+    return 0;
+  }
+
+  const auto new_end = std::remove_if(
+      g_pointcloud_objects.begin(),
+      g_pointcloud_objects.end(),
+      [object_id](const PointCloudObject& object) { return object.id == object_id; });
+  if (new_end == g_pointcloud_objects.end()) {
+    return 0;
+  }
+
+  g_pointcloud_objects.erase(new_end, g_pointcloud_objects.end());
+  g_data_ready = !g_pointcloud_objects.empty();
+  return 1;
+}
+
+extern "C" EXPORT void ClearPointCloudObjects() {
+  g_pointcloud_objects.clear();
+  g_points.clear();
+  g_data_ready = false;
+  g_gpu_data_dirty = false;
 }
 
 extern "C" EXPORT void renderPointCloud() {
-  if (!g_data_ready || g_points.empty()) {
+  if (!g_data_ready || g_pointcloud_objects.empty()) {
     return;
   }
 
   if (!LoadHookFunctions() || !InitializeRenderer()) {
-    return;
-  }
-
-  UploadPointDataIfNeeded();
-  if (g_gpu_data_dirty) {
-    LogMessage("GPU upload is still pending. Skipping frame.");
     return;
   }
 
@@ -368,11 +573,21 @@ extern "C" EXPORT void renderPointCloud() {
   GLint old_vao = 0;
   GLint old_array_buffer = 0;
   GLint old_matrix_mode = 0;
+  GLint stencil_bits = 0;
+  GLint old_stencil_func = GL_ALWAYS;
+  GLint old_stencil_ref = 0;
+  GLint old_stencil_value_mask = ~0;
+  GLint old_stencil_write_mask = ~0;
+  GLint old_stencil_fail = GL_KEEP;
+  GLint old_stencil_zfail = GL_KEEP;
+  GLint old_stencil_zpass = GL_KEEP;
   GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
   GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+  GLboolean stencil_enabled = glIsEnabled(GL_STENCIL_TEST);
   GLboolean program_point_size_enabled = glIsEnabled(GL_PROGRAM_POINT_SIZE);
   GLboolean texture_2d_enabled = glIsEnabled(GL_TEXTURE_2D);
   GLboolean depth_mask = GL_TRUE;
+  GLboolean color_mask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
   GLint old_depth_func = GL_LESS;
   GLint old_blend_src_rgb = GL_ONE;
   GLint old_blend_dst_rgb = GL_ZERO;
@@ -385,11 +600,20 @@ extern "C" EXPORT void renderPointCloud() {
   glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array_buffer);
   glGetIntegerv(GL_MATRIX_MODE, &old_matrix_mode);
   glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+  glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
+  glGetIntegerv(GL_STENCIL_BITS, &stencil_bits);
   glGetIntegerv(GL_DEPTH_FUNC, &old_depth_func);
   glGetIntegerv(GL_BLEND_SRC_RGB, &old_blend_src_rgb);
   glGetIntegerv(GL_BLEND_DST_RGB, &old_blend_dst_rgb);
   glGetIntegerv(GL_BLEND_SRC_ALPHA, &old_blend_src_alpha);
   glGetIntegerv(GL_BLEND_DST_ALPHA, &old_blend_dst_alpha);
+  glGetIntegerv(GL_STENCIL_FUNC, &old_stencil_func);
+  glGetIntegerv(GL_STENCIL_REF, &old_stencil_ref);
+  glGetIntegerv(GL_STENCIL_VALUE_MASK, &old_stencil_value_mask);
+  glGetIntegerv(GL_STENCIL_WRITEMASK, &old_stencil_write_mask);
+  glGetIntegerv(GL_STENCIL_FAIL, &old_stencil_fail);
+  glGetIntegerv(GL_STENCIL_PASS_DEPTH_FAIL, &old_stencil_zfail);
+  glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &old_stencil_zpass);
   glGetFloatv(GL_POINT_SIZE, &old_point_size);
 
   glEnable(GL_DEPTH_TEST);
@@ -410,31 +634,64 @@ extern "C" EXPORT void renderPointCloud() {
   glLoadMatrixf(view_gl);
   glPointSize(4.0f);
 
-  const GLsizei point_count = static_cast<GLsizei>(g_points.size() / 7);
-  GLsizei visible_count = 0;
-  glBegin(GL_POINTS);
-  for (GLsizei i = 0; i < point_count; ++i) {
-    const size_t base = static_cast<size_t>(i) * 7;
-    if (!IsPointInsideClip(
-            clip_box,
-            g_points[base + 0],
-            g_points[base + 1],
-            g_points[base + 2])) {
+  GLsizei point_count = 0;
+  for (const PointCloudObject& object : g_pointcloud_objects) {
+    if (!object.visible) {
       continue;
     }
-    ++visible_count;
-    glColor4f(
-        g_points[base + 3],
-        g_points[base + 4],
-        g_points[base + 5],
-        g_points[base + 6]);
-    glVertex3f(
-        g_points[base + 0],
-        g_points[base + 1],
-        g_points[base + 2]);
+
+    point_count += static_cast<GLsizei>(object.points.size() / 7);
+    DrawPointCloudObject(object, clip_box, false);
   }
-  glEnd();
-  LogMessage("Rendering %d visible points (of %d).", visible_count, point_count);
+  LogMessage("Rendering %d points.", point_count);
+
+  bool has_highlighted_objects = false;
+  for (const PointCloudObject& object : g_pointcloud_objects) {
+    if (object.visible && object.highlight_mode != kHighlightNone) {
+      has_highlighted_objects = true;
+      break;
+    }
+  }
+
+  if (has_highlighted_objects && stencil_bits > 0) {
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0x80);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    glStencilFunc(GL_ALWAYS, 0x80, 0x80);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glDepthMask(GL_FALSE);
+
+    for (const PointCloudObject& object : g_pointcloud_objects) {
+      if (!object.visible || object.highlight_mode == kHighlightNone) {
+        continue;
+      }
+
+      glPointSize(HighlightMaskPointSizeForMode(object.highlight_mode));
+      DrawPointCloudObject(object, clip_box, false);
+    }
+
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glStencilMask(0x00);
+    glStencilFunc(GL_NOTEQUAL, 0x80, 0x80);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    for (const PointCloudObject& object : g_pointcloud_objects) {
+      if (!object.visible || object.highlight_mode == kHighlightNone) {
+        continue;
+      }
+
+      glPointSize(HighlightOutlinePointSizeForMode(object.highlight_mode));
+      DrawPointCloudObject(object, clip_box, true);
+    }
+
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glDepthMask(GL_TRUE);
+  }
 
   GLenum err = glGetError();
   if (err != GL_NO_ERROR) {
@@ -465,6 +722,15 @@ extern "C" EXPORT void renderPointCloud() {
     glDisable(GL_BLEND);
   }
 
+  if (stencil_enabled) {
+    glEnable(GL_STENCIL_TEST);
+  } else {
+    glDisable(GL_STENCIL_TEST);
+  }
+  glStencilFunc(old_stencil_func, old_stencil_ref, old_stencil_value_mask);
+  glStencilMask(old_stencil_write_mask);
+  glStencilOp(old_stencil_fail, old_stencil_zfail, old_stencil_zpass);
+  glColorMask(color_mask[0], color_mask[1], color_mask[2], color_mask[3]);
   glDepthMask(depth_mask);
 
   if (program_point_size_enabled) {

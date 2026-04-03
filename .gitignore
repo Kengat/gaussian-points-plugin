@@ -23,3 +23,7 @@ external/SketchUpSDK/
 *.tlog
 *.recipe
 *.lastbuildstate
+
+# Source artwork backups
+ui/icons_originals/
+ui/icons/*.tmp.png

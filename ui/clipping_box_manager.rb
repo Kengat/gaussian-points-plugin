@@ -200,8 +200,9 @@ module GaussianPoints
       end
 
       def uniformly_scaled_snapshot(state, delta)
+        factor = uniform_scale_factor(state, delta)
         new_half_extents = state[:half_extents].transform_values do |value|
-          [value.to_f + delta.to_f, MIN_BOX_SIZE * 0.5].max
+          [value.to_f * factor, MIN_BOX_SIZE * 0.5].max
         end
 
         {
@@ -546,6 +547,16 @@ module GaussianPoints
         HANDLE_IDS.include?(handle_id) ? handle_id : HANDLE_NONE
       end
 
+      def uniform_scale_factor(state, delta)
+        values = state[:half_extents].values.map { |value| [value.to_f, MIN_BOX_SIZE * 0.5].max }
+        reference = values.max
+        return 1.0 if reference <= 1.0e-8
+
+        raw_factor = (reference + delta.to_f) / reference
+        min_factor = values.map { |value| (MIN_BOX_SIZE * 0.5) / value }.max
+        [raw_factor, min_factor].max
+      end
+
       def box_defined_for_state?(state)
         if state
           state[:center] && state[:half_extents] && state[:axes]
@@ -715,10 +726,11 @@ module GaussianPoints
 
           color = handle_color(handle_id)
           highlighted = hovered_handle == handle_id || active_handle == handle_id
+          draw_color = highlighted ? brighten(color) : color
           view.line_width = highlighted ? 4 : 2
-          view.drawing_color = highlighted ? brighten(color) : color
+          view.drawing_color = draw_color
           view.draw(GL_LINES, segment)
-          view.draw_points([segment.last], highlighted ? 14 : 10, 3, view.drawing_color)
+          view.draw_points([segment.last], highlighted ? 14 : 10, 3, draw_color)
         end
 
         PLANE_HANDLE_IDS.each do |handle_id|
@@ -755,8 +767,9 @@ module GaussianPoints
           highlighted = hovered_handle == handle_id || active_handle == handle_id
           point = handle_point(handle_id, view)
           size = highlighted ? 16 : 12
-          view.drawing_color = highlighted ? brighten(handle_color(handle_id)) : handle_color(handle_id)
-          view.draw_points([point], size, 1, view.drawing_color)
+          draw_color = highlighted ? brighten(handle_color(handle_id)) : handle_color(handle_id)
+          view.drawing_color = draw_color
+          view.draw_points([point], size, 1, draw_color)
         end
       end
 
@@ -823,7 +836,7 @@ module GaussianPoints
       end
 
       def select_editor_tool
-        Sketchup.active_model&.select_tool(ClippingBoxTool.new)
+        Sketchup.active_model&.select_tool(OrientedBoxGizmoTool.new(self))
       end
 
       def release_editor_tool

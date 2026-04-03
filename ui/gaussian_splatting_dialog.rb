@@ -373,8 +373,15 @@ module GaussianPoints
         end
 
         @@dialog.add_action_callback('load_ply') do |_ctx|
-          ok = GaussianPoints::GaussianSplats.load_ply_splats
-          push_state(ok ? 'Gaussian splats loaded into the current scene.' : 'PLY load was cancelled or failed.', ok ? 'ok' : 'warn')
+          filename = UI.openpanel('Choose a Gaussian PLY file', '', 'PLY Files|*.ply||')
+          item =
+            if filename
+              GaussianPoints::UIparts::RenderItemRegistry.register_gaussian_file(
+                name: File.basename(filename),
+                filename: filename
+              )
+            end
+          push_state(item ? 'Gaussian splats loaded into the current scene.' : 'PLY load was cancelled or failed.', item ? 'ok' : 'warn')
         end
 
         @@dialog.add_action_callback('render_now') do |_ctx|
@@ -383,7 +390,10 @@ module GaussianPoints
         end
 
         @@dialog.add_action_callback('clear_splats') do |_ctx|
-          ok = GaussianPoints::GaussianSplats.clear_splats
+          GaussianPoints::UIparts::RenderItemRegistry.gaussian_items.each do |item|
+            GaussianPoints::UIparts::RenderItemRegistry.remove_item(item[:id])
+          end
+          ok = true
           push_state(ok ? 'Cleared current Gaussian splats.' : 'Nothing was cleared.', ok ? 'ok' : 'warn')
         end
       end

@@ -52,6 +52,8 @@ struct ClipBoxState {
 };
 
 ClipBoxState g_clip_box = {};
+ClipBoxState g_move_tool_box = {};
+const ClipBoxState* g_current_box_state = &g_clip_box;
 
 constexpr int kHandleNone = 0;
 constexpr int kHandleMoveX = 1;
@@ -112,9 +114,14 @@ void TransposeMat4(const float* input, float* output) {
   }
 }
 
+const ClipBoxState& CurrentBoxState() {
+  return g_current_box_state ? *g_current_box_state : g_clip_box;
+}
+
 bool IsHandleHighlighted(int handle_id) {
+  const ClipBoxState& box = CurrentBoxState();
   return handle_id != kHandleNone &&
-      (g_clip_box.hovered_handle == handle_id || g_clip_box.active_handle == handle_id);
+      (box.hovered_handle == handle_id || box.active_handle == handle_id);
 }
 
 struct Vec3 {
@@ -231,23 +238,25 @@ int AxisIndex(char axis) {
 }
 
 Vec3 ClipAxis(char axis) {
+  const ClipBoxState& box = CurrentBoxState();
   const int index = AxisIndex(axis) * 3;
   const Vec3 vector = Normalize(MakeVec3(
-      static_cast<float>(g_clip_box.axes_xyz[index + 0]),
-      static_cast<float>(g_clip_box.axes_xyz[index + 1]),
-      static_cast<float>(g_clip_box.axes_xyz[index + 2])));
+      static_cast<float>(box.axes_xyz[index + 0]),
+      static_cast<float>(box.axes_xyz[index + 1]),
+      static_cast<float>(box.axes_xyz[index + 2])));
   return Length(vector) > 1.0e-5f ? vector : WorldAxis(axis);
 }
 
 float HalfExtent(char axis) {
-  return static_cast<float>(g_clip_box.half_extents_xyz[AxisIndex(axis)]);
+  return static_cast<float>(CurrentBoxState().half_extents_xyz[AxisIndex(axis)]);
 }
 
 Vec3 BoxCenterVec() {
+  const ClipBoxState& box = CurrentBoxState();
   return MakeVec3(
-      static_cast<float>(g_clip_box.center_xyz[0]),
-      static_cast<float>(g_clip_box.center_xyz[1]),
-      static_cast<float>(g_clip_box.center_xyz[2]));
+      static_cast<float>(box.center_xyz[0]),
+      static_cast<float>(box.center_xyz[1]),
+      static_cast<float>(box.center_xyz[2]));
 }
 
 Vec3 OrientedCorner(float x_sign, float y_sign, float z_sign) {
@@ -542,7 +551,8 @@ void HandleColorForId(int handle_id, float* r, float* g, float* b) {
 }
 
 void DrawBoxOverlay(bool draw_shell, bool draw_gizmo) {
-  if (!g_clip_box.enabled || !g_clip_box.visible || (!draw_shell && !draw_gizmo)) {
+  const ClipBoxState& box = CurrentBoxState();
+  if (!box.enabled || !box.visible || (!draw_shell && !draw_gizmo)) {
     return;
   }
 
@@ -642,7 +652,7 @@ void DrawBoxOverlay(bool draw_shell, bool draw_gizmo) {
     glEnd();
   }
 
-  if (draw_gizmo && g_clip_box.gizmo_visible) {
+  if (draw_gizmo && box.gizmo_visible) {
     const int move_ids[3] = { kHandleMoveX, kHandleMoveY, kHandleMoveZ };
     const char move_axes[3] = { 'x', 'y', 'z' };
 
@@ -724,7 +734,7 @@ void DrawBoxOverlay(bool draw_shell, bool draw_gizmo) {
     }
 
     {
-      const int center_handle_id = g_clip_box.center_scale_mode ? kHandleScaleUniform : kHandleMoveCenter;
+      const int center_handle_id = box.center_scale_mode ? kHandleScaleUniform : kHandleMoveCenter;
       const bool highlighted =
           IsHandleHighlighted(kHandleMoveCenter) ||
           IsHandleHighlighted(kHandleScaleUniform);
@@ -734,7 +744,7 @@ void DrawBoxOverlay(bool draw_shell, bool draw_gizmo) {
       HandleColorForId(center_handle_id, &r, &g, &b);
       const Vec3 center = BoxCenterVec();
       const float half_size = CenterHandleHalfSize() * (highlighted ? 1.15f : 1.0f);
-      if (g_clip_box.center_scale_mode) {
+      if (box.center_scale_mode) {
         DrawBillboardSquare(center, half_size, r, g, b, highlighted);
       } else {
         DrawBillboardDisc(center, half_size, r, g, b, highlighted);
@@ -902,8 +912,12 @@ BOOL WINAPI HookedSwapBuffers(HDC hdc) {
   if (g_gaussian_render != nullptr) {
     g_gaussian_render();
   }
+  g_current_box_state = &g_clip_box;
   DrawBoxOverlay(true, false);
   DrawBoxOverlay(false, true);
+  g_current_box_state = &g_move_tool_box;
+  DrawBoxOverlay(false, true);
+  g_current_box_state = &g_clip_box;
   g_frame_pending = false;
   g_inside_swap_hook = false;
   return g_orig_swap_buffers(hdc);
@@ -1085,6 +1099,40 @@ extern "C" __declspec(dllexport) void SetPointCloudData(const double* points, in
   g_pointcloud_set_data(points, count);
 }
 
+void SyncBoxState(
+    ClipBoxState* box_state,
+    int enabled,
+    int visible,
+    int gizmo_visible,
+    int center_scale_mode,
+    const double* center_xyz,
+    const double* half_extents_xyz,
+    const double* axes_xyz,
+    int hovered_handle,
+    int active_handle) {
+  if (box_state == nullptr) {
+    return;
+  }
+
+  box_state->enabled = enabled != 0;
+  box_state->visible = visible != 0;
+  box_state->gizmo_visible = gizmo_visible != 0;
+  box_state->center_scale_mode = center_scale_mode != 0;
+
+  if (center_xyz != nullptr) {
+    memcpy(box_state->center_xyz, center_xyz, sizeof(box_state->center_xyz));
+  }
+  if (half_extents_xyz != nullptr) {
+    memcpy(box_state->half_extents_xyz, half_extents_xyz, sizeof(box_state->half_extents_xyz));
+  }
+  if (axes_xyz != nullptr) {
+    memcpy(box_state->axes_xyz, axes_xyz, sizeof(box_state->axes_xyz));
+  }
+
+  box_state->hovered_handle = hovered_handle;
+  box_state->active_handle = active_handle;
+}
+
 extern "C" __declspec(dllexport) void SetClipBoxState(
     int enabled,
     int visible,
@@ -1095,23 +1143,40 @@ extern "C" __declspec(dllexport) void SetClipBoxState(
     const double* axes_xyz,
     int hovered_handle,
     int active_handle) {
-  g_clip_box.enabled = enabled != 0;
-  g_clip_box.visible = visible != 0;
-  g_clip_box.gizmo_visible = gizmo_visible != 0;
-  g_clip_box.center_scale_mode = center_scale_mode != 0;
+  SyncBoxState(
+      &g_clip_box,
+      enabled,
+      visible,
+      gizmo_visible,
+      center_scale_mode,
+      center_xyz,
+      half_extents_xyz,
+      axes_xyz,
+      hovered_handle,
+      active_handle);
+}
 
-  if (center_xyz != nullptr) {
-    memcpy(g_clip_box.center_xyz, center_xyz, sizeof(g_clip_box.center_xyz));
-  }
-  if (half_extents_xyz != nullptr) {
-    memcpy(g_clip_box.half_extents_xyz, half_extents_xyz, sizeof(g_clip_box.half_extents_xyz));
-  }
-  if (axes_xyz != nullptr) {
-    memcpy(g_clip_box.axes_xyz, axes_xyz, sizeof(g_clip_box.axes_xyz));
-  }
-
-  g_clip_box.hovered_handle = hovered_handle;
-  g_clip_box.active_handle = active_handle;
+extern "C" __declspec(dllexport) void SetMoveToolBoxState(
+    int enabled,
+    int visible,
+    int gizmo_visible,
+    int center_scale_mode,
+    const double* center_xyz,
+    const double* half_extents_xyz,
+    const double* axes_xyz,
+    int hovered_handle,
+    int active_handle) {
+  SyncBoxState(
+      &g_move_tool_box,
+      enabled,
+      visible,
+      gizmo_visible,
+      center_scale_mode,
+      center_xyz,
+      half_extents_xyz,
+      axes_xyz,
+      hovered_handle,
+      active_handle);
 }
 
 extern "C" __declspec(dllexport) bool GetClipBoxState(

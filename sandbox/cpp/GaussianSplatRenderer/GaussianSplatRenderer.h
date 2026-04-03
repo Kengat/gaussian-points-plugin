@@ -39,6 +39,11 @@ extern "C" {
     // Load splats from an on-disk PLY file or from already decoded data.
     EXPORT void LoadSplatsFromPLY(const char* filename);
     EXPORT void AddSplatsFromPLYData(PLYGaussianPoint* points, int count);
+    EXPORT int LoadSplatObjectFromPLY(const char* object_id, const char* filename, double* out_center_xyz, double* out_half_extents_xyz);
+    EXPORT int SetSplatObjectTransform(const char* object_id, const double* center_xyz, const double* half_extents_xyz, const double* axes_xyz, int visible);
+    EXPORT int SetSplatObjectHighlight(const char* object_id, int highlight_mode);
+    EXPORT int RemoveSplatObject(const char* object_id);
+    EXPORT void ClearSplatObjects();
 
     // Report an axis-aligned bounds box for the loaded splats.
     EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz);

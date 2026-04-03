@@ -22,6 +22,10 @@ module GaussianPoints
         update_source_bounds(:pointcloud, bounds_from_flat_array(data, stride))
       end
 
+      def update_pointcloud_bounds(min_point, max_point)
+        update_source_bounds(:pointcloud, bounds_to_snapshot(bounds_from_min_max(min_point, max_point)))
+      end
+
       def update_splats_bounds(min_point, max_point = nil)
         snapshot =
           if max_point.nil?

@@ -25,6 +25,39 @@ module GaussianPoints
         [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
         Fiddle::TYPE_VOID
       )
+      begin
+        @set_pointcloud_object_data = Fiddle::Function.new(
+          @renderer_dll['SetPointCloudObjectData'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+          Fiddle::TYPE_INT
+        )
+        @set_pointcloud_object_transform = Fiddle::Function.new(
+          @renderer_dll['SetPointCloudObjectTransform'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+          Fiddle::TYPE_INT
+        )
+        @set_pointcloud_object_highlight = Fiddle::Function.new(
+          @renderer_dll['SetPointCloudObjectHighlight'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+          Fiddle::TYPE_INT
+        )
+        @remove_pointcloud_object = Fiddle::Function.new(
+          @renderer_dll['RemovePointCloudObject'],
+          [Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_INT
+        )
+        @clear_pointcloud_objects = Fiddle::Function.new(
+          @renderer_dll['ClearPointCloudObjects'],
+          [],
+          Fiddle::TYPE_VOID
+        )
+      rescue Fiddle::DLError
+        @set_pointcloud_object_data = nil
+        @set_pointcloud_object_transform = nil
+        @set_pointcloud_object_highlight = nil
+        @remove_pointcloud_object = nil
+        @clear_pointcloud_objects = nil
+      end
       @dll_loaded = true
     rescue Fiddle::DLError => e
       puts "[PointCloud Bridge] DLL load error: #{e.message}"
@@ -57,6 +90,103 @@ module GaussianPoints
 
       @set_pointcloud_data.call(0, 0)
       true
+    end
+
+    def self.supports_object_api?
+      setup_dll && !@set_pointcloud_object_data.nil? && !@set_pointcloud_object_transform.nil?
+    end
+
+    def self.supports_highlight_api?
+      setup_dll && !@set_pointcloud_object_highlight.nil?
+    end
+
+    def self.upsert_pointcloud_object(id, data)
+      return false unless setup_dll
+      return false unless install_hooks
+      return false unless supports_object_api?
+
+      packed = data.pack('d*')
+      mem = Fiddle::Pointer.malloc(packed.bytesize)
+      mem[0, packed.bytesize] = packed
+      @set_pointcloud_object_data.call(c_string(id), mem, data.size / 6) != 0
+    end
+
+    def self.set_pointcloud_object_transform(id, snapshot, visible: true)
+      return false unless setup_dll
+      return false unless install_hooks
+      return false unless supports_object_api?
+
+      @set_pointcloud_object_transform.call(
+        c_string(id),
+        pack_point(snapshot[:center]),
+        pack_half_extents(snapshot[:half_extents]),
+        pack_axes(snapshot[:axes]),
+        visible ? 1 : 0
+      ) != 0
+    end
+
+    def self.remove_pointcloud_object(id)
+      return false unless setup_dll
+      return false unless install_hooks
+      return false unless @remove_pointcloud_object
+
+      @remove_pointcloud_object.call(c_string(id)) != 0
+    end
+
+    def self.set_pointcloud_object_highlight(id, highlight_mode)
+      return false unless setup_dll
+      return false unless install_hooks
+      return false unless @set_pointcloud_object_highlight
+
+      @set_pointcloud_object_highlight.call(c_string(id), highlight_mode.to_i) != 0
+    end
+
+    def self.clear_pointcloud_objects
+      return false unless setup_dll
+      return false unless install_hooks
+      return clear_pointcloud unless @clear_pointcloud_objects
+
+      @clear_pointcloud_objects.call
+      true
+    end
+
+    def self.c_string(value)
+      Fiddle::Pointer[(value.to_s.encode('UTF-8') + "\0")]
+    end
+
+    def self.pack_point(point)
+      values = point ? [point.x.to_f, point.y.to_f, point.z.to_f] : [0.0, 0.0, 0.0]
+      pack_doubles(values)
+    end
+
+    def self.pack_half_extents(half_extents)
+      values =
+        if half_extents
+          [half_extents[:x].to_f, half_extents[:y].to_f, half_extents[:z].to_f]
+        else
+          [0.0, 0.0, 0.0]
+        end
+      pack_doubles(values)
+    end
+
+    def self.pack_axes(axes)
+      values =
+        if axes
+          %i[x y z].flat_map do |axis|
+            vector = axes[axis]
+            vector ? [vector.x.to_f, vector.y.to_f, vector.z.to_f] : [0.0, 0.0, 0.0]
+          end
+        else
+          [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        end
+      pack_doubles(values)
+    end
+
+    def self.pack_doubles(values)
+      packed = values.pack("d#{values.length}")
+      memory = Fiddle::Pointer.malloc(packed.bytesize)
+      memory[0, packed.bytesize] = packed
+      memory
     end
   end
 end

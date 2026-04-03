@@ -20,6 +20,16 @@ extern "C" {
 		const double* axes_xyz,
 		int hovered_handle,
 		int active_handle);
+	SKETCHUP_OVERLAY_BRIDGE_API void SetMoveToolBoxState(
+		int enabled,
+		int visible,
+		int gizmo_visible,
+		int center_scale_mode,
+		const double* center_xyz,
+		const double* half_extents_xyz,
+		const double* axes_xyz,
+		int hovered_handle,
+		int active_handle);
 	SKETCHUP_OVERLAY_BRIDGE_API bool GetClipBoxState(
 		int* enabled,
 		double* center_xyz,

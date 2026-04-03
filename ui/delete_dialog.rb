@@ -74,6 +74,7 @@ module GaussianPoints
           if yesOrNo.to_s == "true"
             overlay = GaussianPoints.overlay
             overlay.clear_points if overlay
+            GaussianPoints::UIparts::RenderItemRegistry.clear_all if defined?(GaussianPoints::UIparts::RenderItemRegistry)
             GaussianPoints::Hook.clear_pointcloud if defined?(GaussianPoints::Hook)
             GaussianPoints::GaussianSplats.clear_splats if defined?(GaussianPoints::GaussianSplats)
           end

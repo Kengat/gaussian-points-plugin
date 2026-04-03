@@ -33,12 +33,21 @@
           points << Geom::Point3d.new(x, y, z)
         end
 
-        overlay = GaussianPoints.overlay
-        if overlay
-          overlay.add_points(points)
-          UI.messagebox("Imported #{points.size} points from #{File.basename(filename)}")
+        if GaussianPoints::Hook.supports_object_api?
+          item = register_pointcloud_points(File.basename(filename), points)
+          if item
+            UI.messagebox("Imported #{points.size} points from #{File.basename(filename)}")
+          else
+            UI.messagebox('Point cloud import failed.')
+          end
         else
-          UI.messagebox('Overlay not found.')
+          overlay = GaussianPoints.overlay
+          if overlay
+            overlay.add_points(points)
+            UI.messagebox("Imported #{points.size} points from #{File.basename(filename)}")
+          else
+            UI.messagebox('Overlay not found.')
+          end
         end
       end
 
@@ -72,17 +81,20 @@
           pt.z *= scale_factor
         end
 
-        points_array = colored_data.map { |pt, r, g, b|
-          [pt.x, pt.y, pt.z, r.to_f, g.to_f, b.to_f]
-        }.flatten
+        points_array = colored_data.flat_map { |pt, r, g, b| [pt.x, pt.y, pt.z, r.to_f, g.to_f, b.to_f] }
 
         optimized_array = GaussianPoints::IO::OctreeProcessor.process(points_array)
         optimized_count = optimized_array.size / 6
         puts "[Optimization] Reduced to #{optimized_count} points."
         GaussianPoints::SceneBoundsProxy.update_pointcloud_flat_array(optimized_array, stride: 6) if defined?(GaussianPoints::SceneBoundsProxy)
 
-        if defined?(GaussianPoints::Hook) && GaussianPoints::Hook.set_pointcloud(optimized_array)
-          UI.messagebox("Imported #{colored_data.size} points from #{File.basename(filename)}. Optimized to #{optimized_count} points.")
+        if defined?(GaussianPoints::Hook) && GaussianPoints::Hook.supports_object_api?
+          item = register_pointcloud_flat_data(File.basename(filename), optimized_array)
+          if item
+            UI.messagebox("Imported #{colored_data.size} points from #{File.basename(filename)}. Optimized to #{optimized_count} points.")
+          else
+            UI.messagebox('Point cloud import failed after optimization.')
+          end
         else
           optimized_data = []
           (0...optimized_count).each do |i|
@@ -103,6 +115,80 @@
             UI.messagebox('Overlay not found.')
           end
         end
+      end
+
+      def self.register_pointcloud_points(name, points)
+        return nil if points.empty?
+
+        color = GaussianPoints.overlay&.visible_color || Sketchup::Color.new(80, 80, 80, 180)
+        packed = points.flat_map { |pt| [pt.x.to_f, pt.y.to_f, pt.z.to_f, color.red.to_f, color.green.to_f, color.blue.to_f] }
+        register_pointcloud_flat_data(name, packed)
+      end
+
+      def self.register_pointcloud_flat_data(name, flat_data)
+        return nil if flat_data.empty?
+
+        center, half_extents = pointcloud_bounds(flat_data)
+        centered_data = []
+        count = flat_data.length / 6
+        count.times do |index|
+          base = index * 6
+          centered_data.concat([
+            flat_data[base + 0] - center.x,
+            flat_data[base + 1] - center.y,
+            flat_data[base + 2] - center.z,
+            flat_data[base + 3],
+            flat_data[base + 4],
+            flat_data[base + 5]
+          ])
+        end
+
+        GaussianPoints::UIparts::RenderItemRegistry.register_pointcloud(
+          name: name,
+          packed_points: centered_data,
+          initial_state: {
+            center: center,
+            half_extents: half_extents,
+            axes: {
+              x: Geom::Vector3d.new(1, 0, 0),
+              y: Geom::Vector3d.new(0, 1, 0),
+              z: Geom::Vector3d.new(0, 0, 1)
+            }
+          }
+        )
+      end
+
+      def self.pointcloud_bounds(flat_data)
+        count = flat_data.length / 6
+        min_x = max_x = flat_data[0].to_f
+        min_y = max_y = flat_data[1].to_f
+        min_z = max_z = flat_data[2].to_f
+
+        count.times do |index|
+          base = index * 6
+          x = flat_data[base + 0].to_f
+          y = flat_data[base + 1].to_f
+          z = flat_data[base + 2].to_f
+          min_x = [min_x, x].min
+          min_y = [min_y, y].min
+          min_z = [min_z, z].min
+          max_x = [max_x, x].max
+          max_y = [max_y, y].max
+          max_z = [max_z, z].max
+        end
+
+        center = Geom::Point3d.new(
+          (min_x + max_x) * 0.5,
+          (min_y + max_y) * 0.5,
+          (min_z + max_z) * 0.5
+        )
+        half_extents = {
+          x: [((max_x - min_x) * 0.5), 1.mm].max,
+          y: [((max_y - min_y) * 0.5), 1.mm].max,
+          z: [((max_z - min_z) * 0.5), 1.mm].max
+        }
+
+        [center, half_extents]
       end
     end
   end

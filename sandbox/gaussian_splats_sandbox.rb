@@ -145,6 +145,39 @@ module GaussianPoints
           [Fiddle::TYPE_VOIDP],
           Fiddle::TYPE_VOID
         )
+        begin
+          @load_splat_object_from_ply = Fiddle::Function.new(
+            @renderer_dll['LoadSplatObjectFromPLY'],
+            [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
+            Fiddle::TYPE_INT
+          )
+          @set_splat_object_transform = Fiddle::Function.new(
+            @renderer_dll['SetSplatObjectTransform'],
+            [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+            Fiddle::TYPE_INT
+          )
+          @set_splat_object_highlight = Fiddle::Function.new(
+            @renderer_dll['SetSplatObjectHighlight'],
+            [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+            Fiddle::TYPE_INT
+          )
+          @remove_splat_object = Fiddle::Function.new(
+            @renderer_dll['RemoveSplatObject'],
+            [Fiddle::TYPE_VOIDP],
+            Fiddle::TYPE_INT
+          )
+          @clear_splat_objects = Fiddle::Function.new(
+            @renderer_dll['ClearSplatObjects'],
+            [],
+            Fiddle::TYPE_VOID
+          )
+        rescue Fiddle::DLError
+          @load_splat_object_from_ply = nil
+          @set_splat_object_transform = nil
+          @set_splat_object_highlight = nil
+          @remove_splat_object = nil
+          @clear_splat_objects = nil
+        end
 
         begin
           @get_splat_bounds = Fiddle::Function.new(
@@ -201,7 +234,11 @@ module GaussianPoints
     def self.clear_splats
       return false unless @renderer_dll_loaded
 
-      @clear_splats.call
+      if @clear_splat_objects
+        @clear_splat_objects.call
+      else
+        @clear_splats.call
+      end
       GaussianPoints::SceneBoundsProxy.clear_splats if defined?(GaussianPoints::SceneBoundsProxy)
       true
     end
@@ -244,6 +281,80 @@ module GaussianPoints
       true
     end
 
+    def self.load_ply_splats_file_as_object(id, filename)
+      return nil unless ensure_initialized
+      return nil unless @renderer_dll_loaded
+      return nil unless @load_splat_object_from_ply
+
+      center_buffer = Fiddle::Pointer.malloc(3 * Fiddle::SIZEOF_DOUBLE)
+      half_buffer = Fiddle::Pointer.malloc(3 * Fiddle::SIZEOF_DOUBLE)
+      center_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE] = [0.0, 0.0, 0.0].pack('d3')
+      half_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE] = [0.0, 0.0, 0.0].pack('d3')
+
+      result = @load_splat_object_from_ply.call(
+        to_c_string(id),
+        to_c_string(filename.tr('/', '\\')),
+        center_buffer,
+        half_buffer
+      )
+      return nil if result == 0
+
+      center = center_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE].unpack('d3')
+      half_extents = half_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE].unpack('d3')
+
+      {
+        center: Geom::Point3d.new(*center),
+        half_extents: {
+          x: half_extents[0],
+          y: half_extents[1],
+          z: half_extents[2]
+        },
+        axes: {
+          x: Geom::Vector3d.new(1, 0, 0),
+          y: Geom::Vector3d.new(0, 1, 0),
+          z: Geom::Vector3d.new(0, 0, 1)
+        }
+      }
+    end
+
+    def self.set_object_transform(id, snapshot, visible: true)
+      return false unless ensure_initialized
+      return false unless @renderer_dll_loaded
+      return false unless @set_splat_object_transform
+
+      @set_splat_object_transform.call(
+        to_c_string(id),
+        pack_point(snapshot[:center]),
+        pack_half_extents(snapshot[:half_extents]),
+        pack_axes(snapshot[:axes]),
+        visible ? 1 : 0
+      ) != 0
+    end
+
+    def self.supports_highlight_api?
+      setup_dlls && !@set_splat_object_highlight.nil?
+    end
+
+    def self.set_object_highlight(id, highlight_mode)
+      return false unless ensure_initialized
+      return false unless @renderer_dll_loaded
+      return false unless @set_splat_object_highlight
+
+      @set_splat_object_highlight.call(to_c_string(id), highlight_mode.to_i) != 0
+    end
+
+    def self.remove_object(id)
+      return false unless ensure_initialized
+      return false unless @renderer_dll_loaded
+      return false unless @remove_splat_object
+
+      @remove_splat_object.call(to_c_string(id)) != 0
+    end
+
+    def self.clear_splat_objects
+      clear_splats
+    end
+
     def self.init_plugin
       ensure_initialized
     end
@@ -269,6 +380,40 @@ module GaussianPoints
       GaussianPoints::SceneBoundsProxy.update_splats_bounds(min_point, max_point)
     rescue StandardError => e
       puts "[GaussianSplats] bounds sync error: #{e.message}"
+    end
+
+    def self.pack_point(point)
+      pack_doubles(point ? [point.x.to_f, point.y.to_f, point.z.to_f] : [0.0, 0.0, 0.0])
+    end
+
+    def self.pack_half_extents(half_extents)
+      values =
+        if half_extents
+          [half_extents[:x].to_f, half_extents[:y].to_f, half_extents[:z].to_f]
+        else
+          [0.0, 0.0, 0.0]
+        end
+      pack_doubles(values)
+    end
+
+    def self.pack_axes(axes)
+      values =
+        if axes
+          %i[x y z].flat_map do |axis|
+            vector = axes[axis]
+            vector ? [vector.x.to_f, vector.y.to_f, vector.z.to_f] : [0.0, 0.0, 0.0]
+          end
+        else
+          [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        end
+      pack_doubles(values)
+    end
+
+    def self.pack_doubles(values)
+      packed = values.pack("d#{values.length}")
+      memory = Fiddle::Pointer.malloc(packed.bytesize)
+      memory[0, packed.bytesize] = packed
+      memory
     end
   end
 end
