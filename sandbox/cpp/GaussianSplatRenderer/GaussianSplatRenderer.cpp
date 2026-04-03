@@ -74,6 +74,11 @@ static std::vector<SplatObject> g_splatObjects;
 static const int HIGHLIGHT_NONE = 0;
 static const int HIGHLIGHT_HOVER = 1;
 static const int HIGHLIGHT_SELECTED = 2;
+static const int IMPORT_ORIENTATION_LEGACY = 0;
+static const int IMPORT_ORIENTATION_SWAP_A = 1;
+static const int IMPORT_ORIENTATION_SWAP_B = 2;
+static const int IMPORT_ORIENTATION_FLIP_Z = 3;
+static const int IMPORT_ORIENTATION_RAW = 4;
 
 enum SplatSortingMode {
     SORT_Z_COORD = 0, SORT_HEMISPHERE = 1, SORT_WEIGHTED_DEPTH = 2,
@@ -1455,7 +1460,95 @@ extern "C" EXPORT void renderPointCloud() {
 
 void ConvertColor(float dc0, float dc1, float dc2, float& r, float& g, float& b) { auto sig = [](float x) {return 1.f / (1.f + exp(-x));}; r = sig(dc0); g = sig(dc1); b = sig(dc2); }
 void ConvertScale(float s0, float s1, float& sx, float& sy) { float rx = exp(s0); float ry = exp(s1); float sf = 45.f; sx = rx * sf; sy = ry * sf; }
-static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* points, int count, double* out_center_xyz, double* out_half_extents_xyz) {
+static int NormalizeImportUpAxis(int up_axis_mode) {
+    switch (up_axis_mode) {
+    case IMPORT_ORIENTATION_SWAP_A:
+    case IMPORT_ORIENTATION_SWAP_B:
+    case IMPORT_ORIENTATION_FLIP_Z:
+    case IMPORT_ORIENTATION_RAW:
+        return up_axis_mode;
+    default:
+        return IMPORT_ORIENTATION_LEGACY;
+    }
+}
+
+static void MapImportPosition(const float* source_xyz, int up_axis_mode, float scale_distance, float* out_xyz) {
+    switch (NormalizeImportUpAxis(up_axis_mode)) {
+    case IMPORT_ORIENTATION_SWAP_A:
+        out_xyz[0] = source_xyz[0] * scale_distance;
+        out_xyz[1] = -source_xyz[2] * scale_distance;
+        out_xyz[2] = source_xyz[1] * scale_distance;
+        break;
+    case IMPORT_ORIENTATION_SWAP_B:
+        out_xyz[0] = source_xyz[0] * scale_distance;
+        out_xyz[1] = source_xyz[2] * scale_distance;
+        out_xyz[2] = -source_xyz[1] * scale_distance;
+        break;
+    case IMPORT_ORIENTATION_FLIP_Z:
+        out_xyz[0] = source_xyz[0] * scale_distance;
+        out_xyz[1] = source_xyz[1] * scale_distance;
+        out_xyz[2] = -source_xyz[2] * scale_distance;
+        break;
+    case IMPORT_ORIENTATION_RAW:
+        out_xyz[0] = source_xyz[0] * scale_distance;
+        out_xyz[1] = source_xyz[1] * scale_distance;
+        out_xyz[2] = source_xyz[2] * scale_distance;
+        break;
+    default:
+        out_xyz[0] = source_xyz[0] * scale_distance;
+        out_xyz[1] = -source_xyz[1] * scale_distance;
+        out_xyz[2] = source_xyz[2] * scale_distance;
+        break;
+    }
+}
+
+static void MapImportVector(const float* source_xyz, int up_axis_mode, float* out_xyz) {
+    switch (NormalizeImportUpAxis(up_axis_mode)) {
+    case IMPORT_ORIENTATION_SWAP_A:
+        out_xyz[0] = source_xyz[0];
+        out_xyz[1] = -source_xyz[2];
+        out_xyz[2] = source_xyz[1];
+        break;
+    case IMPORT_ORIENTATION_SWAP_B:
+        out_xyz[0] = source_xyz[0];
+        out_xyz[1] = source_xyz[2];
+        out_xyz[2] = -source_xyz[1];
+        break;
+    case IMPORT_ORIENTATION_FLIP_Z:
+        out_xyz[0] = source_xyz[0];
+        out_xyz[1] = source_xyz[1];
+        out_xyz[2] = -source_xyz[2];
+        break;
+    case IMPORT_ORIENTATION_RAW:
+        out_xyz[0] = source_xyz[0];
+        out_xyz[1] = source_xyz[1];
+        out_xyz[2] = source_xyz[2];
+        break;
+    default:
+        out_xyz[0] = source_xyz[0];
+        out_xyz[1] = -source_xyz[1];
+        out_xyz[2] = source_xyz[2];
+        break;
+    }
+}
+
+static void BuildMappedBasisVectors(const PLYGaussianPoint& point, float scale_x, float scale_y, int up_axis_mode, float* out_basis_x, float* out_basis_y) {
+    GaussSplat source_splat = {};
+    source_splat.scale[0] = scale_x;
+    source_splat.scale[1] = scale_y;
+    source_splat.rotation[0] = point.rotation[0];
+    source_splat.rotation[1] = point.rotation[1];
+    source_splat.rotation[2] = point.rotation[2];
+    source_splat.rotation[3] = point.rotation[3];
+
+    float source_basis_x[3] = {};
+    float source_basis_y[3] = {};
+    ComputeBasisVectors(source_splat, source_basis_x, source_basis_y);
+    MapImportVector(source_basis_x, up_axis_mode, out_basis_x);
+    MapImportVector(source_basis_y, up_axis_mode, out_basis_y);
+}
+
+static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* points, int count, double* out_center_xyz, double* out_half_extents_xyz, int up_axis_mode) {
     if (!object_id || !points || count <= 0) {
         return 0;
     }
@@ -1483,9 +1576,11 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     double minX = 0.0, minY = 0.0, minZ = 0.0, maxX = 0.0, maxY = 0.0, maxZ = 0.0;
 
     for (int i = 0; i < count; ++i) {
-        float x = points[i].position[0] * scaleDistance;
-        float y = -points[i].position[1] * scaleDistance;
-        float z = points[i].position[2] * scaleDistance;
+        float mapped_position[3] = {};
+        MapImportPosition(points[i].position, up_axis_mode, scaleDistance, mapped_position);
+        const float x = mapped_position[0];
+        const float y = mapped_position[1];
+        const float z = mapped_position[2];
 
         if (!haveBounds) {
             minX = maxX = x;
@@ -1517,12 +1612,14 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
         splat.color[1] = g;
         splat.color[2] = b;
         splat.color[3] = std::max(0.01f, std::min((1.0f / (1.0f + exp(-points[i].opacity))) * opacityMultiplier, 1.0f));
-        splat.scale[0] = scaleX;
-        splat.scale[1] = scaleY;
-        splat.rotation[0] = points[i].rotation[0];
-        splat.rotation[1] = points[i].rotation[1];
-        splat.rotation[2] = points[i].rotation[2];
-        splat.rotation[3] = points[i].rotation[3];
+        splat.scale[0] = 1.0f;
+        splat.scale[1] = 1.0f;
+        splat.rotation[0] = 1.0f;
+        splat.rotation[1] = 0.0f;
+        splat.rotation[2] = 0.0f;
+        splat.rotation[3] = 0.0f;
+        splat.use_custom_basis = 1;
+        BuildMappedBasisVectors(points[i], scaleX, scaleY, up_axis_mode, splat.basis_x, splat.basis_y);
         object.local_splats.push_back(splat);
     }
 
@@ -1561,14 +1658,15 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     return 1;
 }
 
-extern "C" EXPORT void LoadSplatsFromPLY(const char* filename) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); AddSplatsFromPLYData(pts, cnt); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); LogRenderer("PLY load finished."); }
+extern "C" EXPORT void LoadSplatsFromPLYWithUpAxis(const char* filename, int up_axis_mode) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); ResetSplatObjects(); BuildSplatObjectFromPLYData("__legacy__", pts, cnt, nullptr, nullptr, up_axis_mode); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); LogRenderer("PLY load finished."); }
+extern "C" EXPORT void LoadSplatsFromPLY(const char* filename) { LoadSplatsFromPLYWithUpAxis(filename, IMPORT_ORIENTATION_SWAP_B); }
 extern "C" EXPORT void AddSplatsFromPLYData(PLYGaussianPoint* points, int count) {
     LogRenderer("Adding %d splats from PLY data...", count);
     ResetSplatObjects();
-    BuildSplatObjectFromPLYData("__legacy__", points, count, nullptr, nullptr);
+    BuildSplatObjectFromPLYData("__legacy__", points, count, nullptr, nullptr, IMPORT_ORIENTATION_SWAP_B);
 }
 
-extern "C" EXPORT int LoadSplatObjectFromPLY(const char* object_id, const char* filename, double* out_center_xyz, double* out_half_extents_xyz) {
+extern "C" EXPORT int LoadSplatObjectFromPLYWithUpAxis(const char* object_id, const char* filename, double* out_center_xyz, double* out_half_extents_xyz, int up_axis_mode) {
     LogRenderer("Loading PLY object '%s': %s", object_id ? object_id : "(null)", filename ? filename : "(null)");
     if (!object_id || !filename) {
         return 0;
@@ -1593,7 +1691,7 @@ extern "C" EXPORT int LoadSplatObjectFromPLY(const char* object_id, const char* 
     int cnt = load(filename, &pts);
     int result = 0;
     if (cnt > 0 && pts) {
-        result = BuildSplatObjectFromPLYData(object_id, pts, cnt, out_center_xyz, out_half_extents_xyz);
+        result = BuildSplatObjectFromPLYData(object_id, pts, cnt, out_center_xyz, out_half_extents_xyz, up_axis_mode);
     }
 
     if (pts) {
@@ -1601,6 +1699,10 @@ extern "C" EXPORT int LoadSplatObjectFromPLY(const char* object_id, const char* 
     }
     FreeLibrary(plyDLL);
     return result;
+}
+
+extern "C" EXPORT int LoadSplatObjectFromPLY(const char* object_id, const char* filename, double* out_center_xyz, double* out_half_extents_xyz) {
+    return LoadSplatObjectFromPLYWithUpAxis(object_id, filename, out_center_xyz, out_half_extents_xyz, IMPORT_ORIENTATION_SWAP_B);
 }
 
 extern "C" EXPORT int SetSplatObjectTransform(const char* object_id, const double* center_xyz, const double* half_extents_xyz, const double* axes_xyz, int visible) {

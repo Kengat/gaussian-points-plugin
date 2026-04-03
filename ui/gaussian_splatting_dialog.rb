@@ -234,6 +234,29 @@ module GaussianPoints
                 margin-top: 10px;
               }
 
+              .field {
+                margin-top: 14px;
+              }
+
+              .field label {
+                display: block;
+                font-size: 12px;
+                text-transform: uppercase;
+                letter-spacing: 0.14em;
+                color: var(--muted);
+                margin-bottom: 8px;
+              }
+
+              .field select {
+                width: 100%;
+                padding: 12px 14px;
+                border-radius: 12px;
+                border: 1px solid var(--line);
+                background: rgba(255,255,255,0.9);
+                color: var(--ink);
+                font: inherit;
+              }
+
               .status-bar {
                 margin-top: 14px;
                 padding: 12px 14px;
@@ -291,6 +314,14 @@ module GaussianPoints
               <section class="panel">
                 <h2>PLY Workflow</h2>
                 <p>Use the same actions as before, but now from the root toolbar instead of a separate sandbox plugin.</p>
+                <div class="field">
+                  <label for="upAxisMode">Import Orientation Test Mode</label>
+                  <select id="upAxisMode">
+                    <option value="legacy">1. Y-up (original/Postshot)</option>
+                    <option value="swap_a">2. Z-up inverted</option>
+                    <option value="swap_b">3. Z-up (default)</option>
+                  </select>
+                </div>
                 <div class="actions">
                   <button class="primary" data-action="load_ply">
                     <strong>Load Gaussian PLY</strong>
@@ -323,6 +354,7 @@ module GaussianPoints
               const initState = document.getElementById('initState');
               const sandboxPath = document.getElementById('sandboxPath');
               const statusBar = document.getElementById('statusBar');
+              const upAxisMode = document.getElementById('upAxisMode');
 
               function setStatus(message, level) {
                 statusBar.textContent = message;
@@ -333,6 +365,7 @@ module GaussianPoints
                 dllState.textContent = payload.loaded ? 'Loaded' : (payload.available ? 'Found on disk' : 'Missing pieces');
                 initState.textContent = payload.initialized ? 'Initialized' : 'Idle';
                 sandboxPath.textContent = payload.sandbox_dir || 'Path unavailable';
+                upAxisMode.value = payload.up_axis_mode || 'swap_b';
                 if (payload.message) {
                   setStatus(payload.message, payload.level || '');
                 }
@@ -348,6 +381,10 @@ module GaussianPoints
                 });
               });
 
+              upAxisMode.addEventListener('change', () => {
+                sketchup.set_up_axis_mode(upAxisMode.value);
+              });
+
               document.addEventListener('DOMContentLoaded', () => {
                 sketchup.dialog_ready();
               });
@@ -360,6 +397,12 @@ module GaussianPoints
       def self.bind_callbacks
         @@dialog.add_action_callback('dialog_ready') do |_ctx|
           push_state
+        end
+
+        @@dialog.add_action_callback('set_up_axis_mode') do |_ctx, value|
+          mode = GaussianPoints::GaussianSplats.set_up_axis_mode(value)
+          label = GaussianPoints::GaussianSplats.orientation_label(mode)
+          push_state("Gaussian import orientation set to #{label}. Reload the same PLY and tell me which variant is correct.", 'ok')
         end
 
         @@dialog.add_action_callback('initialize') do |_ctx|

@@ -6,8 +6,66 @@ require 'sketchup.rb'
 
 module GaussianPoints
   module GaussianSplats
+    PREF_NAMESPACE = 'GaussianPoints'.freeze
+    PREF_UP_AXIS_KEY = 'gaussian_splats_up_axis'.freeze
+    ORIENTATION_LEGACY = 'legacy'.freeze
+    ORIENTATION_SWAP_A = 'swap_a'.freeze
+    ORIENTATION_SWAP_B = 'swap_b'.freeze
+    ORIENTATION_OPTIONS = [
+      ORIENTATION_LEGACY,
+      ORIENTATION_SWAP_A,
+      ORIENTATION_SWAP_B
+    ].freeze
+
     def self.plugin_dir
       File.join(GaussianPoints::PLUGIN_DIR, 'sandbox')
+    end
+
+    def self.normalize_up_axis_mode(value)
+      normalized = value.to_s.downcase
+      return ORIENTATION_LEGACY if normalized == 'z'
+      return ORIENTATION_SWAP_A if normalized == 'y'
+      return normalized if ORIENTATION_OPTIONS.include?(normalized)
+
+      ORIENTATION_SWAP_B
+    end
+
+    def self.orientation_label(value)
+      case normalize_up_axis_mode(value)
+      when ORIENTATION_LEGACY
+        '1. Y-up (original/Postshot)'
+      when ORIENTATION_SWAP_A
+        '2. Z-up inverted'
+      when ORIENTATION_SWAP_B
+        '3. Z-up (default)'
+      else
+        '3. Z-up (default)'
+      end
+    end
+
+    def self.up_axis_mode
+      normalize_up_axis_mode(Sketchup.read_default(PREF_NAMESPACE, PREF_UP_AXIS_KEY, ORIENTATION_SWAP_B))
+    rescue StandardError
+      ORIENTATION_SWAP_B
+    end
+
+    def self.set_up_axis_mode(value)
+      normalized = normalize_up_axis_mode(value)
+      Sketchup.write_default(PREF_NAMESPACE, PREF_UP_AXIS_KEY, normalized)
+      normalized
+    rescue StandardError
+      ORIENTATION_SWAP_B
+    end
+
+    def self.up_axis_mode_native_value(value = up_axis_mode)
+      case normalize_up_axis_mode(value)
+      when ORIENTATION_SWAP_A
+        1
+      when ORIENTATION_SWAP_B
+        2
+      else
+        0
+      end
     end
 
     def self.hook_dll_path
@@ -62,6 +120,7 @@ module GaussianPoints
         available: available?,
         initialized: initialized?,
         loaded: loaded?,
+        up_axis_mode: up_axis_mode,
         sandbox_dir: plugin_dir,
         hook_loaded: @hook_dll_loaded == true,
         renderer_loaded: @renderer_dll_loaded == true,
@@ -146,11 +205,29 @@ module GaussianPoints
           Fiddle::TYPE_VOID
         )
         begin
+          @load_splats_from_ply_with_up_axis = Fiddle::Function.new(
+            @renderer_dll['LoadSplatsFromPLYWithUpAxis'],
+            [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+            Fiddle::TYPE_VOID
+          )
+        rescue Fiddle::DLError
+          @load_splats_from_ply_with_up_axis = nil
+        end
+        begin
           @load_splat_object_from_ply = Fiddle::Function.new(
             @renderer_dll['LoadSplatObjectFromPLY'],
             [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
             Fiddle::TYPE_INT
           )
+          begin
+            @load_splat_object_from_ply_with_up_axis = Fiddle::Function.new(
+              @renderer_dll['LoadSplatObjectFromPLYWithUpAxis'],
+              [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+              Fiddle::TYPE_INT
+            )
+          rescue Fiddle::DLError
+            @load_splat_object_from_ply_with_up_axis = nil
+          end
           @set_splat_object_transform = Fiddle::Function.new(
             @renderer_dll['SetSplatObjectTransform'],
             [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
@@ -173,6 +250,7 @@ module GaussianPoints
           )
         rescue Fiddle::DLError
           @load_splat_object_from_ply = nil
+          @load_splat_object_from_ply_with_up_axis = nil
           @set_splat_object_transform = nil
           @set_splat_object_highlight = nil
           @remove_splat_object = nil
@@ -271,17 +349,21 @@ module GaussianPoints
       load_ply_splats_file(filename)
     end
 
-    def self.load_ply_splats_file(filename)
+    def self.load_ply_splats_file(filename, up_axis_mode: self.up_axis_mode)
       return false unless ensure_initialized
       return false unless @renderer_dll_loaded
 
       c_filename = to_c_string(filename.tr('/', '\\'))
-      @load_splats_from_ply.call(c_filename)
+      if @load_splats_from_ply_with_up_axis
+        @load_splats_from_ply_with_up_axis.call(c_filename, up_axis_mode_native_value(up_axis_mode))
+      else
+        @load_splats_from_ply.call(c_filename)
+      end
       sync_bounds_proxy_from_renderer
       true
     end
 
-    def self.load_ply_splats_file_as_object(id, filename)
+    def self.load_ply_splats_file_as_object(id, filename, up_axis_mode: self.up_axis_mode)
       return nil unless ensure_initialized
       return nil unless @renderer_dll_loaded
       return nil unless @load_splat_object_from_ply
@@ -291,12 +373,23 @@ module GaussianPoints
       center_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE] = [0.0, 0.0, 0.0].pack('d3')
       half_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE] = [0.0, 0.0, 0.0].pack('d3')
 
-      result = @load_splat_object_from_ply.call(
-        to_c_string(id),
-        to_c_string(filename.tr('/', '\\')),
-        center_buffer,
-        half_buffer
-      )
+      result =
+        if @load_splat_object_from_ply_with_up_axis
+          @load_splat_object_from_ply_with_up_axis.call(
+            to_c_string(id),
+            to_c_string(filename.tr('/', '\\')),
+            center_buffer,
+            half_buffer,
+            up_axis_mode_native_value(up_axis_mode)
+          )
+        else
+          @load_splat_object_from_ply.call(
+            to_c_string(id),
+            to_c_string(filename.tr('/', '\\')),
+            center_buffer,
+            half_buffer
+          )
+        end
       return nil if result == 0
 
       center = center_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE].unpack('d3')
