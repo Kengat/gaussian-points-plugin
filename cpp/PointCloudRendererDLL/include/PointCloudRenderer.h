@@ -7,19 +7,11 @@
 #define EXPORT
 #endif
 
-// Матрицы из хука
-extern __declspec(dllimport) float g_currentModelview[16];
-extern __declspec(dllimport) float g_currentProjection[16];
-
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-	// Функция для установки данных облака точек
-	EXPORT void SetPointCloud(const double* points_in, int count);
-
-	// Функция для рендеринга облака точек
-	EXPORT void renderPointCloud();
+EXPORT void SetPointCloud(const double* points_in, int count);
+EXPORT void renderPointCloud();
 
 #ifdef __cplusplus
 }

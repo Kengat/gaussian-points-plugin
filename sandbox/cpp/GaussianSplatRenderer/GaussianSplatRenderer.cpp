@@ -1,4 +1,4 @@
-#include "GaussianSplatRenderer.h"
+п»ї#include "GaussianSplatRenderer.h"
 #include <windows.h>
 #include <GL/glew.h>
 #include <GL/gl.h>
@@ -10,30 +10,30 @@
 #include <cmath>
 #include <algorithm>
 #include <map>
-#include <numeric> // Для std::iota
+#include <numeric> // Р”Р»СЏ std::iota
 
 #define NOMINMAX
 #undef min
 #undef max
 #define M_PI 3.14159265358979323846
 
-// --- Типы функций хука ---
+// --- РўРёРїС‹ С„СѓРЅРєС†РёР№ С…СѓРєР° ---
 typedef bool (*PFN_GET_MATRIX_BY_LOC)(int location, float* matrix);
 typedef bool (*PFN_GET_CAMERA_STATE)(float* position, float* target, float* up, int* isPerspective);
 static PFN_GET_MATRIX_BY_LOC GetMatrixByLocation = nullptr;
 static PFN_GET_CAMERA_STATE GetCameraState = nullptr;
 
-// --- Глобальные переменные ---
-static std::vector<float> g_points;     // Для хранения данных из SetPointCloud
-static bool g_dataReady = false;        // Флаг для g_points
+// --- Р“Р»РѕР±Р°Р»СЊРЅС‹Рµ РїРµСЂРµРјРµРЅРЅС‹Рµ ---
+static std::vector<float> g_points;     // Р”Р»СЏ С…СЂР°РЅРµРЅРёСЏ РґР°РЅРЅС‹С… РёР· SetPointCloud
+static bool g_dataReady = false;        // Р¤Р»Р°Рі РґР»СЏ g_points
 static GLuint g_gaussTexture = 0;
 static bool g_textureInitialized = false;
 
 struct GaussSplat {
-    float position[3]; // X, Y, Z координаты (мировые)
+    float position[3]; // X, Y, Z РєРѕРѕСЂРґРёРЅР°С‚С‹ (РјРёСЂРѕРІС‹Рµ)
     float color[4];    // R, G, B, A
-    float scale[2];    // X, Y масштаб
-    float rotation[4]; // Кватернион вращения (w, x, y, z)
+    float scale[2];    // X, Y РјР°СЃС€С‚Р°Р±
+    float rotation[4]; // РљРІР°С‚РµСЂРЅРёРѕРЅ РІСЂР°С‰РµРЅРёСЏ (w, x, y, z)
 };
 static std::vector<GaussSplat> g_splats;
 
@@ -51,29 +51,29 @@ struct SplatVBOData {
     std::vector<VertexData> vertices; std::vector<GLuint> indices;
     bool initialized = false; bool needsUpdate = true;
 };
-static SplatVBOData g_splatVBO; // Инициализация по умолчанию
+static SplatVBOData g_splatVBO; // РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ
 
-static std::vector<GLuint> g_splatSortIndices; // Индексы сплэтов для сортировки
+static std::vector<GLuint> g_splatSortIndices; // РРЅРґРµРєСЃС‹ СЃРїР»СЌС‚РѕРІ РґР»СЏ СЃРѕСЂС‚РёСЂРѕРІРєРё
 
-// Структура для оптимизации сортировки
+// РЎС‚СЂСѓРєС‚СѓСЂР° РґР»СЏ РѕРїС‚РёРјРёР·Р°С†РёРё СЃРѕСЂС‚РёСЂРѕРІРєРё
 struct SplatSortData {
-    GLuint index;         // Исходный индекс сплата
-    float projValue;      // Проекция на направление взгляда
-    float distanceSquared; // Квадрат расстояния до камеры
-    float sortKey;        // Финальный ключ сортировки
-    bool isBackfacing;    // Обращён ли назад
+    GLuint index;         // РСЃС…РѕРґРЅС‹Р№ РёРЅРґРµРєСЃ СЃРїР»Р°С‚Р°
+    float projValue;      // РџСЂРѕРµРєС†РёСЏ РЅР° РЅР°РїСЂР°РІР»РµРЅРёРµ РІР·РіР»СЏРґР°
+    float distanceSquared; // РљРІР°РґСЂР°С‚ СЂР°СЃСЃС‚РѕСЏРЅРёСЏ РґРѕ РєР°РјРµСЂС‹
+    float sortKey;        // Р¤РёРЅР°Р»СЊРЅС‹Р№ РєР»СЋС‡ СЃРѕСЂС‚РёСЂРѕРІРєРё
+    bool isBackfacing;    // РћР±СЂР°С‰С‘РЅ Р»Рё РЅР°Р·Р°Рґ
 };
 static std::vector<SplatSortData> g_splatSortCache;
 
-// Переменные для отслеживания изменений камеры
+// РџРµСЂРµРјРµРЅРЅС‹Рµ РґР»СЏ РѕС‚СЃР»РµР¶РёРІР°РЅРёСЏ РёР·РјРµРЅРµРЅРёР№ РєР°РјРµСЂС‹
 static float g_lastCamPos[3] = { 0, 0, 0 };
 static float g_lastViewDir[3] = { 0, 0, 0 };
 static int g_framesSinceLastSort = 0;
-static const int SORT_EVERY_N_FRAMES = 2; // Сортировать каждые 2 кадра
+static const int SORT_EVERY_N_FRAMES = 2; // РЎРѕСЂС‚РёСЂРѕРІР°С‚СЊ РєР°Р¶РґС‹Рµ 2 РєР°РґСЂР°
 
-static GLuint g_splatShader = 0; // Шейдерная программа
+static GLuint g_splatShader = 0; // РЁРµР№РґРµСЂРЅР°СЏ РїСЂРѕРіСЂР°РјРјР°
 
-// --- Утилиты ---
+// --- РЈС‚РёР»РёС‚С‹ ---
 static void LogRenderer(const char* format, ...) {
     char buffer[1024]; va_list args; va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args); va_end(args);
@@ -119,7 +119,7 @@ static void TransposeMat4(const float* source, float* result) {
     }
 }
 
-// --- Математика и OpenGL подготовка ---
+// --- РњР°С‚РµРјР°С‚РёРєР° Рё OpenGL РїРѕРґРіРѕС‚РѕРІРєР° ---
 void QuaternionToMatrix(float q0, float q1, float q2, float q3, float matrix[16]) {
     float norm = sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
     if (norm < 1e-5f) { memset(matrix, 0, 16 * sizeof(float)); matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f; return; }
@@ -148,13 +148,13 @@ static GLuint CreateSplatShader() {
     glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
     glCompileShader(vertexShader);
     GLint success; char infoLog[512]; glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
-    if (!success) { glGetShaderInfoLog(vertexShader, 512, NULL, infoLog); LogRenderer("ERROR: VS compile failed: %s", infoLog); glDeleteShader(vertexShader); return 0; } // Добавил удаление шейдера при ошибке
+    if (!success) { glGetShaderInfoLog(vertexShader, 512, NULL, infoLog); LogRenderer("ERROR: VS compile failed: %s", infoLog); glDeleteShader(vertexShader); return 0; } // Р”РѕР±Р°РІРёР» СѓРґР°Р»РµРЅРёРµ С€РµР№РґРµСЂР° РїСЂРё РѕС€РёР±РєРµ
 
     GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
     glCompileShader(fragmentShader);
     glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
-    if (!success) { glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog); LogRenderer("ERROR: FS compile failed: %s", infoLog); glDeleteShader(vertexShader); glDeleteShader(fragmentShader); return 0; } // Добавил удаление шейдеров
+    if (!success) { glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog); LogRenderer("ERROR: FS compile failed: %s", infoLog); glDeleteShader(vertexShader); glDeleteShader(fragmentShader); return 0; } // Р”РѕР±Р°РІРёР» СѓРґР°Р»РµРЅРёРµ С€РµР№РґРµСЂРѕРІ
 
     GLuint shaderProgram = glCreateProgram();
     glAttachShader(shaderProgram, vertexShader);
@@ -166,8 +166,8 @@ static GLuint CreateSplatShader() {
     glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
     if (!success) { glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog); LogRenderer("ERROR: Shader link failed: %s", infoLog); }
 
-    glDeleteShader(vertexShader); glDeleteShader(fragmentShader); // Удаляем в любом случае после линковки
-    if (!success) { glDeleteProgram(shaderProgram); return 0; } // Если линковка не удалась, удаляем программу
+    glDeleteShader(vertexShader); glDeleteShader(fragmentShader); // РЈРґР°Р»СЏРµРј РІ Р»СЋР±РѕРј СЃР»СѓС‡Р°Рµ РїРѕСЃР»Рµ Р»РёРЅРєРѕРІРєРё
+    if (!success) { glDeleteProgram(shaderProgram); return 0; } // Р•СЃР»Рё Р»РёРЅРєРѕРІРєР° РЅРµ СѓРґР°Р»Р°СЃСЊ, СѓРґР°Р»СЏРµРј РїСЂРѕРіСЂР°РјРјСѓ
     LogRenderer("Shader program created successfully (ID: %u).", shaderProgram);
     return shaderProgram;
 }
@@ -190,7 +190,7 @@ static GLuint CreateGaussianTexture(int size, float sigma) {
     return texture;
 }
 
-// --- VBO Инициализация и Обновление ---
+// --- VBO РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ Рё РћР±РЅРѕРІР»РµРЅРёРµ ---
 static void InitializeSplatVBO() {
     if (g_splatVBO.initialized) return;
     LogRenderer("Initializing Splat VBO...");
@@ -200,11 +200,11 @@ static void InitializeSplatVBO() {
     glGenVertexArrays(1, &g_splatVBO.vao); glBindVertexArray(g_splatVBO.vao);
     glGenBuffers(1, &g_splatVBO.vbo); glBindBuffer(GL_ARRAY_BUFFER, g_splatVBO.vbo);
     glGenBuffers(1, &g_splatVBO.ebo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo);
-    // Атрибуты
+    // РђС‚СЂРёР±СѓС‚С‹
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(SplatVBOData::VertexData), (void*)offsetof(SplatVBOData::VertexData, position)); glEnableVertexAttribArray(0);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SplatVBOData::VertexData), (void*)offsetof(SplatVBOData::VertexData, texCoord)); glEnableVertexAttribArray(1);
     glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(SplatVBOData::VertexData), (void*)offsetof(SplatVBOData::VertexData, color)); glEnableVertexAttribArray(2);
-    glBindBuffer(GL_ARRAY_BUFFER, 0); glBindVertexArray(0); // Отвязка
+    glBindBuffer(GL_ARRAY_BUFFER, 0); glBindVertexArray(0); // РћС‚РІСЏР·РєР°
 
     if (g_splatShader == 0) { g_splatShader = CreateSplatShader(); }
     if (g_splatShader == 0) { LogRenderer("ERROR: Shader creation failed during VBO init. VBO unusable."); return; }
@@ -264,7 +264,7 @@ static void UpdateSplatVBOVertices() {
 
 static void UpdateSplatEBO() {
     if (!g_splatVBO.initialized) {
-        // LogRenderer("DEBUG: UpdateSplatEBO skip - VBO not initialized."); // Раскомментируй для отладки
+        // LogRenderer("DEBUG: UpdateSplatEBO skip - VBO not initialized."); // Р Р°СЃРєРѕРјРјРµРЅС‚РёСЂСѓР№ РґР»СЏ РѕС‚Р»Р°РґРєРё
         return;
     }
     if (g_splatVBO.ebo == 0) {
@@ -273,41 +273,41 @@ static void UpdateSplatEBO() {
     }
 
     if (g_splatSortIndices.empty()) {
-        // LogRenderer("DEBUG: UpdateSplatEBO skip - g_splatSortIndices is empty."); // Раскомментируй для отладки
-        // Если сортировочные индексы пусты, но EBO не пуст, очистим его
+        // LogRenderer("DEBUG: UpdateSplatEBO skip - g_splatSortIndices is empty."); // Р Р°СЃРєРѕРјРјРµРЅС‚РёСЂСѓР№ РґР»СЏ РѕС‚Р»Р°РґРєРё
+        // Р•СЃР»Рё СЃРѕСЂС‚РёСЂРѕРІРѕС‡РЅС‹Рµ РёРЅРґРµРєСЃС‹ РїСѓСЃС‚С‹, РЅРѕ EBO РЅРµ РїСѓСЃС‚, РѕС‡РёСЃС‚РёРј РµРіРѕ
         if (!g_splatVBO.indices.empty()) {
             LogRenderer("DEBUG: Clearing EBO as sort indices are empty.");
-            glBindVertexArray(g_splatVBO.vao); // Нужен VAO для привязки EBO
+            glBindVertexArray(g_splatVBO.vao); // РќСѓР¶РµРЅ VAO РґР»СЏ РїСЂРёРІСЏР·РєРё EBO
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW); // Очищаем буфер на GPU
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW); // РћС‡РёС‰Р°РµРј Р±СѓС„РµСЂ РЅР° GPU
             glBindVertexArray(0);
-            g_splatVBO.indices.clear(); // Очищаем и CPU-копию индексов
+            g_splatVBO.indices.clear(); // РћС‡РёС‰Р°РµРј Рё CPU-РєРѕРїРёСЋ РёРЅРґРµРєСЃРѕРІ
         }
         return;
     }
 
-    // 1. Генерируем индексы в векторе g_splatVBO.indices на CPU
-    // LogRenderer("DEBUG: Generating %zu indices for EBO...", g_splatSortIndices.size() * 6); // Слишком часто
+    // 1. Р“РµРЅРµСЂРёСЂСѓРµРј РёРЅРґРµРєСЃС‹ РІ РІРµРєС‚РѕСЂРµ g_splatVBO.indices РЅР° CPU
+    // LogRenderer("DEBUG: Generating %zu indices for EBO...", g_splatSortIndices.size() * 6); // РЎР»РёС€РєРѕРј С‡Р°СЃС‚Рѕ
 
-    g_splatVBO.indices.clear(); // Очищаем старые CPU-индексы
-    g_splatVBO.indices.reserve(g_splatSortIndices.size() * 6); // Резервируем память для производительности
+    g_splatVBO.indices.clear(); // РћС‡РёС‰Р°РµРј СЃС‚Р°СЂС‹Рµ CPU-РёРЅРґРµРєСЃС‹
+    g_splatVBO.indices.reserve(g_splatSortIndices.size() * 6); // Р РµР·РµСЂРІРёСЂСѓРµРј РїР°РјСЏС‚СЊ РґР»СЏ РїСЂРѕРёР·РІРѕРґРёС‚РµР»СЊРЅРѕСЃС‚Рё
 
     for (GLuint splatIndex : g_splatSortIndices) {
-        // Проверка на валидность индекса сплэта
+        // РџСЂРѕРІРµСЂРєР° РЅР° РІР°Р»РёРґРЅРѕСЃС‚СЊ РёРЅРґРµРєСЃР° СЃРїР»СЌС‚Р°
         if (splatIndex >= g_splats.size()) {
-            // LogRenderer("ERROR UpdateSplatEBO: Invalid splatIndex %u (max: %zu)", splatIndex, g_splats.size() - 1); // Раскомментируй для отладки
-            continue; // Пропускаем невалидный индекс
+            // LogRenderer("ERROR UpdateSplatEBO: Invalid splatIndex %u (max: %zu)", splatIndex, g_splats.size() - 1); // Р Р°СЃРєРѕРјРјРµРЅС‚РёСЂСѓР№ РґР»СЏ РѕС‚Р»Р°РґРєРё
+            continue; // РџСЂРѕРїСѓСЃРєР°РµРј РЅРµРІР°Р»РёРґРЅС‹Р№ РёРЅРґРµРєСЃ
         }
 
-        GLuint baseVertexIndex = splatIndex * 4; // Индекс первой вершины для этого сплэта в VBO
+        GLuint baseVertexIndex = splatIndex * 4; // РРЅРґРµРєСЃ РїРµСЂРІРѕР№ РІРµСЂС€РёРЅС‹ РґР»СЏ СЌС‚РѕРіРѕ СЃРїР»СЌС‚Р° РІ VBO
 
-        // Проверка на валидность индекса вершины
+        // РџСЂРѕРІРµСЂРєР° РЅР° РІР°Р»РёРґРЅРѕСЃС‚СЊ РёРЅРґРµРєСЃР° РІРµСЂС€РёРЅС‹
         if (baseVertexIndex + 3 >= g_splatVBO.vertices.size()) {
-            // LogRenderer("ERROR UpdateSplatEBO: Invalid baseVertexIndex %u (max: %zu)", baseVertexIndex, g_splatVBO.vertices.size() - 1); // Раскомментируй для отладки
-            continue; // Пропускаем, если вершины для этого сплэта отсутствуют
+            // LogRenderer("ERROR UpdateSplatEBO: Invalid baseVertexIndex %u (max: %zu)", baseVertexIndex, g_splatVBO.vertices.size() - 1); // Р Р°СЃРєРѕРјРјРµРЅС‚РёСЂСѓР№ РґР»СЏ РѕС‚Р»Р°РґРєРё
+            continue; // РџСЂРѕРїСѓСЃРєР°РµРј, РµСЃР»Рё РІРµСЂС€РёРЅС‹ РґР»СЏ СЌС‚РѕРіРѕ СЃРїР»СЌС‚Р° РѕС‚СЃСѓС‚СЃС‚РІСѓСЋС‚
         }
 
-        // Добавляем 6 индексов для двух треугольников квада
+        // Р”РѕР±Р°РІР»СЏРµРј 6 РёРЅРґРµРєСЃРѕРІ РґР»СЏ РґРІСѓС… С‚СЂРµСѓРіРѕР»СЊРЅРёРєРѕРІ РєРІР°РґР°
         g_splatVBO.indices.push_back(baseVertexIndex + 0);
         g_splatVBO.indices.push_back(baseVertexIndex + 1);
         g_splatVBO.indices.push_back(baseVertexIndex + 2);
@@ -317,30 +317,30 @@ static void UpdateSplatEBO() {
         g_splatVBO.indices.push_back(baseVertexIndex + 3);
     }
 
-    // 2. Загружаем сгенерированные индексы в GPU одним вызовом glBufferData
-    // LogRenderer("DEBUG: Uploading %zu indices (%zu bytes) to EBO (ID: %u)...", g_splatVBO.indices.size(), g_splatVBO.indices.size() * sizeof(GLuint), g_splatVBO.ebo); // Слишком часто
+    // 2. Р—Р°РіСЂСѓР¶Р°РµРј СЃРіРµРЅРµСЂРёСЂРѕРІР°РЅРЅС‹Рµ РёРЅРґРµРєСЃС‹ РІ GPU РѕРґРЅРёРј РІС‹Р·РѕРІРѕРј glBufferData
+    // LogRenderer("DEBUG: Uploading %zu indices (%zu bytes) to EBO (ID: %u)...", g_splatVBO.indices.size(), g_splatVBO.indices.size() * sizeof(GLuint), g_splatVBO.ebo); // РЎР»РёС€РєРѕРј С‡Р°СЃС‚Рѕ
 
-    glBindVertexArray(g_splatVBO.vao); // Привязываем VAO
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo); // Привязываем наш EBO
+    glBindVertexArray(g_splatVBO.vao); // РџСЂРёРІСЏР·С‹РІР°РµРј VAO
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo); // РџСЂРёРІСЏР·С‹РІР°РµРј РЅР°С€ EBO
 
-    // Используем glBufferData для загрузки данных. GL_DYNAMIC_DRAW - подсказка драйверу, что данные будут часто меняться.
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,           // Цель - индексный буфер
-        g_splatVBO.indices.size() * sizeof(GLuint), // Размер данных в байтах
-        g_splatVBO.indices.data(),          // Указатель на данные (из вектора)
-        GL_DYNAMIC_DRAW);                   // Подсказка использования
+    // РСЃРїРѕР»СЊР·СѓРµРј glBufferData РґР»СЏ Р·Р°РіСЂСѓР·РєРё РґР°РЅРЅС‹С…. GL_DYNAMIC_DRAW - РїРѕРґСЃРєР°Р·РєР° РґСЂР°Р№РІРµСЂСѓ, С‡С‚Рѕ РґР°РЅРЅС‹Рµ Р±СѓРґСѓС‚ С‡Р°СЃС‚Рѕ РјРµРЅСЏС‚СЊСЃСЏ.
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,           // Р¦РµР»СЊ - РёРЅРґРµРєСЃРЅС‹Р№ Р±СѓС„РµСЂ
+        g_splatVBO.indices.size() * sizeof(GLuint), // Р Р°Р·РјРµСЂ РґР°РЅРЅС‹С… РІ Р±Р°Р№С‚Р°С…
+        g_splatVBO.indices.data(),          // РЈРєР°Р·Р°С‚РµР»СЊ РЅР° РґР°РЅРЅС‹Рµ (РёР· РІРµРєС‚РѕСЂР°)
+        GL_DYNAMIC_DRAW);                   // РџРѕРґСЃРєР°Р·РєР° РёСЃРїРѕР»СЊР·РѕРІР°РЅРёСЏ
 
-    glBindVertexArray(0); // Отвязываем VAO (EBO останется привязанным к VAO)
+    glBindVertexArray(0); // РћС‚РІСЏР·С‹РІР°РµРј VAO (EBO РѕСЃС‚Р°РЅРµС‚СЃСЏ РїСЂРёРІСЏР·Р°РЅРЅС‹Рј Рє VAO)
 
-    // Проверка на ошибки OpenGL после загрузки
+    // РџСЂРѕРІРµСЂРєР° РЅР° РѕС€РёР±РєРё OpenGL РїРѕСЃР»Рµ Р·Р°РіСЂСѓР·РєРё
     GLenum err = glGetError();
     if (err != GL_NO_ERROR) {
         LogRenderer("ERROR: OpenGL Error 0x%x after EBO update (glBufferData)! Check buffer size and memory.", err);
     }
-    // LogRenderer("DEBUG: UpdateSplatEBO finished."); // Слишком часто
+    // LogRenderer("DEBUG: UpdateSplatEBO finished."); // РЎР»РёС€РєРѕРј С‡Р°СЃС‚Рѕ
 }
 
-// --- Инициализация и Вспомогательные Функции ---
-static void InitializeDefaultSplats() { LogRenderer("Init default splat."); g_splats.clear(); GaussSplat s; s.position[0] = 0; s.position[1] = 0; s.position[2] = 0; s.color[0] = 0; s.color[1] = 0; s.color[2] = 1; s.color[3] = 0.8f; s.scale[0] = 50; s.scale[1] = 50; s.rotation[0] = 1; s.rotation[1] = 0; s.rotation[2] = 0; s.rotation[3] = 0; g_splats.push_back(s); g_splatVBO.needsUpdate = true; }
+// --- РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ Рё Р’СЃРїРѕРјРѕРіР°С‚РµР»СЊРЅС‹Рµ Р¤СѓРЅРєС†РёРё ---
+static void InitializeDefaultSplats() { LogRenderer("Default splat disabled."); g_splats.clear(); g_splatSortIndices.clear(); g_splatVBO.needsUpdate = true; }
 static void EnsureTextureInitialized() { if (!g_textureInitialized) { g_gaussTexture = CreateGaussianTexture(64, 0.3f); g_textureInitialized = true; if (g_gaussTexture == 0) LogRenderer("ERR: Gauss texture failed."); } }
 static void LoadHookFunctions() {
     if (GetMatrixByLocation && GetCameraState) return;
@@ -368,20 +368,20 @@ static void Normalize3(float* vector) {
 }
 static void CrossProduct(const float* v1, const float* v2, float* r) { r[0] = v1[1] * v2[2] - v1[2] * v2[1]; r[1] = v1[2] * v2[0] - v1[0] * v2[2]; r[2] = v1[0] * v2[1] - v1[1] * v2[0]; }
 
-// --- Экспортируемые функции управления данными ---
+// --- Р­РєСЃРїРѕСЂС‚РёСЂСѓРµРјС‹Рµ С„СѓРЅРєС†РёРё СѓРїСЂР°РІР»РµРЅРёСЏ РґР°РЅРЅС‹РјРё ---
 extern "C" EXPORT void SetPointCloud(const double* points_in, int count) { LogRenderer("SetPointCloud called."); if (!points_in || count <= 0)return; LoadHookFunctions(); g_points.clear(); g_points.reserve(count * 6); for (int i = 0;i < count;++i) { g_points.push_back((float)points_in[i * 6 + 0]); g_points.push_back((float)points_in[i * 6 + 1]); g_points.push_back((float)points_in[i * 6 + 2]); g_points.push_back((float)points_in[i * 6 + 3] / 255.f); g_points.push_back((float)points_in[i * 6 + 4] / 255.f); g_points.push_back((float)points_in[i * 6 + 5] / 255.f); } g_dataReady = true; }
 extern "C" EXPORT void AddSplat(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float rotation, bool rotateVertical) { GaussSplat s; s.position[0] = x;s.position[1] = y;s.position[2] = z; s.color[0] = r;s.color[1] = g;s.color[2] = b;s.color[3] = a; s.scale[0] = scaleX;s.scale[1] = scaleY; float an = rotation * M_PI / 180.f, ha = an * .5f, sn = sin(ha), cn = cos(ha); s.rotation[0] = cn; if (rotateVertical) { s.rotation[1] = sn;s.rotation[2] = 0;s.rotation[3] = 0; } else { s.rotation[1] = 0;s.rotation[2] = 0;s.rotation[3] = sn; } g_splats.push_back(s); g_splatVBO.needsUpdate = true; }
 extern "C" EXPORT void AddSplatWithQuaternion(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float qw, float qx, float qy, float qz) { GaussSplat s; s.position[0] = x;s.position[1] = y;s.position[2] = z; s.color[0] = r;s.color[1] = g;s.color[2] = b;s.color[3] = std::max(0.01f, std::min(a, 1.f)); s.scale[0] = scaleX;s.scale[1] = scaleY; float n = sqrt(qw * qw + qx * qx + qy * qy + qz * qz); if (n > 1e-5f) { s.rotation[0] = qw / n;s.rotation[1] = qx / n;s.rotation[2] = qy / n;s.rotation[3] = qz / n; } else { s.rotation[0] = 1;s.rotation[1] = 0;s.rotation[2] = 0;s.rotation[3] = 0; } g_splats.push_back(s); g_splatVBO.needsUpdate = true; }
 extern "C" EXPORT void ClearSplats() { LogRenderer("ClearSplats called."); g_splats.clear(); g_splatSortIndices.clear(); g_splatVBO.needsUpdate = true; }
 extern "C" EXPORT void SetSplatSortingMode(SplatSortingMode mode) { if (mode >= 0 && mode <= 5) { g_sortingMode = mode; LogRenderer("Sort mode set %d.", mode); } else LogRenderer("Invalid sort mode %d.", mode); }
 
-// --- Рендеринг ---
+// --- Р РµРЅРґРµСЂРёРЅРі ---
 static void RenderSingleSplatIM(const GaussSplat& splat, const float* viewMatrix, const float* projectionMatrix) { glPushMatrix(); glTranslatef(splat.position[0], splat.position[1], splat.position[2]); float rm[16]; QuaternionToMatrix(splat.rotation[0], splat.rotation[1], splat.rotation[2], splat.rotation[3], rm); glMultMatrixf(rm); glScalef(splat.scale[0], splat.scale[1], 1.0f); glColor4f(splat.color[0], splat.color[1], splat.color[2], splat.color[3]); float qs = 1.0f; glBegin(GL_QUADS); glTexCoord2f(0, 0);glVertex3f(-qs, -qs, 0); glTexCoord2f(1, 0);glVertex3f(qs, -qs, 0); glTexCoord2f(1, 1);glVertex3f(qs, qs, 0); glTexCoord2f(0, 1);glVertex3f(-qs, qs, 0); glEnd(); glPopMatrix(); }
 static bool CheckGLCapabilities() { GLenum e = glewInit(); if (e != GLEW_OK) { LogRenderer("GLEW failed:%s", glewGetErrorString(e));return false; } if (!GLEW_VERSION_2_0 || !GLEW_ARB_vertex_buffer_object) { LogRenderer("WARN No VBO/Shader support");return false; } LogRenderer("OpenGL VBO/Shader support detected."); return true; }
 
-// --- Основная функция рендеринга ---
+// --- РћСЃРЅРѕРІРЅР°СЏ С„СѓРЅРєС†РёСЏ СЂРµРЅРґРµСЂРёРЅРіР° ---
 extern "C" EXPORT void renderPointCloud() {
-    // LogRenderer("DEBUG: renderPointCloud ENTER"); // Слишком часто
+    // LogRenderer("DEBUG: renderPointCloud ENTER"); // РЎР»РёС€РєРѕРј С‡Р°СЃС‚Рѕ
     LoadHookFunctions(); if (!GetMatrixByLocation) { LogRenderer("ERROR: GetMatrixByLocation is NULL, cannot proceed."); return; } if (!GetCameraState) { LogRenderer("ERROR: GetCameraState is NULL, cannot proceed."); return; }
 
     static bool firstCall = true; static bool useVBO = false;
@@ -399,7 +399,7 @@ extern "C" EXPORT void renderPointCloud() {
         if (!g_splatVBO.initialized) { LogRenderer("WARN: VBO re-init failed. Disabling VBO path."); useVBO = false; }
     }
 
-    if (g_splats.empty()) { return; } // Нечего рендерить
+    if (g_splats.empty()) { return; } // РќРµС‡РµРіРѕ СЂРµРЅРґРµСЂРёС‚СЊ
 
     if (g_splatVBO.needsUpdate) {
         LogRenderer("DEBUG: renderPointCloud - needsUpdate=true, calling UpdateSplatVBOVertices()");
@@ -443,13 +443,13 @@ extern "C" EXPORT void renderPointCloud() {
         if (g_splatSortIndices.size() != g_splats.size()) {
             g_splatSortIndices.resize(g_splats.size()); std::iota(g_splatSortIndices.begin(), g_splatSortIndices.end(), 0);
             LogRenderer("DEBUG: Resized sort indices to %zu in sort block.", g_splatSortIndices.size());
-            sorting_done = true; // Нужно обновить EBO после изменения размера
+            sorting_done = true; // РќСѓР¶РЅРѕ РѕР±РЅРѕРІРёС‚СЊ EBO РїРѕСЃР»Рµ РёР·РјРµРЅРµРЅРёСЏ СЂР°Р·РјРµСЂР°
         }
 
-        // Проверяем, нужно ли выполнять сортировку
+        // РџСЂРѕРІРµСЂСЏРµРј, РЅСѓР¶РЅРѕ Р»Рё РІС‹РїРѕР»РЅСЏС‚СЊ СЃРѕСЂС‚РёСЂРѕРІРєСѓ
         bool needSorting = false;
 
-        // Проверяем, значительно ли изменилась камера
+        // РџСЂРѕРІРµСЂСЏРµРј, Р·РЅР°С‡РёС‚РµР»СЊРЅРѕ Р»Рё РёР·РјРµРЅРёР»Р°СЃСЊ РєР°РјРµСЂР°
         float posDistSq =
             (camPos[0] - g_lastCamPos[0]) * (camPos[0] - g_lastCamPos[0]) +
             (camPos[1] - g_lastCamPos[1]) * (camPos[1] - g_lastCamPos[1]) +
@@ -460,82 +460,82 @@ extern "C" EXPORT void renderPointCloud() {
             (viewDir[1] - g_lastViewDir[1]) * (viewDir[1] - g_lastViewDir[1]) +
             (viewDir[2] - g_lastViewDir[2]) * (viewDir[2] - g_lastViewDir[2]);
 
-        // Увеличиваем счетчик кадров
+        // РЈРІРµР»РёС‡РёРІР°РµРј СЃС‡РµС‚С‡РёРє РєР°РґСЂРѕРІ
         g_framesSinceLastSort++;
 
-        // Если камера сдвинулась более чем на 0.01 единиц или поворот более 0.001 рад
-        // или прошло достаточно кадров - выполняем сортировку
+        // Р•СЃР»Рё РєР°РјРµСЂР° СЃРґРІРёРЅСѓР»Р°СЃСЊ Р±РѕР»РµРµ С‡РµРј РЅР° 0.01 РµРґРёРЅРёС† РёР»Рё РїРѕРІРѕСЂРѕС‚ Р±РѕР»РµРµ 0.001 СЂР°Рґ
+        // РёР»Рё РїСЂРѕС€Р»Рѕ РґРѕСЃС‚Р°С‚РѕС‡РЅРѕ РєР°РґСЂРѕРІ - РІС‹РїРѕР»РЅСЏРµРј СЃРѕСЂС‚РёСЂРѕРІРєСѓ
         if (posDistSq > 0.0001f || dirDiff > 0.000001f || g_framesSinceLastSort >= SORT_EVERY_N_FRAMES) {
             needSorting = true;
 
-            // Обновляем последнюю позицию камеры
+            // РћР±РЅРѕРІР»СЏРµРј РїРѕСЃР»РµРґРЅСЋСЋ РїРѕР·РёС†РёСЋ РєР°РјРµСЂС‹
             memcpy(g_lastCamPos, camPos, 3 * sizeof(float));
             memcpy(g_lastViewDir, viewDir, 3 * sizeof(float));
 
-            // Сбрасываем счетчик кадров
+            // РЎР±СЂР°СЃС‹РІР°РµРј СЃС‡РµС‚С‡РёРє РєР°РґСЂРѕРІ
             g_framesSinceLastSort = 0;
         }
 
-        // Если нужна сортировка, выполняем её
+        // Р•СЃР»Рё РЅСѓР¶РЅР° СЃРѕСЂС‚РёСЂРѕРІРєР°, РІС‹РїРѕР»РЅСЏРµРј РµС‘
         if (needSorting) {
             LogRenderer("DEBUG: Sorting %zu indices for view changes or frame limit...", g_splats.size());
 
-            // Предварительное вычисление данных для сортировки
+            // РџСЂРµРґРІР°СЂРёС‚РµР»СЊРЅРѕРµ РІС‹С‡РёСЃР»РµРЅРёРµ РґР°РЅРЅС‹С… РґР»СЏ СЃРѕСЂС‚РёСЂРѕРІРєРё
             g_splatSortCache.resize(g_splats.size());
 
-            // Заполняем кэш данными для сортировки
+            // Р—Р°РїРѕР»РЅСЏРµРј РєСЌС€ РґР°РЅРЅС‹РјРё РґР»СЏ СЃРѕСЂС‚РёСЂРѕРІРєРё
             for (size_t i = 0; i < g_splats.size(); ++i) {
                 const GaussSplat& splat = g_splats[i];
                 SplatSortData& sortData = g_splatSortCache[i];
 
                 sortData.index = i;
 
-                // Вычисление вектора от камеры к сплату
+                // Р’С‹С‡РёСЃР»РµРЅРёРµ РІРµРєС‚РѕСЂР° РѕС‚ РєР°РјРµСЂС‹ Рє СЃРїР»Р°С‚Сѓ
                 float vec[3] = {
                     splat.position[0] - camPos[0],
                     splat.position[1] - camPos[1],
                     splat.position[2] - camPos[2]
                 };
 
-                // Проекция вектора на направление взгляда
+                // РџСЂРѕРµРєС†РёСЏ РІРµРєС‚РѕСЂР° РЅР° РЅР°РїСЂР°РІР»РµРЅРёРµ РІР·РіР»СЏРґР°
                 sortData.projValue = vec[0] * viewDir[0] + vec[1] * viewDir[1] + vec[2] * viewDir[2];
 
-                // Квадрат расстояния
+                // РљРІР°РґСЂР°С‚ СЂР°СЃСЃС‚РѕСЏРЅРёСЏ
                 sortData.distanceSquared = vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2];
 
-                // Направлен ли сплат от нас
+                // РќР°РїСЂР°РІР»РµРЅ Р»Рё СЃРїР»Р°С‚ РѕС‚ РЅР°СЃ
                 sortData.isBackfacing = (sortData.projValue <= 0);
 
-                // Вычисление ключа сортировки
+                // Р’С‹С‡РёСЃР»РµРЅРёРµ РєР»СЋС‡Р° СЃРѕСЂС‚РёСЂРѕРІРєРё
                 if (!sortData.isBackfacing) {
-                    // Для передних граней: проекция + небольшая доля расстояния
+                    // Р”Р»СЏ РїРµСЂРµРґРЅРёС… РіСЂР°РЅРµР№: РїСЂРѕРµРєС†РёСЏ + РЅРµР±РѕР»СЊС€Р°СЏ РґРѕР»СЏ СЂР°СЃСЃС‚РѕСЏРЅРёСЏ
                     float distanceFactor = sortData.distanceSquared * 0.001f;
-                    // Защита от деления на очень маленькие числа
+                    // Р—Р°С‰РёС‚Р° РѕС‚ РґРµР»РµРЅРёСЏ РЅР° РѕС‡РµРЅСЊ РјР°Р»РµРЅСЊРєРёРµ С‡РёСЃР»Р°
                     if (sortData.projValue > 0.001f) {
                         distanceFactor /= sortData.projValue;
                     }
                     sortData.sortKey = sortData.projValue + distanceFactor;
                 }
                 else {
-                    // Для задних граней: только по расстоянию
+                    // Р”Р»СЏ Р·Р°РґРЅРёС… РіСЂР°РЅРµР№: С‚РѕР»СЊРєРѕ РїРѕ СЂР°СЃСЃС‚РѕСЏРЅРёСЋ
                     sortData.sortKey = sortData.distanceSquared;
                 }
             }
 
-            // Быстрая сортировка по предварительно вычисленным значениям
+            // Р‘С‹СЃС‚СЂР°СЏ СЃРѕСЂС‚РёСЂРѕРІРєР° РїРѕ РїСЂРµРґРІР°СЂРёС‚РµР»СЊРЅРѕ РІС‹С‡РёСЃР»РµРЅРЅС‹Рј Р·РЅР°С‡РµРЅРёСЏРј
             std::sort(g_splatSortCache.begin(), g_splatSortCache.end(),
                 [](const SplatSortData& a, const SplatSortData& b) -> bool {
-                    // Сначала разделяем по направлению (forward/backward)
+                    // РЎРЅР°С‡Р°Р»Р° СЂР°Р·РґРµР»СЏРµРј РїРѕ РЅР°РїСЂР°РІР»РµРЅРёСЋ (forward/backward)
                     if (a.isBackfacing != b.isBackfacing) return a.isBackfacing;
 
-                    // Если оба направлены от нас, сортируем по квадрату расстояния (дальние первыми)
+                    // Р•СЃР»Рё РѕР±Р° РЅР°РїСЂР°РІР»РµРЅС‹ РѕС‚ РЅР°СЃ, СЃРѕСЂС‚РёСЂСѓРµРј РїРѕ РєРІР°РґСЂР°С‚Сѓ СЂР°СЃСЃС‚РѕСЏРЅРёСЏ (РґР°Р»СЊРЅРёРµ РїРµСЂРІС‹РјРё)
                     if (a.isBackfacing) return a.distanceSquared > b.distanceSquared;
 
-                    // Если оба направлены к нам, используем предварительно вычисленный ключ
+                    // Р•СЃР»Рё РѕР±Р° РЅР°РїСЂР°РІР»РµРЅС‹ Рє РЅР°Рј, РёСЃРїРѕР»СЊР·СѓРµРј РїСЂРµРґРІР°СЂРёС‚РµР»СЊРЅРѕ РІС‹С‡РёСЃР»РµРЅРЅС‹Р№ РєР»СЋС‡
                     return a.sortKey > b.sortKey;
                 });
 
-            // Обновляем индексы сортировки
+            // РћР±РЅРѕРІР»СЏРµРј РёРЅРґРµРєСЃС‹ СЃРѕСЂС‚РёСЂРѕРІРєРё
             for (size_t i = 0; i < g_splatSortCache.size(); ++i) {
                 g_splatSortIndices[i] = g_splatSortCache[i].index;
             }
@@ -548,9 +548,9 @@ extern "C" EXPORT void renderPointCloud() {
         if (g_splatVBO.indices.size() != g_splatSortIndices.size() * 6) { LogRenderer("DEBUG: EBO needs update (default order)."); UpdateSplatEBO(); }
     }
 
-    if (sorting_done) { /* LogRenderer("DEBUG: Calling UpdateSplatEBO() after sort.");*/ UpdateSplatEBO(); } // Обновляем EBO *после* сортировки
+    if (sorting_done) { /* LogRenderer("DEBUG: Calling UpdateSplatEBO() after sort.");*/ UpdateSplatEBO(); } // РћР±РЅРѕРІР»СЏРµРј EBO *РїРѕСЃР»Рµ* СЃРѕСЂС‚РёСЂРѕРІРєРё
 
-    // --- Рендеринг ---
+    // --- Р РµРЅРґРµСЂРёРЅРі ---
     GLint oldProg = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg); GLboolean blendEn = glIsEnabled(GL_BLEND); GLint oldBlendSrcRGB, oldBlendDstRGB, oldBlendSrcAlpha, oldBlendDstAlpha; glGetIntegerv(GL_BLEND_SRC_RGB, &oldBlendSrcRGB); glGetIntegerv(GL_BLEND_DST_RGB, &oldBlendDstRGB); glGetIntegerv(GL_BLEND_SRC_ALPHA, &oldBlendSrcAlpha); glGetIntegerv(GL_BLEND_DST_ALPHA, &oldBlendDstAlpha); GLboolean depthEn = glIsEnabled(GL_DEPTH_TEST); GLboolean depthMask; glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask); GLint oldDepthFunc; glGetIntegerv(GL_DEPTH_FUNC, &oldDepthFunc); GLboolean cullEn = glIsEnabled(GL_CULL_FACE); GLint oldCullMode; glGetIntegerv(GL_CULL_FACE_MODE, &oldCullMode); GLboolean texEn = glIsEnabled(GL_TEXTURE_2D); GLint oldActiveTex = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTex); GLint oldTexBind = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexBind);
 
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_FALSE);
@@ -563,7 +563,7 @@ extern "C" EXPORT void renderPointCloud() {
             GLint eboSizeCheck = 0; glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo); glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_SIZE, &eboSizeCheck); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
             if (eboSizeCheck == 0 && g_splatSortIndices.size() > 0) { LogRenderer("WARN: EBO size is 0 but we have sort indices! Skipping draw."); }
             else if (eboSizeCheck > 0) {
-                // LogRenderer("DEBUG: Rendering %d indices using VBO...", eboSizeCheck / sizeof(GLuint)); // Слишком часто
+                // LogRenderer("DEBUG: Rendering %d indices using VBO...", eboSizeCheck / sizeof(GLuint)); // РЎР»РёС€РєРѕРј С‡Р°СЃС‚Рѕ
                 glUseProgram(g_splatShader);
                 GLint mvpLoc = glGetUniformLocation(g_splatShader, "uMVP"); if (mvpLoc != -1) glUniformMatrix4fv(mvpLoc, 1, GL_TRUE, mvpMatrix); else LogRenderer("ERR uMVP loc");
                 GLint texLoc = glGetUniformLocation(g_splatShader, "uTexture"); if (texLoc != -1 && g_gaussTexture != 0) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_gaussTexture); glUniform1i(texLoc, 0); }
@@ -575,7 +575,7 @@ extern "C" EXPORT void renderPointCloud() {
             }
         }
     }
-    else if (!useVBO && hasView && hasProj) { // Проверяем hasProj для IM
+    else if (!useVBO && hasView && hasProj) { // РџСЂРѕРІРµСЂСЏРµРј hasProj РґР»СЏ IM
         LogRenderer("DEBUG: Using Immediate Mode fallback for %zu splats.", g_splatSortIndices.size());
         glUseProgram(0);
         float projectionMatrixGL[16]; float viewMatrixGL[16];
@@ -584,7 +584,7 @@ extern "C" EXPORT void renderPointCloud() {
         glEnable(GL_TEXTURE_2D); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_gaussTexture);
         glMatrixMode(GL_PROJECTION); glLoadMatrixf(projectionMatrixGL);
         glMatrixMode(GL_MODELVIEW); glLoadMatrixf(viewMatrixGL);
-        for (GLuint splatIndex : g_splatSortIndices) { if (splatIndex < g_splats.size()) RenderSingleSplatIM(g_splats[splatIndex], viewMatrix, projectionMatrix); } // Добавил проверку индекса
+        for (GLuint splatIndex : g_splatSortIndices) { if (splatIndex < g_splats.size()) RenderSingleSplatIM(g_splats[splatIndex], viewMatrix, projectionMatrix); } // Р”РѕР±Р°РІРёР» РїСЂРѕРІРµСЂРєСѓ РёРЅРґРµРєСЃР°
         glBindTexture(GL_TEXTURE_2D, 0);
         if (!texEn) glDisable(GL_TEXTURE_2D);
     }
@@ -599,11 +599,11 @@ extern "C" EXPORT void renderPointCloud() {
     else glDisable(GL_CULL_FACE); glActiveTexture(oldActiveTex); glBindTexture(GL_TEXTURE_2D, oldTexBind); if (!texEn && oldTexBind == 0) glDisable(GL_TEXTURE_2D); else if (texEn) glEnable(GL_TEXTURE_2D);
 
     GLenum renderErr = glGetError(); if (renderErr != GL_NO_ERROR) LogRenderer("GL Error after render: 0x%x", renderErr);
-    // LogRenderer("DEBUG: renderPointCloud EXIT"); // Слишком часто
+    // LogRenderer("DEBUG: renderPointCloud EXIT"); // РЎР»РёС€РєРѕРј С‡Р°СЃС‚Рѕ
 }
 
 
-// --- Функции загрузки PLY ---
+// --- Р¤СѓРЅРєС†РёРё Р·Р°РіСЂСѓР·РєРё PLY ---
 void ConvertColor(float dc0, float dc1, float dc2, float& r, float& g, float& b) { auto sig = [](float x) {return 1.f / (1.f + exp(-x));}; r = sig(dc0); g = sig(dc1); b = sig(dc2); }
 void ConvertScale(float s0, float s1, float& sx, float& sy) { float rx = exp(s0); float ry = exp(s1); float sf = 45.f; sx = rx * sf; sy = ry * sf; }
 extern "C" EXPORT void LoadSplatsFromPLY(const char* filename) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); AddSplatsFromPLYData(pts, cnt); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); LogRenderer("PLY load finished."); }
@@ -621,11 +621,11 @@ extern "C" EXPORT void AddSplatsFromPLYData(PLYGaussianPoint* points, int count)
     } g_splatVBO.needsUpdate = true; LogRenderer("Added %d splats. Total: %zu.", addedCount, g_splats.size());
 }
 
-// --- Точка входа DLL и очистка ---
+// --- РўРѕС‡РєР° РІС…РѕРґР° DLL Рё РѕС‡РёСЃС‚РєР° ---
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH: LogRenderer("DLL_PROCESS_ATTACH"); LoadHookFunctions(); break;
-    case DLL_PROCESS_DETACH: LogRenderer("DLL_PROCESS_DETACH"); /* Очистка OpenGL закомментирована */ break;
+    case DLL_PROCESS_DETACH: LogRenderer("DLL_PROCESS_DETACH"); /* РћС‡РёСЃС‚РєР° OpenGL Р·Р°РєРѕРјРјРµРЅС‚РёСЂРѕРІР°РЅР° */ break;
     case DLL_THREAD_ATTACH: break;
     case DLL_THREAD_DETACH: break;
     }

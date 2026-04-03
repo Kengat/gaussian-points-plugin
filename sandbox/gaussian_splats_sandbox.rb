@@ -1,211 +1,242 @@
-﻿# gaussian_splats_sandbox.rb - Песочница для работы с тремя DLL
+# gaussian_splats_sandbox.rb - Internal Gaussian splat runtime for GaussianPoints
 require 'fiddle'
 require 'fiddle/import'
+require 'json'
 require 'sketchup.rb'
 
-module GaussianSplats
-  def self.to_c_string(value)
-    Fiddle::Pointer[(value.encode('UTF-8') + "\0")]
-  end
-
-  def self.resolve_ply_importer_path(plugin_dir)
-    candidates = [
-      File.join(plugin_dir, 'cpp', 'build', 'PlyImporter', 'PlyImporter', 'x64', 'Release', 'PlyImporter.dll'),
-      File.join(plugin_dir, 'PlyImporter.dll')
-    ]
-
-    candidates.find { |path| File.exist?(path) }
-  end
-
-  # Настройка и загрузка всех DLL
-  def self.setup_dlls
-    script_path = File.expand_path(__FILE__)
-    plugin_dir = File.dirname(script_path)
-    ply_dll_path = resolve_ply_importer_path(plugin_dir)
-    extra_paths = [plugin_dir, ply_dll_path && File.dirname(ply_dll_path)].compact.uniq
-    path_entries = ENV.fetch('PATH', '').split(File::PATH_SEPARATOR)
-    ENV['PATH'] = (extra_paths + path_entries.reject { |entry| extra_paths.include?(entry) }).join(File::PATH_SEPARATOR)
-    @support_dlls = []
-    
-    %w[glew32.dll minhook.x64.dll].each do |dll_name|
-      dll_path = File.join(plugin_dir, dll_name)
-      next unless File.exist?(dll_path)
-    
-      @support_dlls << Fiddle.dlopen(dll_path)
+module GaussianPoints
+  module GaussianSplats
+    def self.plugin_dir
+      File.join(GaussianPoints::PLUGIN_DIR, 'sandbox')
     end
-    
-    # Загрузка Hook DLL
-    hook_dll_path = File.join(plugin_dir, "SketchUpOverlayBridge.dll")
-    unless File.exist?(hook_dll_path)
-      UI.messagebox("Не найден Hook DLL: #{hook_dll_path}")
+
+    def self.hook_dll_path
+      candidates = [
+        File.join(plugin_dir, 'cpp', 'build', 'SketchUpOverlayBridge', 'SketchUpOverlayBridge', 'x64', 'Release', 'SketchUpOverlayBridge.dll'),
+        File.join(plugin_dir, 'SketchUpOverlayBridge.dll')
+      ]
+
+      candidates.find { |path| File.exist?(path) }
+    end
+
+    def self.renderer_dll_path
+      candidates = [
+        File.join(plugin_dir, 'runtime', 'GaussianSplatRenderer.dll'),
+        File.join(plugin_dir, 'cpp', 'build', 'GaussianSplatRenderer', 'GaussianSplatRenderer', 'x64', 'Release', 'GaussianSplatRenderer.dll'),
+        File.join(plugin_dir, 'GaussianSplatRenderer.dll')
+      ]
+
+      candidates.find { |path| File.exist?(path) }
+    end
+
+    def self.ply_importer_path
+      candidates = [
+        File.join(plugin_dir, 'cpp', 'build', 'PlyImporter', 'PlyImporter', 'x64', 'Release', 'PlyImporter.dll'),
+        File.join(plugin_dir, 'PlyImporter.dll')
+      ]
+
+      candidates.find { |path| File.exist?(path) }
+    end
+
+    def self.to_c_string(value)
+      Fiddle::Pointer[(value.encode('UTF-8') + "\0")]
+    end
+
+    def self.available?
+      hook_path = hook_dll_path
+      renderer_path = renderer_dll_path
+      !hook_path.nil? && !renderer_path.nil? && File.exist?(hook_path) && File.exist?(renderer_path) && !ply_importer_path.nil?
+    end
+
+    def self.initialized?
+      @initialized == true
+    end
+
+    def self.loaded?
+      @hook_dll_loaded == true && @renderer_dll_loaded == true && @ply_dll_loaded == true
+    end
+
+    def self.status_payload
+      {
+        available: available?,
+        initialized: initialized?,
+        loaded: loaded?,
+        sandbox_dir: plugin_dir,
+        hook_loaded: @hook_dll_loaded == true,
+        renderer_loaded: @renderer_dll_loaded == true,
+        ply_loaded: @ply_dll_loaded == true,
+        hook_path: hook_dll_path,
+        renderer_path: renderer_dll_path,
+        ply_path: ply_importer_path
+      }
+    end
+
+    def self.setup_dlls
+      return true if @setup_complete
+
+      hook_path = hook_dll_path
+      renderer_path = renderer_dll_path
+      ply_dll_path = ply_importer_path
+      extra_paths = [
+        plugin_dir,
+        hook_path && File.dirname(hook_path),
+        renderer_path && File.dirname(renderer_path),
+        ply_dll_path && File.dirname(ply_dll_path)
+      ].compact.uniq
+      path_entries = ENV.fetch('PATH', '').split(File::PATH_SEPARATOR)
+      ENV['PATH'] = (extra_paths + path_entries.reject { |entry| extra_paths.include?(entry) }).join(File::PATH_SEPARATOR)
+      @support_dlls = []
+
+      %w[glew32.dll minhook.x64.dll].each do |dll_name|
+        dll_path = File.join(plugin_dir, dll_name)
+        next unless File.exist?(dll_path)
+
+        @support_dlls << Fiddle.dlopen(dll_path)
+      end
+
+      if hook_path && File.exist?(hook_path)
+        @hook_dll = Fiddle.dlopen(hook_path)
+        @hook_dll_loaded = true
+        puts "[GaussianSplats] hook=#{hook_path}"
+      else
+        @hook_dll_loaded = false
+      end
+
+      if renderer_path && File.exist?(renderer_path)
+        @renderer_dll = Fiddle.dlopen(renderer_path)
+        @renderer_dll_loaded = true
+        puts "[GaussianSplats] renderer=#{renderer_path}"
+      else
+        @renderer_dll_loaded = false
+      end
+
+      if ply_dll_path && File.exist?(ply_dll_path)
+        @ply_dll = Fiddle.dlopen(ply_dll_path)
+        @ply_dll_loaded = true
+        puts "[GaussianSplats] ply=#{ply_dll_path}"
+      else
+        @ply_dll_loaded = false
+      end
+
+      if @hook_dll_loaded
+        @install_all_hooks = Fiddle::Function.new(
+          @hook_dll['InstallAllHooks'],
+          [],
+          Fiddle::TYPE_VOID
+        )
+      end
+
+      if @renderer_dll_loaded
+        @render_point_cloud = Fiddle::Function.new(
+          @renderer_dll['renderPointCloud'],
+          [],
+          Fiddle::TYPE_VOID
+        )
+
+        @clear_splats = Fiddle::Function.new(
+          @renderer_dll['ClearSplats'],
+          [],
+          Fiddle::TYPE_VOID
+        )
+
+        @load_splats_from_ply = Fiddle::Function.new(
+          @renderer_dll['LoadSplatsFromPLY'],
+          [Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_VOID
+        )
+      end
+
+      if @ply_dll_loaded
+        @load_ply_file = Fiddle::Function.new(
+          @ply_dll['LoadPLYFile'],
+          [Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_INT
+        )
+      end
+
+      @setup_complete = true
+      true
+    rescue StandardError => e
+      puts "[GaussianSplats] setup error: #{e.message}"
+      @setup_complete = false
       @hook_dll_loaded = false
-      return
-    end
-    
-    @hook_dll = Fiddle.dlopen(hook_dll_path)
-    puts "Hook DLL загружен успешно: #{hook_dll_path}"
-    @hook_dll_loaded = true
-    
-    # Загрузка Renderer DLL
-    renderer_dll_path = File.join(plugin_dir, "GaussianSplatRenderer.dll")
-    unless File.exist?(renderer_dll_path)
-      UI.messagebox("Не найден Renderer DLL: #{renderer_dll_path}")
       @renderer_dll_loaded = false
-      return
-    end
-    
-    @renderer_dll = Fiddle.dlopen(renderer_dll_path)
-    puts "Renderer DLL загружен успешно: #{renderer_dll_path}"
-    @renderer_dll_loaded = true
-    
-    # Загрузка PLY Importer DLL
-    unless ply_dll_path && File.exist?(ply_dll_path)
-      UI.messagebox("Не найден PLY Importer DLL")
       @ply_dll_loaded = false
-      return
-    else
-      @ply_dll = Fiddle.dlopen(ply_dll_path)
-      puts "PLY Importer DLL загружен успешно: #{ply_dll_path}"
-      @ply_dll_loaded = true
+      false
     end
-    
-    # Определяем функции из DLL
-    if @hook_dll_loaded
-      @installAllHooks = Fiddle::Function.new(
-        @hook_dll['InstallAllHooks'],
-        [],
-        Fiddle::TYPE_VOID
-      )
+
+    def self.ensure_initialized
+      return false unless setup_dlls
+      return false unless @hook_dll_loaded
+      return true if initialized?
+
+      @install_all_hooks.call
+      @initialized = true
+      puts 'Gaussian splat hooks installed'
+      true
+    rescue StandardError => e
+      puts "[GaussianSplats] init error: #{e.message}"
+      false
     end
-    
-    if @renderer_dll_loaded
-      @renderPointCloud = Fiddle::Function.new(
-        @renderer_dll['renderPointCloud'],
-        [],
-        Fiddle::TYPE_VOID
-      )
-      
-      @clearSplats = Fiddle::Function.new(
-        @renderer_dll['ClearSplats'],
-        [],
-        Fiddle::TYPE_VOID
-      )
-      
-      @loadSplatsFromPLY = Fiddle::Function.new(
-        @renderer_dll['LoadSplatsFromPLY'],
-        [Fiddle::TYPE_VOIDP],
-        Fiddle::TYPE_VOID
-      )
+
+    def self.render_splats
+      return false unless ensure_initialized
+      return false unless @renderer_dll_loaded
+
+      @render_point_cloud.call
+      true
     end
-    
-    if @ply_dll_loaded
-      @loadPLYFile = Fiddle::Function.new(
-        @ply_dll['LoadPLYFile'],
-        [Fiddle::TYPE_VOIDP],
-        Fiddle::TYPE_INT
-      )
+
+    def self.clear_splats
+      return false unless @renderer_dll_loaded
+
+      @clear_splats.call
+      true
     end
-  end
-  
-  # Инициализация модуля
-  setup_dlls
-  
-  # Инициализация хуков
-  def self.init_hooks
-    return unless @hook_dll_loaded
-    
-    # Вызываем функцию установки хуков
-    @installAllHooks.call
-    puts "Хуки установлены"
-  end
-  
-  # Принудительный вызов рендеринга
-  def self.render_splats
-    return unless @renderer_dll_loaded
-    
-    puts "Принудительный вызов renderPointCloud..."
-    @renderPointCloud.call
-    puts "renderPointCloud выполнен"
-  end
-  
-  # Очистка клякс
-  def self.clear_splats
-    return unless @renderer_dll_loaded
-    
-    puts "Очистка клякс..."
-    @clearSplats.call
-    puts "Кляксы очищены"
-  end
-  
-  # Анализ PLY файла
-  def self.analyze_ply
-    return unless @ply_dll_loaded
-    
-    # Диалог выбора файла
-    filename = UI.openpanel("Выберите PLY файл", "", "PLY файлы|*.ply||")
-    return if filename.nil? || filename.empty?
-    
-    puts "Выбран файл: #{filename}"
-    
-    # Преобразование пути к файлу для C-строки
-    c_filename = to_c_string(filename.tr('/', '\\'))
-    
-    # Анализ файла
-    result = @loadPLYFile.call(c_filename)
-    
-    if result != 0
-      puts "PLY файл успешно проанализирован"
-    else
-      puts "Ошибка при анализе PLY файла"
+
+    def self.analyze_ply
+      return false unless setup_dlls
+      return false unless @ply_dll_loaded
+
+      filename = UI.openpanel('Choose a PLY file', '', 'PLY Files|*.ply||')
+      return false if filename.nil? || filename.empty?
+
+      analyze_ply_file(filename)
     end
-  end
-  
-  # Загрузка клякс из PLY
-  def self.load_ply_splats
-    return unless @renderer_dll_loaded
-    
-    # Диалог выбора файла
-    filename = UI.openpanel("Выберите PLY файл для загрузки клякс", "", "PLY файлы|*.ply||")
-    return if filename.nil? || filename.empty?
-    
-    puts "Выбран файл: #{filename}"
-    
-    # Преобразование пути к файлу для C-строки
-    c_filename = to_c_string(filename.tr('/', '\\'))
-    
-    # Загрузка клякс из PLY
-    @loadSplatsFromPLY.call(c_filename)
-    
-    puts "Кляксы загружены из PLY файла"
-  end
-  
-  # Инициализация плагина
-  def self.init_plugin
-    puts "Инициализация плагина гауссовых клякс..."
-    init_hooks
-    puts "Плагин гауссовых клякс инициализирован"
-  end
-  
-  # Остановка плагина
-  def self.stop_plugin
-    puts "Плагин гауссовых клякс остановлен"
-    clear_splats
+
+    def self.analyze_ply_file(filename)
+      return false unless setup_dlls
+      return false unless @ply_dll_loaded
+
+      c_filename = to_c_string(filename.tr('/', '\\'))
+      @load_ply_file.call(c_filename) != 0
+    end
+
+    def self.load_ply_splats
+      return false unless ensure_initialized
+      return false unless @renderer_dll_loaded
+
+      filename = UI.openpanel('Choose a Gaussian PLY file', '', 'PLY Files|*.ply||')
+      return false if filename.nil? || filename.empty?
+
+      load_ply_splats_file(filename)
+    end
+
+    def self.load_ply_splats_file(filename)
+      return false unless ensure_initialized
+      return false unless @renderer_dll_loaded
+
+      c_filename = to_c_string(filename.tr('/', '\\'))
+      @load_splats_from_ply.call(c_filename)
+      true
+    end
+
+    def self.init_plugin
+      ensure_initialized
+    end
+
+    def self.stop_plugin
+      clear_splats
+    end
   end
 end
-
-# Команды для меню
-unless file_loaded?(__FILE__)
-  menu = UI.menu("Plugins").add_submenu("Gaussian Splats")
-  menu.add_item("Инициализировать") { GaussianSplats.init_plugin }
-  menu.add_item("Загрузить PLY (анализ)") { GaussianSplats.analyze_ply }
-  menu.add_item("Загрузить кляксы из PLY") { GaussianSplats.load_ply_splats }
-  menu.add_item("Показать кляксы") { GaussianSplats.render_splats }
-  menu.add_item("Очистить кляксы") { GaussianSplats.clear_splats }
-  menu.add_item("Остановить") { GaussianSplats.stop_plugin }
-
-  # Автозапуск при загрузке
-  GaussianSplats.init_plugin
-  
-  file_loaded(__FILE__)
-end
-

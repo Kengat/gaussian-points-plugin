@@ -32,7 +32,10 @@ SUOverlayRef g_overlay = SU_INVALID;
 bool g_frame_pending = false;
 
 using PFN_RENDER_POINTCLOUD = void (*)();
-PFN_RENDER_POINTCLOUD g_render = nullptr;
+using PFN_SET_POINTCLOUD = void (*)(const double*, int);
+PFN_RENDER_POINTCLOUD g_gaussian_render = nullptr;
+PFN_RENDER_POINTCLOUD g_pointcloud_render = nullptr;
+PFN_SET_POINTCLOUD g_pointcloud_set_data = nullptr;
 using PFN_SWAPBUFFERS = BOOL(WINAPI*)(HDC);
 PFN_SWAPBUFFERS g_orig_swap_buffers = nullptr;
 bool g_swap_hook_installed = false;
@@ -60,38 +63,69 @@ void LogBridge(const char* message) {
   }
 }
 
-void LoadRenderer() {
-  if (g_render != nullptr) {
-    return;
-  }
-
-  HMODULE module = GetModuleHandleA("GaussianSplatRenderer.dll");
+HMODULE LoadSiblingModule(const char* file_name) {
+  HMODULE module = GetModuleHandleA(file_name);
   if (module == nullptr) {
     char path[MAX_PATH] = {};
     if (GetModuleFileNameA(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH) != 0) {
       char* slash = strrchr(path, '\\');
       if (slash != nullptr) {
         *(slash + 1) = '\0';
-        strcat_s(path, MAX_PATH, "GaussianSplatRenderer.dll");
+        strcat_s(path, MAX_PATH, file_name);
         module = LoadLibraryA(path);
       }
     }
   }
 
   if (module == nullptr) {
-    module = LoadLibraryA("GaussianSplatRenderer.dll");
+    module = LoadLibraryA(file_name);
   }
 
-  if (module == nullptr) {
-    LogBridge("GaussianSplatRenderer.dll not found.");
-    return;
+  return module;
+}
+
+void LoadRenderers() {
+  if (g_gaussian_render == nullptr) {
+    HMODULE module = LoadSiblingModule("GaussianSplatRenderer.dll");
+    if (module == nullptr) {
+      LogBridge("GaussianSplatRenderer.dll not found.");
+    } else {
+      g_gaussian_render = reinterpret_cast<PFN_RENDER_POINTCLOUD>(
+          GetProcAddress(module, "renderPointCloud"));
+      if (g_gaussian_render == nullptr) {
+        LogBridge("Gaussian renderPointCloud export not found.");
+      }
+    }
   }
 
-  g_render = reinterpret_cast<PFN_RENDER_POINTCLOUD>(
-      GetProcAddress(module, "renderPointCloud"));
-  if (g_render == nullptr) {
-    LogBridge("renderPointCloud export not found.");
+  if (g_pointcloud_render == nullptr || g_pointcloud_set_data == nullptr) {
+    HMODULE module = LoadSiblingModule("PointCloudRendererDLL.dll");
+    if (module == nullptr) {
+      LogBridge("PointCloudRendererDLL.dll not found.");
+    } else {
+      g_pointcloud_render = reinterpret_cast<PFN_RENDER_POINTCLOUD>(
+          GetProcAddress(module, "renderPointCloud"));
+      g_pointcloud_set_data = reinterpret_cast<PFN_SET_POINTCLOUD>(
+          GetProcAddress(module, "SetPointCloud"));
+      if (g_pointcloud_render == nullptr || g_pointcloud_set_data == nullptr) {
+        LogBridge("Point cloud renderer exports not found.");
+      }
+    }
   }
+}
+
+void LoadRenderer() {
+  LoadRenderers();
+}
+
+extern "C" __declspec(dllexport) bool GetCurrentMatrices(float* modelview, float* projection) {
+  if (modelview == nullptr || projection == nullptr) {
+    return false;
+  }
+
+  memcpy(modelview, g_view, sizeof(g_view));
+  memcpy(projection, g_proj, sizeof(g_proj));
+  return true;
 }
 
 BOOL WINAPI HookedSwapBuffers(HDC hdc) {
@@ -104,9 +138,12 @@ BOOL WINAPI HookedSwapBuffers(HDC hdc) {
   }
 
   g_inside_swap_hook = true;
-  LoadRenderer();
-  if (g_render != nullptr) {
-    g_render();
+  LoadRenderers();
+  if (g_pointcloud_render != nullptr) {
+    g_pointcloud_render();
+  }
+  if (g_gaussian_render != nullptr) {
+    g_gaussian_render();
   }
   g_frame_pending = false;
   g_inside_swap_hook = false;
@@ -175,7 +212,7 @@ void BeginFrame(SUOverlayRef, const SUBeginFrameInfo* info, void*) {
   g_camera_up[2] = static_cast<float>(info->up.z);
   g_camera_is_perspective = info->is_perspective;
 
-  LoadRenderer();
+  LoadRenderers();
   if (!loggedFirstFrame) {
     LogBridge("BeginFrame received.");
     loggedFirstFrame = true;
@@ -279,8 +316,14 @@ extern "C" __declspec(dllexport) void InstallAllHooks() {
   LogBridge("Overlay registered.");
 }
 
-extern "C" __declspec(dllexport) void SetPointCloudData(const double*, int) {
-  // Kept only for ABI compatibility with earlier experiments.
+extern "C" __declspec(dllexport) void SetPointCloudData(const double* points, int count) {
+  LoadRenderers();
+  if (g_pointcloud_set_data == nullptr) {
+    LogBridge("Point cloud SetPointCloud export not found.");
+    return;
+  }
+
+  g_pointcloud_set_data(points, count);
 }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
