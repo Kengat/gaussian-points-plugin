@@ -38,14 +38,27 @@ class CenterPointOverlay < Sketchup::Overlay
 end
 
 module GaussianSplats
+  def self.to_c_string(value)
+    Fiddle::Pointer[(value.encode('UTF-8') + "\0")]
+  end
+
+  def self.resolve_ply_importer_path(plugin_dir)
+    candidates = [
+      File.join(plugin_dir, 'cpp', 'build', 'PlyImporter', 'PlyImporter', 'x64', 'Release', 'PlyImporter.dll'),
+      File.join(plugin_dir, 'PlyImporter.dll')
+    ]
+
+    candidates.find { |path| File.exist?(path) }
+  end
+
   # Настройка и загрузка всех DLL
   def self.setup_dlls
     script_path = File.expand_path(__FILE__)
     plugin_dir = File.dirname(script_path)
+    ply_dll_path = resolve_ply_importer_path(plugin_dir)
+    extra_paths = [plugin_dir, ply_dll_path && File.dirname(ply_dll_path)].compact.uniq
     path_entries = ENV.fetch('PATH', '').split(File::PATH_SEPARATOR)
-    unless path_entries.include?(plugin_dir)
-      ENV['PATH'] = ([plugin_dir] + path_entries).join(File::PATH_SEPARATOR)
-    end
+    ENV['PATH'] = (extra_paths + path_entries.reject { |entry| extra_paths.include?(entry) }).join(File::PATH_SEPARATOR)
     @support_dlls = []
     
     %w[glew32.dll minhook.x64.dll].each do |dll_name|
@@ -80,9 +93,8 @@ module GaussianSplats
     @renderer_dll_loaded = true
     
     # Загрузка PLY Importer DLL
-    ply_dll_path = File.join(plugin_dir, "PlyImporter.dll")
-    unless File.exist?(ply_dll_path)
-      UI.messagebox("Не найден PLY Importer DLL: #{ply_dll_path}")
+    unless ply_dll_path && File.exist?(ply_dll_path)
+      UI.messagebox("Не найден PLY Importer DLL")
       @ply_dll_loaded = false
       return
     else
@@ -170,7 +182,7 @@ module GaussianSplats
     puts "Выбран файл: #{filename}"
     
     # Преобразование пути к файлу для C-строки
-    c_filename = filename.gsub('/', '\\')
+    c_filename = to_c_string(filename.tr('/', '\\'))
     
     # Анализ файла
     result = @loadPLYFile.call(c_filename)
@@ -193,7 +205,7 @@ module GaussianSplats
     puts "Выбран файл: #{filename}"
     
     # Преобразование пути к файлу для C-строки
-    c_filename = filename.gsub('/', '\\')
+    c_filename = to_c_string(filename.tr('/', '\\'))
     
     # Загрузка клякс из PLY
     @loadSplatsFromPLY.call(c_filename)

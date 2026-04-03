@@ -26,6 +26,48 @@ struct PLYHeader {
     std::map<std::string, size_t> propertyOffsets;
 };
 
+static bool TryOpenWithCodePage(std::ifstream& file, const char* filename, UINT codePage, const char* label) {
+    int wideLength = MultiByteToWideChar(codePage, 0, filename, -1, nullptr, 0);
+    if (wideLength <= 0) {
+        return false;
+    }
+
+    std::vector<wchar_t> wideBuffer(static_cast<size_t>(wideLength));
+    if (MultiByteToWideChar(codePage, 0, filename, -1, wideBuffer.data(), wideLength) <= 0) {
+        return false;
+    }
+
+    file.open(static_cast<const wchar_t*>(wideBuffer.data()), std::ios::binary);
+    if (file.is_open()) {
+        LogMessage("[PlyImporter] Opened file using %s path decoding\n", label);
+        return true;
+    }
+
+    return false;
+}
+
+static std::ifstream OpenPLYStream(const char* filename) {
+    std::ifstream file;
+    if (!filename || !filename[0]) {
+        return file;
+    }
+
+    file.open(filename, std::ios::binary);
+    if (file.is_open()) {
+        LogMessage("[PlyImporter] Opened file using native narrow path\n");
+        return file;
+    }
+
+    file.clear();
+    if (TryOpenWithCodePage(file, filename, CP_UTF8, "UTF-8")) {
+        return file;
+    }
+
+    file.clear();
+    TryOpenWithCodePage(file, filename, CP_ACP, "ACP");
+    return file;
+}
+
 // Функция для чтения заголовка PLY
 bool ReadPLYHeader(std::ifstream& file, PLYHeader& header) {
     std::string line;
@@ -185,7 +227,7 @@ PLYGaussianPoint ConvertToPLYGaussianPoint(const std::vector<float>& vertexData,
 extern "C" EXPORT bool LoadPLYFile(const char* filename) {
     LogMessage("[PlyImporter] Loading PLY file: %s\n", filename);
 
-    std::ifstream file(filename, std::ios::binary);
+    std::ifstream file = OpenPLYStream(filename);
     if (!file.is_open()) {
         LogMessage("[PlyImporter] Error: Could not open file\n");
         return false;
@@ -292,7 +334,7 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
 extern "C" EXPORT int LoadPLYData(const char* filename, PLYGaussianPoint** points) {
     LogMessage("[PlyImporter] Loading PLY data from: %s\n", filename);
 
-    std::ifstream file(filename, std::ios::binary);
+    std::ifstream file = OpenPLYStream(filename);
     if (!file.is_open()) {
         LogMessage("[PlyImporter] Error: Could not open file\n");
         return 0;
@@ -340,3 +382,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     }
     return TRUE;
 }
+
+
+

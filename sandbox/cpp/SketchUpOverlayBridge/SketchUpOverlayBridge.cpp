@@ -8,6 +8,10 @@
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+
+#include <GL/gl.h>
+#include <MinHook.h>
 
 #include <SketchUpAPI/application/application.h>
 #include <SketchUpAPI/application/model.h>
@@ -19,11 +23,20 @@ namespace {
 
 float g_view[16] = { 0.0f };
 float g_proj[16] = { 0.0f };
+float g_camera_position[3] = { 0.0f, 0.0f, 0.0f };
+float g_camera_target[3] = { 0.0f, 0.0f, 0.0f };
+float g_camera_up[3] = { 0.0f, 1.0f, 0.0f };
+bool g_camera_is_perspective = true;
 bool g_overlay_registered = false;
 SUOverlayRef g_overlay = SU_INVALID;
+bool g_frame_pending = false;
 
 using PFN_RENDER_POINTCLOUD = void (*)();
 PFN_RENDER_POINTCLOUD g_render = nullptr;
+using PFN_SWAPBUFFERS = BOOL(WINAPI*)(HDC);
+PFN_SWAPBUFFERS g_orig_swap_buffers = nullptr;
+bool g_swap_hook_installed = false;
+thread_local bool g_inside_swap_hook = false;
 
 constexpr const char* kOverlayId = "kengat.gaussian_points.overlay";
 constexpr const char* kOverlayName = "Gaussian Points Overlay";
@@ -34,6 +47,17 @@ void LogBridge(const char* message) {
   OutputDebugStringA("[OverlayBridge] ");
   OutputDebugStringA(message);
   OutputDebugStringA("\n");
+
+  char tempPath[MAX_PATH] = {};
+  DWORD length = GetTempPathA(MAX_PATH, tempPath);
+  if (length == 0 || length > MAX_PATH) {
+    return;
+  }
+
+  std::ofstream logFile(std::string(tempPath) + "gaussian_splats_native.log", std::ios::app);
+  if (logFile.is_open()) {
+    logFile << "[OverlayBridge] " << message << "\n";
+  }
 }
 
 void LoadRenderer() {
@@ -70,7 +94,67 @@ void LoadRenderer() {
   }
 }
 
+BOOL WINAPI HookedSwapBuffers(HDC hdc) {
+  if (g_orig_swap_buffers == nullptr) {
+    return FALSE;
+  }
+
+  if (g_inside_swap_hook || !g_frame_pending || wglGetCurrentContext() == nullptr) {
+    return g_orig_swap_buffers(hdc);
+  }
+
+  g_inside_swap_hook = true;
+  LoadRenderer();
+  if (g_render != nullptr) {
+    g_render();
+  }
+  g_frame_pending = false;
+  g_inside_swap_hook = false;
+  return g_orig_swap_buffers(hdc);
+}
+
+void InstallSwapBuffersHook() {
+  if (g_swap_hook_installed) {
+    return;
+  }
+
+  HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
+  if (gdi32 == nullptr) {
+    LogBridge("gdi32.dll not loaded.");
+    return;
+  }
+
+  FARPROC target = GetProcAddress(gdi32, "SwapBuffers");
+  if (target == nullptr) {
+    LogBridge("SwapBuffers export not found.");
+    return;
+  }
+
+  MH_STATUS status = MH_Initialize();
+  if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
+    LogBridge("MH_Initialize failed.");
+    return;
+  }
+
+  status = MH_CreateHook(target, &HookedSwapBuffers,
+      reinterpret_cast<LPVOID*>(&g_orig_swap_buffers));
+  if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED) {
+    LogBridge("MH_CreateHook(SwapBuffers) failed.");
+    return;
+  }
+
+  status = MH_EnableHook(target);
+  if (status != MH_OK && status != MH_ERROR_ENABLED) {
+    LogBridge("MH_EnableHook(SwapBuffers) failed.");
+    return;
+  }
+
+  g_swap_hook_installed = true;
+  LogBridge("SwapBuffers hook installed.");
+}
+
 void BeginFrame(SUOverlayRef, const SUBeginFrameInfo* info, void*) {
+  static bool loggedFirstFrame = false;
   if (info == nullptr) {
     return;
   }
@@ -80,10 +164,23 @@ void BeginFrame(SUOverlayRef, const SUBeginFrameInfo* info, void*) {
     g_proj[i] = static_cast<float>(info->projection_matrix[i]);
   }
 
+  g_camera_position[0] = static_cast<float>(info->position.x);
+  g_camera_position[1] = static_cast<float>(info->position.y);
+  g_camera_position[2] = static_cast<float>(info->position.z);
+  g_camera_target[0] = static_cast<float>(info->target.x);
+  g_camera_target[1] = static_cast<float>(info->target.y);
+  g_camera_target[2] = static_cast<float>(info->target.z);
+  g_camera_up[0] = static_cast<float>(info->up.x);
+  g_camera_up[1] = static_cast<float>(info->up.y);
+  g_camera_up[2] = static_cast<float>(info->up.z);
+  g_camera_is_perspective = info->is_perspective;
+
   LoadRenderer();
-  if (g_render != nullptr) {
-    g_render();
+  if (!loggedFirstFrame) {
+    LogBridge("BeginFrame received.");
+    loggedFirstFrame = true;
   }
+  g_frame_pending = true;
 }
 
 void DrawFrame(SUOverlayRef, SUOverlayDrawFrameInfo* info, void*) {
@@ -125,10 +222,27 @@ extern "C" __declspec(dllexport) bool GetMatrixByLocation(int loc, float* out) {
   return false;
 }
 
+extern "C" __declspec(dllexport) bool GetCameraState(
+    float* position, float* target, float* up, int* is_perspective) {
+  if (position == nullptr || target == nullptr || up == nullptr) {
+    return false;
+  }
+
+  memcpy(position, g_camera_position, sizeof(g_camera_position));
+  memcpy(target, g_camera_target, sizeof(g_camera_target));
+  memcpy(up, g_camera_up, sizeof(g_camera_up));
+  if (is_perspective != nullptr) {
+    *is_perspective = g_camera_is_perspective ? 1 : 0;
+  }
+  return true;
+}
+
 extern "C" __declspec(dllexport) void InstallAllHooks() {
   if (g_overlay_registered) {
     return;
   }
+
+  InstallSwapBuffersHook();
 
   SUModelRef model = SU_INVALID;
   if (SUApplicationGetActiveModel(&model) != SU_ERROR_NONE) {
@@ -173,6 +287,13 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     // Avoid LoadLibrary work under the loader lock. The renderer is loaded lazily
     // from BeginFrame after SketchUp has fully initialized the overlay callback.
+  }
+  if (reason == DLL_PROCESS_DETACH) {
+    g_frame_pending = false;
+    if (g_swap_hook_installed) {
+      MH_DisableHook(MH_ALL_HOOKS);
+      MH_Uninitialize();
+    }
   }
   return TRUE;
 }

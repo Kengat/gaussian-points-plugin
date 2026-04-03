@@ -3,15 +3,28 @@ require 'sketchup.rb'
 require 'fiddle'
 
 module PLYLoader
+  def self.to_c_string(value)
+    Fiddle::Pointer[(value.encode('UTF-8') + "\0")]
+  end
+
+  def self.resolve_ply_importer_path(plugin_dir)
+    candidates = [
+      File.join(plugin_dir, 'cpp', 'build', 'PlyImporter', 'PlyImporter', 'x64', 'Release', 'PlyImporter.dll'),
+      File.join(plugin_dir, 'PlyImporter.dll')
+    ]
+
+    candidates.find { |path| File.exist?(path) }
+  end
+
   # Загрузка DLL для импорта PLY
   def self.setup_dll
     script_path = File.expand_path(__FILE__)
     plugin_dir = File.dirname(script_path)
+    ply_dll_path = resolve_ply_importer_path(plugin_dir)
     
     # Загружаем PLY Importer DLL
-    ply_dll_path = File.join(plugin_dir, "PlyImporter.dll")
-    unless File.exist?(ply_dll_path)
-      UI.messagebox("Не найден PLY Importer DLL: #{ply_dll_path}")
+    unless ply_dll_path && File.exist?(ply_dll_path)
+      UI.messagebox("Не найден PLY Importer DLL")
       @ply_dll_loaded = false
       return
     end
@@ -44,7 +57,7 @@ module PLYLoader
     puts "Выбран файл: #{filename}"
     
     # Преобразуем путь к файлу в формат C-строки
-    c_filename = filename.gsub('/', '\\')
+    c_filename = to_c_string(filename.tr('/', '\\'))
     
     # Вызываем функцию загрузки PLY из DLL
     result = @load_ply_file.call(c_filename)
