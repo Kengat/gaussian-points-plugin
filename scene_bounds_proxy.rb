@@ -4,11 +4,16 @@ module GaussianPoints
     PROXY_KIND = 'scene_bounds_proxy'.freeze
     PROXY_NAME = '[GaussianPoints Bounds Proxy]'.freeze
     PROXY_MATERIAL = 'GaussianPoints Bounds Proxy Material'.freeze
+    CLIP_BOX_SOURCE = :clip_box
     EPSILON = 1.mm
 
     @source_bounds = {}
 
     class << self
+      def current_bounds_snapshot
+        combined_bounds(include_clip_box: false)
+      end
+
       def update_pointcloud_points(points)
         update_source_bounds(:pointcloud, bounds_from_points(points))
       end
@@ -35,12 +40,22 @@ module GaussianPoints
         clear_source_bounds(:splats)
       end
 
+      def update_clip_box_bounds(min_point, max_point)
+        update_source_bounds(CLIP_BOX_SOURCE, bounds_to_snapshot(bounds_from_min_max(min_point, max_point)))
+      end
+
+      def clear_clip_box
+        clear_source_bounds(CLIP_BOX_SOURCE)
+      end
+
       private
 
       def update_source_bounds(source, snapshot)
+        existing = @source_bounds[source]
         if snapshot.nil?
-          @source_bounds.delete(source)
+          return unless @source_bounds.delete(source)
         else
+          return if existing == snapshot
           @source_bounds[source] = snapshot
         end
         refresh_proxy
@@ -56,7 +71,7 @@ module GaussianPoints
         model = Sketchup.active_model
         return unless model
 
-        combined = combined_bounds
+        combined = combined_bounds(include_clip_box: true)
 
         model.start_operation('Gaussian Points Bounds', true, false, true)
         proxy_group = find_proxy_group(model)
@@ -75,8 +90,13 @@ module GaussianPoints
         puts "[GaussianPoints::SceneBoundsProxy] #{e.class}: #{e.message}"
       end
 
-      def combined_bounds
-        snapshots = @source_bounds.values.compact
+      def combined_bounds(include_clip_box: true)
+        snapshots = @source_bounds.each_with_object([]) do |(source, snapshot), acc|
+          next if snapshot.nil?
+          next if !include_clip_box && source == CLIP_BOX_SOURCE
+
+          acc << snapshot
+        end
         return nil if snapshots.empty?
 
         bb = Geom::BoundingBox.new

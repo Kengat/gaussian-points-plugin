@@ -20,8 +20,16 @@
 // Functions imported from the SketchUp overlay bridge.
 typedef bool (*PFN_GET_MATRIX_BY_LOC)(int location, float* matrix);
 typedef bool (*PFN_GET_CAMERA_STATE)(float* position, float* target, float* up, int* isPerspective);
+typedef bool (*PFN_GET_CLIP_BOX_STATE)(int* enabled, double* min_xyz, double* max_xyz);
 static PFN_GET_MATRIX_BY_LOC GetMatrixByLocation = nullptr;
 static PFN_GET_CAMERA_STATE GetCameraState = nullptr;
+static PFN_GET_CLIP_BOX_STATE GetClipBoxState = nullptr;
+
+struct NativeClipBoxState {
+    bool enabled = false;
+    double min_xyz[3] = { 0.0, 0.0, 0.0 };
+    double max_xyz[3] = { 0.0, 0.0, 0.0 };
+};
 
 // Renderer-owned state for splats, buffers, and camera-driven sorting.
 static std::vector<float> g_points;
@@ -69,6 +77,8 @@ static float g_lastCamPos[3] = { 0, 0, 0 };
 static float g_lastViewDir[3] = { 0, 0, 0 };
 static int g_framesSinceLastSort = 0;
 static const int SORT_EVERY_N_FRAMES = 2;
+static NativeClipBoxState g_lastClipBoxState = {};
+static bool g_hasLastClipBoxState = false;
 
 static GLuint g_splatShader = 0;
 
@@ -115,6 +125,45 @@ static void TransposeMat4(const float* source, float* result) {
             result[col * 4 + row] = source[row * 4 + col];
         }
     }
+}
+
+static NativeClipBoxState FetchClipBoxStateSnapshot() {
+    NativeClipBoxState state;
+    if (!GetClipBoxState) {
+        return state;
+    }
+
+    int enabled = 0;
+    if (!GetClipBoxState(&enabled, state.min_xyz, state.max_xyz)) {
+        return state;
+    }
+
+    state.enabled = enabled != 0;
+    return state;
+}
+
+static bool ClipStatesEqual(const NativeClipBoxState& a, const NativeClipBoxState& b) {
+    if (a.enabled != b.enabled) {
+        return false;
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        if (fabs(a.min_xyz[i] - b.min_xyz[i]) > 1e-6 || fabs(a.max_xyz[i] - b.max_xyz[i]) > 1e-6) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool IsPointInsideClipBox(const NativeClipBoxState& clip_box, float x, float y, float z) {
+    if (!clip_box.enabled) {
+        return true;
+    }
+
+    return x >= clip_box.min_xyz[0] && x <= clip_box.max_xyz[0] &&
+        y >= clip_box.min_xyz[1] && y <= clip_box.max_xyz[1] &&
+        z >= clip_box.min_xyz[2] && z <= clip_box.max_xyz[2];
 }
 
 void QuaternionToMatrix(float q0, float q1, float q2, float q3, float matrix[16]) {
@@ -323,7 +372,7 @@ static void UpdateSplatEBO() {
 static void InitializeDefaultSplats() { LogRenderer("Default splat disabled."); g_splats.clear(); g_splatSortIndices.clear(); g_splatVBO.needsUpdate = true; }
 static void EnsureTextureInitialized() { if (!g_textureInitialized) { g_gaussTexture = CreateGaussianTexture(64, 0.3f); g_textureInitialized = true; if (g_gaussTexture == 0) LogRenderer("ERR: Gauss texture failed."); } }
 static void LoadHookFunctions() {
-    if (GetMatrixByLocation && GetCameraState) return;
+    if (GetMatrixByLocation && GetCameraState && GetClipBoxState) return;
     HMODULE dll = GetModuleHandleA("SketchUpOverlayBridge.dll");
     if (!dll) {
         LogRenderer("ERR: Overlay bridge DLL not found.");
@@ -336,6 +385,10 @@ static void LoadHookFunctions() {
     if (!GetCameraState) {
         GetCameraState = (PFN_GET_CAMERA_STATE)GetProcAddress(dll, "GetCameraState");
         if (GetCameraState) LogRenderer("Found GetCameraState."); else LogRenderer("ERR: GetCameraState not found.");
+    }
+    if (!GetClipBoxState) {
+        GetClipBoxState = (PFN_GET_CLIP_BOX_STATE)GetProcAddress(dll, "GetClipBoxState");
+        if (GetClipBoxState) LogRenderer("Found GetClipBoxState."); else LogRenderer("WARN: GetClipBoxState not found.");
     }
 }
 static void Normalize3(float* vector) {
@@ -443,15 +496,15 @@ extern "C" EXPORT void renderPointCloud() {
     Normalize3(camUp);
 
     MultiplyMat4(projectionMatrix, viewMatrix, mvpMatrix);
+    const NativeClipBoxState clipBoxState = FetchClipBoxStateSnapshot();
+    const bool clipStateChanged = !g_hasLastClipBoxState || !ClipStatesEqual(clipBoxState, g_lastClipBoxState);
+    if (clipStateChanged) {
+        g_lastClipBoxState = clipBoxState;
+        g_hasLastClipBoxState = true;
+    }
 
     bool sorting_done = false;
     if (hasCamera) {
-        if (g_splatSortIndices.size() != g_splats.size()) {
-            g_splatSortIndices.resize(g_splats.size()); std::iota(g_splatSortIndices.begin(), g_splatSortIndices.end(), 0);
-            LogRenderer("DEBUG: Resized sort indices to %zu in sort block.", g_splatSortIndices.size());
-            sorting_done = true;
-        }
-
         bool needSorting = false;
 
         float posDistSq =
@@ -466,7 +519,7 @@ extern "C" EXPORT void renderPointCloud() {
 
         g_framesSinceLastSort++;
 
-        if (posDistSq > 0.0001f || dirDiff > 0.000001f || g_framesSinceLastSort >= SORT_EVERY_N_FRAMES) {
+        if (clipStateChanged || posDistSq > 0.0001f || dirDiff > 0.000001f || g_framesSinceLastSort >= SORT_EVERY_N_FRAMES) {
             needSorting = true;
 
             memcpy(g_lastCamPos, camPos, 3 * sizeof(float));
@@ -478,12 +531,17 @@ extern "C" EXPORT void renderPointCloud() {
         if (needSorting) {
             LogRenderer("DEBUG: Sorting %zu indices for view changes or frame limit...", g_splats.size());
 
-            g_splatSortCache.resize(g_splats.size());
+            g_splatSortCache.clear();
+            g_splatSortCache.reserve(g_splats.size());
 
             // Cache the current camera-relative ordering so alpha blending stays stable.
             for (size_t i = 0; i < g_splats.size(); ++i) {
                 const GaussSplat& splat = g_splats[i];
-                SplatSortData& sortData = g_splatSortCache[i];
+                if (!IsPointInsideClipBox(clipBoxState, splat.position[0], splat.position[1], splat.position[2])) {
+                    continue;
+                }
+
+                SplatSortData sortData = {};
 
                 sortData.index = i;
 
@@ -509,6 +567,8 @@ extern "C" EXPORT void renderPointCloud() {
                 else {
                     sortData.sortKey = sortData.distanceSquared;
                 }
+
+                g_splatSortCache.push_back(sortData);
             }
 
             std::sort(g_splatSortCache.begin(), g_splatSortCache.end(),
@@ -520,6 +580,7 @@ extern "C" EXPORT void renderPointCloud() {
                     return a.sortKey > b.sortKey;
                 });
 
+            g_splatSortIndices.resize(g_splatSortCache.size());
             for (size_t i = 0; i < g_splatSortCache.size(); ++i) {
                 g_splatSortIndices[i] = g_splatSortCache[i].index;
             }
@@ -536,7 +597,7 @@ extern "C" EXPORT void renderPointCloud() {
 
     GLint oldProg = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg); GLboolean blendEn = glIsEnabled(GL_BLEND); GLint oldBlendSrcRGB, oldBlendDstRGB, oldBlendSrcAlpha, oldBlendDstAlpha; glGetIntegerv(GL_BLEND_SRC_RGB, &oldBlendSrcRGB); glGetIntegerv(GL_BLEND_DST_RGB, &oldBlendDstRGB); glGetIntegerv(GL_BLEND_SRC_ALPHA, &oldBlendSrcAlpha); glGetIntegerv(GL_BLEND_DST_ALPHA, &oldBlendDstAlpha); GLboolean depthEn = glIsEnabled(GL_DEPTH_TEST); GLboolean depthMask; glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask); GLint oldDepthFunc; glGetIntegerv(GL_DEPTH_FUNC, &oldDepthFunc); GLboolean cullEn = glIsEnabled(GL_CULL_FACE); GLint oldCullMode; glGetIntegerv(GL_CULL_FACE_MODE, &oldCullMode); GLboolean texEn = glIsEnabled(GL_TEXTURE_2D); GLint oldActiveTex = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTex); GLint oldTexBind = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexBind);
 
-    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_FALSE);
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_TRUE);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_CULL_FACE);
 

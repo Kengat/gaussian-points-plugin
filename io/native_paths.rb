@@ -8,6 +8,13 @@ module GaussianPoints
       paths.flatten.compact.find { |path| File.exist?(path) }
     end
 
+    def self.newest_existing(*paths)
+      candidates = paths.flatten.compact.select { |path| File.exist?(path) }
+      return nil if candidates.empty?
+
+      candidates.max_by { |path| File.mtime(path) }
+    end
+
     def self.pointcloud_hook_dll
       first_existing(
         File.join(plugin_root, 'cpp', 'build', 'PointCloudHookDLL', 'x64', 'Release', 'PointCloudHookDLL.dll'),
@@ -16,9 +23,9 @@ module GaussianPoints
     end
 
     def self.bridge_dll
-      first_existing(
-        File.join(plugin_root, 'sandbox', 'cpp', 'build', 'SketchUpOverlayBridge', 'SketchUpOverlayBridge', 'x64', 'Release', 'SketchUpOverlayBridge.dll'),
+      newest_existing(
         File.join(plugin_root, 'sandbox', 'SketchUpOverlayBridge.dll'),
+        File.join(plugin_root, 'sandbox', 'cpp', 'build', 'SketchUpOverlayBridge', 'SketchUpOverlayBridge', 'x64', 'Release', 'SketchUpOverlayBridge.dll'),
         File.join(plugin_root, 'external', 'SketchUpOverlayBridge.dll')
       )
     end

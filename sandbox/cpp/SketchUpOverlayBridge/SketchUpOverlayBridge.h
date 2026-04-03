@@ -10,6 +10,18 @@
 extern "C" {
 	SKETCHUP_OVERLAY_BRIDGE_API void InstallAllHooks();
 	SKETCHUP_OVERLAY_BRIDGE_API void SetPointCloudData(const double* points, int count);
+	SKETCHUP_OVERLAY_BRIDGE_API void SetClipBoxState(
+		int enabled,
+		int visible,
+		int gizmo_visible,
+		const double* min_xyz,
+		const double* max_xyz,
+		int hovered_handle,
+		int active_handle);
+	SKETCHUP_OVERLAY_BRIDGE_API bool GetClipBoxState(
+		int* enabled,
+		double* min_xyz,
+		double* max_xyz);
 }
 
 #endif // SKETCHUP_OVERLAY_BRIDGE_H

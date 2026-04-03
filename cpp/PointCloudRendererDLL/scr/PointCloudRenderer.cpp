@@ -14,8 +14,16 @@
 namespace {
 
 using PFN_GET_MATRICES = bool (*)(float* modelview, float* projection);
+using PFN_GET_CLIP_BOX_STATE = bool (*)(int* enabled, double* min_xyz, double* max_xyz);
+
+struct ClipBoxState {
+  bool enabled = false;
+  double min_xyz[3] = {0.0, 0.0, 0.0};
+  double max_xyz[3] = {0.0, 0.0, 0.0};
+};
 
 PFN_GET_MATRICES g_get_current_matrices = nullptr;
+PFN_GET_CLIP_BOX_STATE g_get_clip_box_state = nullptr;
 std::vector<float> g_points;
 bool g_data_ready = false;
 bool g_gpu_data_dirty = false;
@@ -89,7 +97,7 @@ void TransposeMat4(const float* input, float* output) {
 }
 
 bool LoadHookFunctions() {
-  if (g_get_current_matrices != nullptr) {
+  if (g_get_current_matrices != nullptr && g_get_clip_box_state != nullptr) {
     return true;
   }
 
@@ -106,7 +114,38 @@ bool LoadHookFunctions() {
     return false;
   }
 
+  g_get_clip_box_state = reinterpret_cast<PFN_GET_CLIP_BOX_STATE>(
+      GetProcAddress(hook_dll, "GetClipBoxState"));
+  if (g_get_clip_box_state == nullptr) {
+    LogMessage("GetClipBoxState export not found.");
+  }
+
   return true;
+}
+
+ClipBoxState FetchClipBoxState() {
+  ClipBoxState state;
+  if (g_get_clip_box_state == nullptr) {
+    return state;
+  }
+
+  int enabled = 0;
+  if (!g_get_clip_box_state(&enabled, state.min_xyz, state.max_xyz)) {
+    return state;
+  }
+
+  state.enabled = enabled != 0;
+  return state;
+}
+
+bool IsPointInsideClip(const ClipBoxState& clip_box, float x, float y, float z) {
+  if (!clip_box.enabled) {
+    return true;
+  }
+
+  return x >= clip_box.min_xyz[0] && x <= clip_box.max_xyz[0] &&
+      y >= clip_box.min_xyz[1] && y <= clip_box.max_xyz[1] &&
+      z >= clip_box.min_xyz[2] && z <= clip_box.max_xyz[2];
 }
 
 bool InitializeRenderer() {
@@ -264,7 +303,7 @@ extern "C" EXPORT void SetPointCloud(const double* points_in, int count) {
     g_points.push_back(static_cast<float>(points_in[i * 6 + 3]) / 255.0f);
     g_points.push_back(static_cast<float>(points_in[i * 6 + 4]) / 255.0f);
     g_points.push_back(static_cast<float>(points_in[i * 6 + 5]) / 255.0f);
-    g_points.push_back(0.8f);
+    g_points.push_back(1.0f);
   }
 
   if (have_bounds) {
@@ -298,6 +337,7 @@ extern "C" EXPORT void renderPointCloud() {
     LogMessage("GetCurrentMatrices failed.");
     return;
   }
+  const ClipBoxState clip_box = FetchClipBoxState();
 
   float mvp[16] = {0.0f};
   MultiplyMat4(projection, view, mvp);
@@ -336,9 +376,8 @@ extern "C" EXPORT void renderPointCloud() {
 
   glEnable(GL_DEPTH_TEST);
   glDepthFunc(GL_LEQUAL);
-  glDepthMask(GL_FALSE);
-  glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glDepthMask(GL_TRUE);
+  glDisable(GL_BLEND);
   glDisable(GL_PROGRAM_POINT_SIZE);
   glDisable(GL_TEXTURE_2D);
 
@@ -354,10 +393,18 @@ extern "C" EXPORT void renderPointCloud() {
   glPointSize(4.0f);
 
   const GLsizei point_count = static_cast<GLsizei>(g_points.size() / 7);
-  LogMessage("Rendering %d points.", point_count);
+  GLsizei visible_count = 0;
   glBegin(GL_POINTS);
   for (GLsizei i = 0; i < point_count; ++i) {
     const size_t base = static_cast<size_t>(i) * 7;
+    if (!IsPointInsideClip(
+            clip_box,
+            g_points[base + 0],
+            g_points[base + 1],
+            g_points[base + 2])) {
+      continue;
+    }
+    ++visible_count;
     glColor4f(
         g_points[base + 3],
         g_points[base + 4],
@@ -369,6 +416,7 @@ extern "C" EXPORT void renderPointCloud() {
         g_points[base + 2]);
   }
   glEnd();
+  LogMessage("Rendering %d visible points (of %d).", visible_count, point_count);
 
   GLenum err = glGetError();
   if (err != GL_NO_ERROR) {

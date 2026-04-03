@@ -88,7 +88,7 @@ module GaussianPoints
         @all_points.concat(new_points)
         @all_points.uniq!
         sync_pointcloud_bounds!
-        apply_downsample(@downsample_factor)
+        refresh_display_points
       end
 
       def clear_points
@@ -108,13 +108,7 @@ module GaussianPoints
 
       def apply_downsample(factor)
         @downsample_factor = factor.clamp(0.0, 1.0)
-        if @all_points.empty?
-          @points = []
-        else
-          need = (@all_points.size * @downsample_factor).round
-          @points = @all_points.shuffle.first(need)
-        end
-        apply_downsample_colored(@downsample_factor)
+        refresh_display_points
         Sketchup.active_model.active_view.invalidate
       end
 
@@ -123,16 +117,41 @@ module GaussianPoints
         # data: [ [pt, r,g,b], ... ]
         @all_colored.concat(data)
         sync_pointcloud_bounds!
-        apply_downsample_colored(@downsample_factor)
+        refresh_display_points
       end
 
       def apply_downsample_colored(factor)
-        return if @all_colored.empty?
-        needed = (@all_colored.size * factor).round
-        @colored_pts = @all_colored.shuffle.first(needed)
+        refresh_display_points(factor)
+      end
+
+      def refresh_display_points(factor = @downsample_factor)
+        @downsample_factor = factor.clamp(0.0, 1.0)
+        @points = filtered_downsample(@all_points)
+        @colored_pts = filtered_downsample(@all_colored) { |(pt, _r, _g, _b)| pt }
+        Sketchup.active_model.active_view.invalidate
       end
 
       private
+
+      def filtered_downsample(source)
+        return [] if source.empty?
+
+        needed = (source.size * @downsample_factor).round
+        return [] if needed <= 0
+
+        sampled = source.shuffle.first(needed)
+        return sampled unless clip_active?
+
+        sampled.select do |entry|
+          point = block_given? ? yield(entry) : entry
+          GaussianPoints::UIparts::ClippingManager.point_inside?(point)
+        end
+      end
+
+      def clip_active?
+        defined?(GaussianPoints::UIparts::ClippingManager) &&
+          GaussianPoints::UIparts::ClippingManager.active?
+      end
 
       def visible_from_camera?(eye, pt)
         dir = pt - eye

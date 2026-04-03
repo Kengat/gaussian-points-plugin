@@ -42,10 +42,11 @@ module GaussianPoints
         cmd_vis.status_bar_text = 'Adjusts colors and transparency.'
 
         cmd_clip = UI::Command.new('Clipping Tool') {
-          ClippingManager.toggle_clip
           if ClippingManager.active?
-            ClippingDialog.show_dialog
+            ClippingManager.disable_clip
+            ClippingDialog.close_if_open
           else
+            ClippingManager.enable_clip(activate_tool: false)
             ClippingDialog.close_if_open
           end
         }
@@ -53,15 +54,46 @@ module GaussianPoints
         cmd_clip.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_24.png')
         cmd_clip.set_validation_proc { ClippingManager.active? ? MF_CHECKED : MF_UNCHECKED }
         cmd_clip.tooltip = 'Clipping Tool'
-        cmd_clip.status_bar_text = 'Clips geometry outside a defined box.'
+        cmd_clip.status_bar_text = 'Enables or disables the clip box.'
 
-        cmd_move = UI::Command.new('Move Tool') {
-          UI.messagebox('Move Tool Placeholder')
+        cmd_clip_move = UI::Command.new('Clip Move Gizmo') {
+          ClippingManager.toggle_gizmo
+          ClippingDialog.close_if_open
         }
-        cmd_move.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'move_16.png')
-        cmd_move.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'move_24.png')
-        cmd_move.tooltip = 'Move Tool'
-        cmd_move.status_bar_text = 'Moves objects.'
+        cmd_clip_move.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_move_16.png')
+        cmd_clip_move.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_move_24.png')
+        cmd_clip_move.set_validation_proc { ClippingManager.gizmo_enabled? ? MF_CHECKED : MF_UNCHECKED }
+        cmd_clip_move.tooltip = 'Clip Gizmo'
+        cmd_clip_move.status_bar_text = 'Toggles the clip gizmo for move and resize.'
+
+        cmd_clip_hide = UI::Command.new('Clip Show/Hide') {
+          ClippingManager.enable_clip(activate_tool: false) unless ClippingManager.active?
+          ClippingManager.toggle_box_visibility
+          ClippingDialog.close_if_open
+        }
+        cmd_clip_hide.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_hide_16.png')
+        cmd_clip_hide.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_hide_24.png')
+        cmd_clip_hide.tooltip = 'Show / Hide Clip Box'
+        cmd_clip_hide.status_bar_text = 'Toggles clip box visibility while keeping clipping active.'
+
+        cmd_clip_reset = UI::Command.new('Clip Reset') {
+          ClippingManager.enable_clip(activate_tool: false) unless ClippingManager.active?
+          ClippingManager.reset_box_position
+          ClippingDialog.close_if_open
+        }
+        cmd_clip_reset.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_reset_16.png')
+        cmd_clip_reset.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_reset_24.png')
+        cmd_clip_reset.tooltip = 'Reset Clip Box'
+        cmd_clip_reset.status_bar_text = 'Refits the clip box to the current scene bounds with padding.'
+
+        cmd_clip_delete = UI::Command.new('Clip Remove') {
+          ClippingManager.remove_clip
+          ClippingDialog.close_if_open
+        }
+        cmd_clip_delete.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_delete_16.png')
+        cmd_clip_delete.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'clip_delete_24.png')
+        cmd_clip_delete.tooltip = 'Remove Clip'
+        cmd_clip_delete.status_bar_text = 'Disables clipping and removes the active clip box effect.'
 
         cmd_select = UI::Command.new('Select') {
           UI.messagebox('Select Tool Placeholder')
@@ -73,7 +105,10 @@ module GaussianPoints
 
         toolbar.add_item(cmd_vis)
         toolbar.add_item(cmd_clip)
-        toolbar.add_item(cmd_move)
+        toolbar.add_item(cmd_clip_move)
+        toolbar.add_item(cmd_clip_hide)
+        toolbar.add_item(cmd_clip_reset)
+        toolbar.add_item(cmd_clip_delete)
         toolbar.add_item(cmd_select)
         toolbar.add_separator
 

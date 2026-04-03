@@ -6,6 +6,7 @@ cpp/OctreeProcessorDLL/Libraries/nanoflann/.git/
 cpp/build/
 cpp/libE57/build/
 sandbox/cpp/build/
+build_out/
 external/SketchUpSDK/
 
 # IDE and compiler cache
