@@ -390,7 +390,7 @@ extern "C" EXPORT void renderPointCloud() {
         EnsureTextureInitialized();
         useVBO = CheckGLCapabilities();
         if (useVBO) InitializeSplatVBO();
-        if (g_splats.empty()) InitializeDefaultSplats();
+        // Do not inject a synthetic test splat on startup.
         firstCall = false;
     }
     if (useVBO && !g_splatVBO.initialized) {

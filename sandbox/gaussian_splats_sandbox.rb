@@ -3,40 +3,6 @@ require 'fiddle'
 require 'fiddle/import'
 require 'sketchup.rb'
 
-# Класс для создания оверлея, который рисует точку в центре экрана
-class CenterPointOverlay < Sketchup::Overlay
-  def initialize
-    # Указываем уникальный идентификатор, имя и краткое описание
-    super('my_extension.center_point_overlay', 'Center Point Overlay', description: 'Отображает точку в центре экрана')
-  end
-  
-  # Для корректной отрисовки оверлея необходимо задать экстенты,
-  # чтобы SketchUp не обрезал нашу 2D-отрисовку.
-  def getExtents
-    bb = Geom::BoundingBox.new
-    # Задаём достаточно большую область
-    bb.add(Geom::Point3d.new(-10000, -10000, 0))
-    bb.add(Geom::Point3d.new(10000, 10000, 0))
-    bb
-  end
-  
-  # Метод draw вызывается при перерисовке вида
-  def draw(view)
-    # Определяем центр вьюпорта (логические пиксели)
-    center_x = view.vpwidth / 2.0
-    center_y = view.vpheight / 2.0
-    size = 5  # половина размера квадрата, итоговый квадрат 10x10 пикселей
-    square = [
-      [center_x - size, center_y - size, 0],
-      [center_x + size, center_y - size, 0],
-      [center_x + size, center_y + size, 0],
-      [center_x - size, center_y + size, 0]
-    ]
-    view.drawing_color = 'red'
-    view.draw2d(GL_QUADS, square)
-  end
-end
-
 module GaussianSplats
   def self.to_c_string(value)
     Fiddle::Pointer[(value.encode('UTF-8') + "\0")]
@@ -236,15 +202,7 @@ unless file_loaded?(__FILE__)
   menu.add_item("Показать кляксы") { GaussianSplats.render_splats }
   menu.add_item("Очистить кляксы") { GaussianSplats.clear_splats }
   menu.add_item("Остановить") { GaussianSplats.stop_plugin }
-  
-  # Создаём экземпляр оверлея центральной точки
-  overlay = CenterPointOverlay.new
-  # Добавляем оверлей в активную модель и активируем его
-  model = Sketchup.active_model
-  model.overlays.add(overlay)
-  overlay.enabled = true
-  puts "Центральная точка добавлена через оверлей"
-  
+
   # Автозапуск при загрузке
   GaussianSplats.init_plugin
   
