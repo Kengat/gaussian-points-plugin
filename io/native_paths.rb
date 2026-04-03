@@ -25,6 +25,7 @@ module GaussianPoints
 
     def self.pointcloud_hook_support_dirs
       [
+        File.join(plugin_root, 'sandbox', 'runtime'),
         File.join(plugin_root, 'sandbox'),
         File.join(plugin_root, 'cpp', 'build', 'PointCloudHookDLL', 'x64', 'Release'),
         File.join(plugin_root, 'cpp', 'build', 'PointCloudRendererDLL', 'PointCloudRendererDLL', 'x64', 'Release'),

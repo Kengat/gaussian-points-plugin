@@ -79,6 +79,7 @@
         optimized_array = GaussianPoints::IO::OctreeProcessor.process(points_array)
         optimized_count = optimized_array.size / 6
         puts "[Optimization] Reduced to #{optimized_count} points."
+        GaussianPoints::SceneBoundsProxy.update_pointcloud_flat_array(optimized_array, stride: 6) if defined?(GaussianPoints::SceneBoundsProxy)
 
         if defined?(GaussianPoints::Hook) && GaussianPoints::Hook.set_pointcloud(optimized_array)
           UI.messagebox("Imported #{colored_data.size} points from #{File.basename(filename)}. Optimized to #{optimized_count} points.")

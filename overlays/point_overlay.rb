@@ -87,6 +87,7 @@ module GaussianPoints
       def add_points(new_points)
         @all_points.concat(new_points)
         @all_points.uniq!
+        sync_pointcloud_bounds!
         apply_downsample(@downsample_factor)
       end
 
@@ -95,6 +96,7 @@ module GaussianPoints
         @points.clear
         @all_colored.clear
         @colored_pts.clear
+        GaussianPoints::SceneBoundsProxy.clear_pointcloud if defined?(GaussianPoints::SceneBoundsProxy)
         Sketchup.active_model.active_view.invalidate
       end
 
@@ -120,6 +122,7 @@ module GaussianPoints
       def add_colored_points(data)
         # data: [ [pt, r,g,b], ... ]
         @all_colored.concat(data)
+        sync_pointcloud_bounds!
         apply_downsample_colored(@downsample_factor)
       end
 
@@ -140,6 +143,13 @@ module GaussianPoints
         dist_eye_int = eye.distance(ipt)
         dist_eye_pt  = eye.distance(pt)
         (dist_eye_int >= dist_eye_pt - 0.001.mm)
+      end
+
+      def sync_pointcloud_bounds!
+        return unless defined?(GaussianPoints::SceneBoundsProxy)
+
+        points = @all_points + @all_colored.map { |(point, _r, _g, _b)| point }
+        GaussianPoints::SceneBoundsProxy.update_pointcloud_points(points)
       end
 
     end

@@ -54,6 +54,7 @@ module GaussianPoints
 end
 
 require File.join(GaussianPoints::PLUGIN_DIR, 'overlays', 'point_overlay.rb')
+require File.join(GaussianPoints::PLUGIN_DIR, 'scene_bounds_proxy.rb')
 
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'native_paths.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'pointcloud_hook_native.rb')

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <string>
 
 #include <GL/gl.h>
 #include <MinHook.h>
@@ -65,14 +66,27 @@ void LogBridge(const char* message) {
 
 HMODULE LoadSiblingModule(const char* file_name) {
   HMODULE module = GetModuleHandleA(file_name);
-  if (module == nullptr) {
-    char path[MAX_PATH] = {};
-    if (GetModuleFileNameA(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH) != 0) {
-      char* slash = strrchr(path, '\\');
-      if (slash != nullptr) {
-        *(slash + 1) = '\0';
-        strcat_s(path, MAX_PATH, file_name);
-        module = LoadLibraryA(path);
+  if (module != nullptr) {
+    return module;
+  }
+
+  char path[MAX_PATH] = {};
+  if (GetModuleFileNameA(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH) != 0) {
+    char* slash = strrchr(path, '\\');
+    if (slash != nullptr) {
+      *(slash + 1) = '\0';
+
+      const std::string bridge_dir(path);
+      const std::string runtime_path = bridge_dir + "runtime\\" + file_name;
+      module = LoadLibraryA(runtime_path.c_str());
+      if (module != nullptr) {
+        return module;
+      }
+
+      const std::string sibling_path = bridge_dir + file_name;
+      module = LoadLibraryA(sibling_path.c_str());
+      if (module != nullptr) {
+        return module;
       }
     }
   }

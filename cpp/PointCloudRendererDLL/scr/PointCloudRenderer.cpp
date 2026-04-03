@@ -1,356 +1,422 @@
 #include "PointCloudRenderer.h"
+
 #include <windows.h>
+
 #include <GL/glew.h>
 #include <GL/gl.h>
-#include <cstdio>
+
 #include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
-// Тип функции получения матриц
-typedef bool (*PFN_GET_MATRICES)(float* modelview, float* projection);
-static PFN_GET_MATRICES GetCurrentMatrices = nullptr;
+namespace {
 
-// Глобальные переменные для хранения данных точек и состояния OpenGL
-static std::vector<float> g_points;
-static bool g_dataReady = false;
-static GLuint g_program = 0;
-static GLuint g_vao = 0;
-static GLuint g_vbo = 0;
+using PFN_GET_MATRICES = bool (*)(float* modelview, float* projection);
 
-// Функция логирования
-static void LogMessage(const char* format, ...) {
-    char buffer[1024];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    OutputDebugStringA(buffer);
+PFN_GET_MATRICES g_get_current_matrices = nullptr;
+std::vector<float> g_points;
+bool g_data_ready = false;
+bool g_gpu_data_dirty = false;
+GLuint g_program = 0;
+GLuint g_vao = 0;
+GLuint g_vbo = 0;
+
+void LogMessage(const char* format, ...) {
+  char buffer[1024];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  OutputDebugStringA("[PointCloudRenderer] ");
+  OutputDebugStringA(buffer);
+  OutputDebugStringA("\n");
+
+  char temp_path[MAX_PATH] = {};
+  DWORD length = GetTempPathA(MAX_PATH, temp_path);
+  if (length == 0 || length > MAX_PATH) {
+    return;
+  }
+
+  std::ofstream log_file(std::string(temp_path) + "pointcloud_renderer.log", std::ios::app);
+  if (log_file.is_open()) {
+    log_file << "[PointCloudRenderer] " << buffer << "\n";
+  }
 }
 
-// Вспомогательная функция для компиляции шейдера
-static GLuint CompileShader(GLenum type, const char* source) {
-    GLuint shader = glCreateShader(type);
-    if (!shader) {
-        LogMessage("[Renderer] Failed to create shader\n");
-        return 0;
-    }
+GLuint CompileShader(GLenum type, const char* source) {
+  GLuint shader = glCreateShader(type);
+  if (shader == 0) {
+    LogMessage("glCreateShader failed.");
+    return 0;
+  }
 
-    glShaderSource(shader, 1, &source, nullptr);
-    glCompileShader(shader);
+  glShaderSource(shader, 1, &source, nullptr);
+  glCompileShader(shader);
 
-    GLint success;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char infoLog[512];
-        glGetShaderInfoLog(shader, sizeof(infoLog), nullptr, infoLog);
-        LogMessage("[Renderer] Shader compilation error:\n%s\n", infoLog);
-        glDeleteShader(shader);
-        return 0;
-    }
+  GLint success = GL_FALSE;
+  glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+  if (success != GL_TRUE) {
+    char info_log[512];
+    glGetShaderInfoLog(shader, sizeof(info_log), nullptr, info_log);
+    LogMessage("Shader compilation failed: %s", info_log);
+    glDeleteShader(shader);
+    return 0;
+  }
 
-    LogMessage("[Renderer] Shader compiled successfully\n");
-    return shader;
+  return shader;
 }
 
-// Создание шейдерной программы один раз
-static bool InitializeRenderer() {
-    if (g_program != 0) {
-        return true;  // Уже инициализировано
+void MultiplyMat4(const float* left, const float* right, float* result) {
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      result[row * 4 + col] =
+          left[row * 4 + 0] * right[0 * 4 + col] +
+          left[row * 4 + 1] * right[1 * 4 + col] +
+          left[row * 4 + 2] * right[2 * 4 + col] +
+          left[row * 4 + 3] * right[3 * 4 + col];
     }
+  }
+}
 
-    LogMessage("[Renderer] Starting renderer initialization...\n");
-
-    // Шейдер для точек с использованием projection-матрицы
-    const char* vertexShaderSource = R"(
-        #version 150
-        uniform mat4 projection;
-        
-        in vec3 position;
-        in vec3 color;
-        in float size;
-        
-        flat out vec4 pointColor;
-        
-        void main() {
-            // Позиционируем точку с использованием только projection-матрицы
-            gl_Position = projection * vec4(position, 1.0);
-            
-            // Передаем цвет и устанавливаем полупрозрачность
-            pointColor = vec4(color, 0.7);
-            
-            // Устанавливаем размер точки
-            gl_PointSize = size;
-        }
-    )";
-
-    const char* fragmentShaderSource = R"(
-        #version 150
-        flat in vec4 pointColor;
-        out vec4 outColor;
-        
-        void main() {
-            outColor = pointColor;
-        }
-    )";
-
-    // Компилируем шейдеры
-    GLuint vertexShader = CompileShader(GL_VERTEX_SHADER, vertexShaderSource);
-    if (!vertexShader) {
-        LogMessage("[Renderer] Failed to compile vertex shader\n");
-        return false;
+void TransposeMat4(const float* input, float* output) {
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      output[col * 4 + row] = input[row * 4 + col];
     }
+  }
+}
 
-    GLuint fragmentShader = CompileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
-    if (!fragmentShader) {
-        glDeleteShader(vertexShader);
-        LogMessage("[Renderer] Failed to compile fragment shader\n");
-        return false;
-    }
-
-    // Создаем и линкуем программу
-    g_program = glCreateProgram();
-    glAttachShader(g_program, vertexShader);
-    glAttachShader(g_program, fragmentShader);
-
-    // Привязываем атрибуты к конкретным локациям
-    glBindAttribLocation(g_program, 0, "position");
-    glBindAttribLocation(g_program, 1, "color");
-    glBindAttribLocation(g_program, 2, "size");
-
-    glLinkProgram(g_program);
-
-    GLint success;
-    glGetProgramiv(g_program, GL_LINK_STATUS, &success);
-    if (!success) {
-        char infoLog[512];
-        glGetProgramInfoLog(g_program, sizeof(infoLog), nullptr, infoLog);
-        LogMessage("[Renderer] Program linking error:\n%s\n", infoLog);
-        glDeleteShader(vertexShader);
-        glDeleteShader(fragmentShader);
-        glDeleteProgram(g_program);
-        g_program = 0;
-        return false;
-    }
-
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
-
-    // Создаем VAO и VBO для точек
-    glGenVertexArrays(1, &g_vao);
-    glGenBuffers(1, &g_vbo);
-
-    LogMessage("[Renderer] Renderer initialized successfully\n");
+bool LoadHookFunctions() {
+  if (g_get_current_matrices != nullptr) {
     return true;
+  }
+
+  HMODULE hook_dll = GetModuleHandleA("SketchUpOverlayBridge.dll");
+  if (hook_dll == nullptr) {
+    LogMessage("SketchUpOverlayBridge.dll is not loaded.");
+    return false;
+  }
+
+  g_get_current_matrices = reinterpret_cast<PFN_GET_MATRICES>(
+      GetProcAddress(hook_dll, "GetCurrentMatrices"));
+  if (g_get_current_matrices == nullptr) {
+    LogMessage("GetCurrentMatrices export not found.");
+    return false;
+  }
+
+  return true;
 }
 
-// Освобождение ресурсов
-static void CleanupRenderer() {
-    if (g_vao) glDeleteVertexArrays(1, &g_vao);
-    if (g_vbo) glDeleteBuffers(1, &g_vbo);
-    if (g_program) glDeleteProgram(g_program);
-    g_vao = 0;
-    g_vbo = 0;
+bool InitializeRenderer() {
+  if (g_program != 0) {
+    return true;
+  }
+
+  GLenum err = glewInit();
+  if (err != GLEW_OK) {
+    LogMessage("GLEW init failed: %s", glewGetErrorString(err));
+    return false;
+  }
+
+  const char* vertex_shader_source = R"(
+    #version 150
+    in vec3 aPosition;
+    in vec4 aColor;
+    uniform mat4 uMVP;
+    uniform float uPointSize;
+    out vec4 vColor;
+    void main() {
+      gl_Position = uMVP * vec4(aPosition, 1.0);
+      gl_PointSize = uPointSize;
+      vColor = aColor;
+    }
+  )";
+
+  const char* fragment_shader_source = R"(
+    #version 150
+    in vec4 vColor;
+    out vec4 fragColor;
+    void main() {
+      vec2 coord = gl_PointCoord * 2.0 - 1.0;
+      if (dot(coord, coord) > 1.0) {
+        discard;
+      }
+      fragColor = vColor;
+    }
+  )";
+
+  GLuint vertex_shader = CompileShader(GL_VERTEX_SHADER, vertex_shader_source);
+  GLuint fragment_shader = CompileShader(GL_FRAGMENT_SHADER, fragment_shader_source);
+  if (vertex_shader == 0 || fragment_shader == 0) {
+    if (vertex_shader != 0) glDeleteShader(vertex_shader);
+    if (fragment_shader != 0) glDeleteShader(fragment_shader);
+    return false;
+  }
+
+  g_program = glCreateProgram();
+  glAttachShader(g_program, vertex_shader);
+  glAttachShader(g_program, fragment_shader);
+  glBindAttribLocation(g_program, 0, "aPosition");
+  glBindAttribLocation(g_program, 1, "aColor");
+  glLinkProgram(g_program);
+
+  GLint success = GL_FALSE;
+  glGetProgramiv(g_program, GL_LINK_STATUS, &success);
+  glDeleteShader(vertex_shader);
+  glDeleteShader(fragment_shader);
+
+  if (success != GL_TRUE) {
+    char info_log[512];
+    glGetProgramInfoLog(g_program, sizeof(info_log), nullptr, info_log);
+    LogMessage("Program link failed: %s", info_log);
+    glDeleteProgram(g_program);
     g_program = 0;
-    LogMessage("[Renderer] Resources cleaned up\n");
+    return false;
+  }
+
+  glGenVertexArrays(1, &g_vao);
+  glGenBuffers(1, &g_vbo);
+  return g_program != 0 && g_vao != 0 && g_vbo != 0;
 }
 
-// Функция для сохранения данных точек
+void CleanupRenderer() {
+  if (g_vbo != 0) glDeleteBuffers(1, &g_vbo);
+  if (g_vao != 0) glDeleteVertexArrays(1, &g_vao);
+  if (g_program != 0) glDeleteProgram(g_program);
+  g_vbo = 0;
+  g_vao = 0;
+  g_program = 0;
+}
+
+void UploadPointDataIfNeeded() {
+  if (!g_gpu_data_dirty) {
+    return;
+  }
+
+  if (!InitializeRenderer()) {
+    return;
+  }
+
+  glBindVertexArray(g_vao);
+  glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+  glBufferData(GL_ARRAY_BUFFER,
+      static_cast<GLsizeiptr>(g_points.size() * sizeof(float)),
+      g_points.data(),
+      GL_STATIC_DRAW);
+
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), reinterpret_cast<void*>(0));
+  glEnableVertexAttribArray(1);
+  glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 7 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
+
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindVertexArray(0);
+  g_gpu_data_dirty = false;
+}
+
+}  // namespace
+
 extern "C" EXPORT void SetPointCloud(const double* points_in, int count) {
-    LogMessage("[Renderer] SetPointCloud called with %d points\n", count);
-
-    if (!points_in || count <= 0) {
-        LogMessage("[Renderer] Invalid input data\n");
-        return;
-    }
-
-    // Пытаемся загрузить функцию получения матриц
-    if (!GetCurrentMatrices) {
-        HMODULE hookDLL = GetModuleHandleA("PointCloudHookDLL.dll");
-        if (hookDLL) {
-            GetCurrentMatrices = (PFN_GET_MATRICES)GetProcAddress(hookDLL, "GetCurrentMatrices");
-            if (GetCurrentMatrices) {
-                LogMessage("[Renderer] Found GetCurrentMatrices function\n");
-            }
-            else {
-                LogMessage("[Renderer] GetCurrentMatrices function not found\n");
-            }
-        }
-        else {
-            LogMessage("[Renderer] Hook DLL not found\n");
-        }
-    }
-
-    // Инициализируем рендерер при первой загрузке
-    if (!InitializeRenderer()) {
-        LogMessage("[Renderer] Failed to initialize renderer\n");
-        return;
-    }
-
-    // Преобразуем данные - для каждой точки сохраняем:
-    // - координаты (x, y, z)
-    // - цвет (r, g, b)
-    // - размер (константа, 5.0f)
+  if (points_in == nullptr || count <= 0) {
+    LogMessage("SetPointCloud called with invalid input.");
     g_points.clear();
-    g_points.reserve(count * 7); // xyz + rgb + size
+    g_data_ready = false;
+    g_gpu_data_dirty = false;
+    return;
+  }
 
-    for (int i = 0; i < count; ++i) {
-        // Координаты XYZ (не изменяем, берем как есть)
-        g_points.push_back(static_cast<float>(points_in[i * 6 + 0]));
-        g_points.push_back(static_cast<float>(points_in[i * 6 + 1]));
-        g_points.push_back(static_cast<float>(points_in[i * 6 + 2]));
+  LogMessage("SetPointCloud received %d points.", count);
+  g_points.clear();
+  g_points.reserve(static_cast<size_t>(count) * 7);
 
-        // Цвет RGB (нормализуем до 0-1)
-        g_points.push_back(static_cast<float>(points_in[i * 6 + 3]) / 255.0f);
-        g_points.push_back(static_cast<float>(points_in[i * 6 + 4]) / 255.0f);
-        g_points.push_back(static_cast<float>(points_in[i * 6 + 5]) / 255.0f);
+  float min_x = 0.0f;
+  float min_y = 0.0f;
+  float min_z = 0.0f;
+  float max_x = 0.0f;
+  float max_y = 0.0f;
+  float max_z = 0.0f;
+  bool have_bounds = false;
 
-        // Размер точки (фиксированный)
-        g_points.push_back(5.0f);
+  for (int i = 0; i < count; ++i) {
+    const float x = static_cast<float>(points_in[i * 6 + 0]);
+    const float y = static_cast<float>(points_in[i * 6 + 1]);
+    const float z = static_cast<float>(points_in[i * 6 + 2]);
+
+    if (!have_bounds) {
+      min_x = max_x = x;
+      min_y = max_y = y;
+      min_z = max_z = z;
+      have_bounds = true;
+    } else {
+      if (x < min_x) min_x = x;
+      if (y < min_y) min_y = y;
+      if (z < min_z) min_z = z;
+      if (x > max_x) max_x = x;
+      if (y > max_y) max_y = y;
+      if (z > max_z) max_z = z;
     }
 
-    // Загружаем данные в VBO
-    glBindVertexArray(g_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glBufferData(GL_ARRAY_BUFFER, g_points.size() * sizeof(float), g_points.data(), GL_STATIC_DRAW);
+    g_points.push_back(x);
+    g_points.push_back(y);
+    g_points.push_back(z);
+    g_points.push_back(static_cast<float>(points_in[i * 6 + 3]) / 255.0f);
+    g_points.push_back(static_cast<float>(points_in[i * 6 + 4]) / 255.0f);
+    g_points.push_back(static_cast<float>(points_in[i * 6 + 5]) / 255.0f);
+    g_points.push_back(0.8f);
+  }
 
-    // Настраиваем атрибуты
-    // Позиция (xyz)
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)0);
+  if (have_bounds) {
+    LogMessage(
+        "Bounds min=(%.3f, %.3f, %.3f) max=(%.3f, %.3f, %.3f)",
+        min_x, min_y, min_z, max_x, max_y, max_z);
+  }
 
-    // Цвет (rgb)
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(3 * sizeof(float)));
-
-    // Размер точки
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void*)(6 * sizeof(float)));
-
-    // Освобождаем привязку
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-    g_dataReady = true;
-    LogMessage("[Renderer] Data processed and uploaded to GPU, %zu bytes\n", g_points.size() * sizeof(float));
+  g_data_ready = true;
+  g_gpu_data_dirty = true;
 }
 
-// Функция для рендеринга облака точек
 extern "C" EXPORT void renderPointCloud() {
-    LogMessage("[Renderer] renderPointCloud called\n");
+  if (!g_data_ready || g_points.empty()) {
+    return;
+  }
 
-    if (!g_dataReady || g_points.empty() || !g_program || !g_vao) {
-        LogMessage("[Renderer] Not ready for rendering\n");
-        return;
-    }
+  if (!LoadHookFunctions() || !InitializeRenderer()) {
+    return;
+  }
 
-    // Пытаемся найти функцию получения матриц, если еще не нашли
-    if (!GetCurrentMatrices) {
-        HMODULE hookDLL = GetModuleHandleA("PointCloudHookDLL.dll");
-        if (hookDLL) {
-            GetCurrentMatrices = (PFN_GET_MATRICES)GetProcAddress(hookDLL, "GetCurrentMatrices");
-            if (!GetCurrentMatrices) {
-                LogMessage("[Renderer] GetCurrentMatrices function not found\n");
-                return;
-            }
-        }
-        else {
-            LogMessage("[Renderer] Hook DLL not found\n");
-            return;
-        }
-    }
+  UploadPointDataIfNeeded();
+  if (g_gpu_data_dirty) {
+    LogMessage("GPU upload is still pending. Skipping frame.");
+    return;
+  }
 
-    // Получаем текущие матрицы
-    float modelview[16];
-    float projection[16];
-    if (!GetCurrentMatrices(modelview, projection)) {
-        LogMessage("[Renderer] Failed to get matrices\n");
-        return;
-    }
+  float view[16] = {0.0f};
+  float projection[16] = {0.0f};
+  if (!g_get_current_matrices(view, projection)) {
+    LogMessage("GetCurrentMatrices failed.");
+    return;
+  }
 
-    // Сохраняем текущее состояние OpenGL
-    GLint oldProgram;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
+  float mvp[16] = {0.0f};
+  MultiplyMat4(projection, view, mvp);
+  float projection_gl[16] = {0.0f};
+  float view_gl[16] = {0.0f};
+  TransposeMat4(projection, projection_gl);
+  TransposeMat4(view, view_gl);
 
-    GLboolean depthTest, blend, depthMask;
-    glGetBooleanv(GL_DEPTH_TEST, &depthTest);
-    glGetBooleanv(GL_BLEND, &blend);
-    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+  GLint old_program = 0;
+  GLint old_vao = 0;
+  GLint old_array_buffer = 0;
+  GLint old_matrix_mode = 0;
+  GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
+  GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+  GLboolean program_point_size_enabled = glIsEnabled(GL_PROGRAM_POINT_SIZE);
+  GLboolean texture_2d_enabled = glIsEnabled(GL_TEXTURE_2D);
+  GLboolean depth_mask = GL_TRUE;
+  GLint old_depth_func = GL_LESS;
+  GLint old_blend_src_rgb = GL_ONE;
+  GLint old_blend_dst_rgb = GL_ZERO;
+  GLint old_blend_src_alpha = GL_ONE;
+  GLint old_blend_dst_alpha = GL_ZERO;
+  GLfloat old_point_size = 1.0f;
 
-    // Устанавливаем наши параметры рендеринга
-    glUseProgram(g_program);
-    glBindVertexArray(g_vao);
+  glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
+  glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array_buffer);
+  glGetIntegerv(GL_MATRIX_MODE, &old_matrix_mode);
+  glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+  glGetIntegerv(GL_DEPTH_FUNC, &old_depth_func);
+  glGetIntegerv(GL_BLEND_SRC_RGB, &old_blend_src_rgb);
+  glGetIntegerv(GL_BLEND_DST_RGB, &old_blend_dst_rgb);
+  glGetIntegerv(GL_BLEND_SRC_ALPHA, &old_blend_src_alpha);
+  glGetIntegerv(GL_BLEND_DST_ALPHA, &old_blend_dst_alpha);
+  glGetFloatv(GL_POINT_SIZE, &old_point_size);
 
-    // Включаем depth test для корректного перекрытия объектами
+  glEnable(GL_DEPTH_TEST);
+  glDepthFunc(GL_LEQUAL);
+  glDepthMask(GL_FALSE);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glDisable(GL_PROGRAM_POINT_SIZE);
+  glDisable(GL_TEXTURE_2D);
+
+  glUseProgram(0);
+  glBindVertexArray(0);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadMatrixf(projection_gl);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadMatrixf(view_gl);
+  glPointSize(4.0f);
+
+  const GLsizei point_count = static_cast<GLsizei>(g_points.size() / 7);
+  LogMessage("Rendering %d points.", point_count);
+  glBegin(GL_POINTS);
+  for (GLsizei i = 0; i < point_count; ++i) {
+    const size_t base = static_cast<size_t>(i) * 7;
+    glColor4f(
+        g_points[base + 3],
+        g_points[base + 4],
+        g_points[base + 5],
+        g_points[base + 6]);
+    glVertex3f(
+        g_points[base + 0],
+        g_points[base + 1],
+        g_points[base + 2]);
+  }
+  glEnd();
+
+  GLenum err = glGetError();
+  if (err != GL_NO_ERROR) {
+    LogMessage("OpenGL error after glDrawArrays: 0x%x", err);
+  }
+
+  glPointSize(old_point_size);
+  glMatrixMode(GL_MODELVIEW);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(old_matrix_mode);
+  glBindVertexArray(old_vao);
+  glBindBuffer(GL_ARRAY_BUFFER, old_array_buffer);
+  glUseProgram(old_program);
+
+  if (depth_enabled) {
     glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_TRUE);
+    glDepthFunc(old_depth_func);
+  } else {
+    glDisable(GL_DEPTH_TEST);
+  }
 
-    // Включаем blending для прозрачности
+  if (blend_enabled) {
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBlendFuncSeparate(old_blend_src_rgb, old_blend_dst_rgb, old_blend_src_alpha, old_blend_dst_alpha);
+  } else {
+    glDisable(GL_BLEND);
+  }
 
-    // Включаем рендеринг точек с переменным размером
+  glDepthMask(depth_mask);
+
+  if (program_point_size_enabled) {
     glEnable(GL_PROGRAM_POINT_SIZE);
-
-    // Устанавливаем projection-матрицу в шейдер
-    GLint projectionLoc = glGetUniformLocation(g_program, "projection");
-    if (projectionLoc >= 0) {
-        glUniformMatrix4fv(projectionLoc, 1, GL_FALSE, projection);
-    }
-    else {
-        LogMessage("[Renderer] Warning: projection uniform not found\n");
-    }
-
-    // Рисуем все точки одним вызовом
-    int pointCount = g_points.size() / 7; // 7 float на точку (xyz + rgb + size)
-    LogMessage("[Renderer] Drawing %d points\n", pointCount);
-    glDrawArrays(GL_POINTS, 0, pointCount);
-
-    // Проверяем ошибки
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        LogMessage("[Renderer] OpenGL error: 0x%x\n", err);
-    }
-
-    // Восстанавливаем предыдущее состояние OpenGL
-    glBindVertexArray(0);
-    glUseProgram(oldProgram);
-
-    if (!depthTest) glDisable(GL_DEPTH_TEST);
-    if (!blend) glDisable(GL_BLEND);
-    if (!depthMask) glDepthMask(GL_FALSE);
-
+  } else {
     glDisable(GL_PROGRAM_POINT_SIZE);
+  }
 
-    LogMessage("[Renderer] Rendering completed\n");
+  if (texture_2d_enabled) {
+    glEnable(GL_TEXTURE_2D);
+  } else {
+    glDisable(GL_TEXTURE_2D);
+  }
 }
 
-// Обработка загрузки/выгрузки DLL
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    switch (ul_reason_for_call) {
-    case DLL_PROCESS_ATTACH:
-    {
-        LogMessage("[Renderer] DLL_PROCESS_ATTACH\n");
-        // Пытаемся найти функцию получения матриц
-        HMODULE hookDLL = GetModuleHandleA("PointCloudHookDLL.dll");
-        if (hookDLL) {
-            GetCurrentMatrices = (PFN_GET_MATRICES)GetProcAddress(hookDLL, "GetCurrentMatrices");
-            if (GetCurrentMatrices) {
-                LogMessage("[Renderer] Found GetCurrentMatrices function\n");
-            }
-            else {
-                LogMessage("[Renderer] GetCurrentMatrices function not found\n");
-            }
-        }
-        else {
-            LogMessage("[Renderer] Hook DLL not found\n");
-        }
-        break;
-    }
-    case DLL_PROCESS_DETACH:
-        LogMessage("[Renderer] DLL_PROCESS_DETACH\n");
-        CleanupRenderer();
-        break;
-    }
-    return TRUE;
+BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
+  if (reason == DLL_PROCESS_DETACH) {
+    CleanupRenderer();
+  }
+  return TRUE;
 }

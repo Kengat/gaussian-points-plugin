@@ -1,4 +1,4 @@
-﻿#include "GaussianSplatRenderer.h"
+#include "GaussianSplatRenderer.h"
 #include <windows.h>
 #include <GL/glew.h>
 #include <GL/gl.h>
@@ -10,30 +10,31 @@
 #include <cmath>
 #include <algorithm>
 #include <map>
-#include <numeric> // Для std::iota
+#include <numeric>
 
 #define NOMINMAX
 #undef min
 #undef max
 #define M_PI 3.14159265358979323846
 
-// --- Типы функций хука ---
+// Functions imported from the SketchUp overlay bridge.
 typedef bool (*PFN_GET_MATRIX_BY_LOC)(int location, float* matrix);
 typedef bool (*PFN_GET_CAMERA_STATE)(float* position, float* target, float* up, int* isPerspective);
 static PFN_GET_MATRIX_BY_LOC GetMatrixByLocation = nullptr;
 static PFN_GET_CAMERA_STATE GetCameraState = nullptr;
 
-// --- Глобальные переменные ---
-static std::vector<float> g_points;     // Для хранения данных из SetPointCloud
-static bool g_dataReady = false;        // Флаг для g_points
+// Renderer-owned state for splats, buffers, and camera-driven sorting.
+static std::vector<float> g_points;
+static bool g_dataReady = false;
 static GLuint g_gaussTexture = 0;
 static bool g_textureInitialized = false;
 
+// Runtime representation of a single billboarded gaussian splat.
 struct GaussSplat {
-    float position[3]; // X, Y, Z координаты (мировые)
+    float position[3];
     float color[4];    // R, G, B, A
-    float scale[2];    // X, Y масштаб
-    float rotation[4]; // Кватернион вращения (w, x, y, z)
+    float scale[2];
+    float rotation[4];
 };
 static std::vector<GaussSplat> g_splats;
 
@@ -51,29 +52,26 @@ struct SplatVBOData {
     std::vector<VertexData> vertices; std::vector<GLuint> indices;
     bool initialized = false; bool needsUpdate = true;
 };
-static SplatVBOData g_splatVBO; // Инициализация по умолчанию
+static SplatVBOData g_splatVBO;
 
-static std::vector<GLuint> g_splatSortIndices; // Индексы сплэтов для сортировки
+static std::vector<GLuint> g_splatSortIndices;
 
-// Структура для оптимизации сортировки
 struct SplatSortData {
-    GLuint index;         // Исходный индекс сплата
-    float projValue;      // Проекция на направление взгляда
-    float distanceSquared; // Квадрат расстояния до камеры
-    float sortKey;        // Финальный ключ сортировки
-    bool isBackfacing;    // Обращён ли назад
+    GLuint index;
+    float projValue;
+    float distanceSquared;
+    float sortKey;
+    bool isBackfacing;
 };
 static std::vector<SplatSortData> g_splatSortCache;
 
-// Переменные для отслеживания изменений камеры
 static float g_lastCamPos[3] = { 0, 0, 0 };
 static float g_lastViewDir[3] = { 0, 0, 0 };
 static int g_framesSinceLastSort = 0;
-static const int SORT_EVERY_N_FRAMES = 2; // Сортировать каждые 2 кадра
+static const int SORT_EVERY_N_FRAMES = 2;
 
-static GLuint g_splatShader = 0; // Шейдерная программа
+static GLuint g_splatShader = 0;
 
-// --- Утилиты ---
 static void LogRenderer(const char* format, ...) {
     char buffer[1024]; va_list args; va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args); va_end(args);
@@ -119,7 +117,6 @@ static void TransposeMat4(const float* source, float* result) {
     }
 }
 
-// --- Математика и OpenGL подготовка ---
 void QuaternionToMatrix(float q0, float q1, float q2, float q3, float matrix[16]) {
     float norm = sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
     if (norm < 1e-5f) { memset(matrix, 0, 16 * sizeof(float)); matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f; return; }
@@ -148,13 +145,13 @@ static GLuint CreateSplatShader() {
     glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
     glCompileShader(vertexShader);
     GLint success; char infoLog[512]; glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
-    if (!success) { glGetShaderInfoLog(vertexShader, 512, NULL, infoLog); LogRenderer("ERROR: VS compile failed: %s", infoLog); glDeleteShader(vertexShader); return 0; } // Добавил удаление шейдера при ошибке
+    if (!success) { glGetShaderInfoLog(vertexShader, 512, NULL, infoLog); LogRenderer("ERROR: VS compile failed: %s", infoLog); glDeleteShader(vertexShader); return 0; }
 
     GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
     glCompileShader(fragmentShader);
     glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
-    if (!success) { glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog); LogRenderer("ERROR: FS compile failed: %s", infoLog); glDeleteShader(vertexShader); glDeleteShader(fragmentShader); return 0; } // Добавил удаление шейдеров
+    if (!success) { glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog); LogRenderer("ERROR: FS compile failed: %s", infoLog); glDeleteShader(vertexShader); glDeleteShader(fragmentShader); return 0; }
 
     GLuint shaderProgram = glCreateProgram();
     glAttachShader(shaderProgram, vertexShader);
@@ -166,8 +163,8 @@ static GLuint CreateSplatShader() {
     glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
     if (!success) { glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog); LogRenderer("ERROR: Shader link failed: %s", infoLog); }
 
-    glDeleteShader(vertexShader); glDeleteShader(fragmentShader); // Удаляем в любом случае после линковки
-    if (!success) { glDeleteProgram(shaderProgram); return 0; } // Если линковка не удалась, удаляем программу
+    glDeleteShader(vertexShader); glDeleteShader(fragmentShader);
+    if (!success) { glDeleteProgram(shaderProgram); return 0; }
     LogRenderer("Shader program created successfully (ID: %u).", shaderProgram);
     return shaderProgram;
 }
@@ -190,7 +187,6 @@ static GLuint CreateGaussianTexture(int size, float sigma) {
     return texture;
 }
 
-// --- VBO Инициализация и Обновление ---
 static void InitializeSplatVBO() {
     if (g_splatVBO.initialized) return;
     LogRenderer("Initializing Splat VBO...");
@@ -200,11 +196,10 @@ static void InitializeSplatVBO() {
     glGenVertexArrays(1, &g_splatVBO.vao); glBindVertexArray(g_splatVBO.vao);
     glGenBuffers(1, &g_splatVBO.vbo); glBindBuffer(GL_ARRAY_BUFFER, g_splatVBO.vbo);
     glGenBuffers(1, &g_splatVBO.ebo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo);
-    // Атрибуты
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(SplatVBOData::VertexData), (void*)offsetof(SplatVBOData::VertexData, position)); glEnableVertexAttribArray(0);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SplatVBOData::VertexData), (void*)offsetof(SplatVBOData::VertexData, texCoord)); glEnableVertexAttribArray(1);
     glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(SplatVBOData::VertexData), (void*)offsetof(SplatVBOData::VertexData, color)); glEnableVertexAttribArray(2);
-    glBindBuffer(GL_ARRAY_BUFFER, 0); glBindVertexArray(0); // Отвязка
+    glBindBuffer(GL_ARRAY_BUFFER, 0); glBindVertexArray(0);
 
     if (g_splatShader == 0) { g_splatShader = CreateSplatShader(); }
     if (g_splatShader == 0) { LogRenderer("ERROR: Shader creation failed during VBO init. VBO unusable."); return; }
@@ -264,7 +259,6 @@ static void UpdateSplatVBOVertices() {
 
 static void UpdateSplatEBO() {
     if (!g_splatVBO.initialized) {
-        // LogRenderer("DEBUG: UpdateSplatEBO skip - VBO not initialized."); // Раскомментируй для отладки
         return;
     }
     if (g_splatVBO.ebo == 0) {
@@ -273,41 +267,33 @@ static void UpdateSplatEBO() {
     }
 
     if (g_splatSortIndices.empty()) {
-        // LogRenderer("DEBUG: UpdateSplatEBO skip - g_splatSortIndices is empty."); // Раскомментируй для отладки
-        // Если сортировочные индексы пусты, но EBO не пуст, очистим его
         if (!g_splatVBO.indices.empty()) {
             LogRenderer("DEBUG: Clearing EBO as sort indices are empty.");
-            glBindVertexArray(g_splatVBO.vao); // Нужен VAO для привязки EBO
+            glBindVertexArray(g_splatVBO.vao);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW); // Очищаем буфер на GPU
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
             glBindVertexArray(0);
-            g_splatVBO.indices.clear(); // Очищаем и CPU-копию индексов
+            g_splatVBO.indices.clear();
         }
         return;
     }
 
-    // 1. Генерируем индексы в векторе g_splatVBO.indices на CPU
-    // LogRenderer("DEBUG: Generating %zu indices for EBO...", g_splatSortIndices.size() * 6); // Слишком часто
 
-    g_splatVBO.indices.clear(); // Очищаем старые CPU-индексы
-    g_splatVBO.indices.reserve(g_splatSortIndices.size() * 6); // Резервируем память для производительности
+    g_splatVBO.indices.clear();
+    g_splatVBO.indices.reserve(g_splatSortIndices.size() * 6);
 
+    // Rebuild draw indices from the current view-dependent splat order.
     for (GLuint splatIndex : g_splatSortIndices) {
-        // Проверка на валидность индекса сплэта
         if (splatIndex >= g_splats.size()) {
-            // LogRenderer("ERROR UpdateSplatEBO: Invalid splatIndex %u (max: %zu)", splatIndex, g_splats.size() - 1); // Раскомментируй для отладки
-            continue; // Пропускаем невалидный индекс
+            continue;
         }
 
-        GLuint baseVertexIndex = splatIndex * 4; // Индекс первой вершины для этого сплэта в VBO
+        GLuint baseVertexIndex = splatIndex * 4;
 
-        // Проверка на валидность индекса вершины
         if (baseVertexIndex + 3 >= g_splatVBO.vertices.size()) {
-            // LogRenderer("ERROR UpdateSplatEBO: Invalid baseVertexIndex %u (max: %zu)", baseVertexIndex, g_splatVBO.vertices.size() - 1); // Раскомментируй для отладки
-            continue; // Пропускаем, если вершины для этого сплэта отсутствуют
+            continue;
         }
 
-        // Добавляем 6 индексов для двух треугольников квада
         g_splatVBO.indices.push_back(baseVertexIndex + 0);
         g_splatVBO.indices.push_back(baseVertexIndex + 1);
         g_splatVBO.indices.push_back(baseVertexIndex + 2);
@@ -317,29 +303,23 @@ static void UpdateSplatEBO() {
         g_splatVBO.indices.push_back(baseVertexIndex + 3);
     }
 
-    // 2. Загружаем сгенерированные индексы в GPU одним вызовом glBufferData
-    // LogRenderer("DEBUG: Uploading %zu indices (%zu bytes) to EBO (ID: %u)...", g_splatVBO.indices.size(), g_splatVBO.indices.size() * sizeof(GLuint), g_splatVBO.ebo); // Слишком часто
 
-    glBindVertexArray(g_splatVBO.vao); // Привязываем VAO
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo); // Привязываем наш EBO
+    glBindVertexArray(g_splatVBO.vao);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo);
 
-    // Используем glBufferData для загрузки данных. GL_DYNAMIC_DRAW - подсказка драйверу, что данные будут часто меняться.
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,           // Цель - индексный буфер
-        g_splatVBO.indices.size() * sizeof(GLuint), // Размер данных в байтах
-        g_splatVBO.indices.data(),          // Указатель на данные (из вектора)
-        GL_DYNAMIC_DRAW);                   // Подсказка использования
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+        g_splatVBO.indices.size() * sizeof(GLuint),
+        g_splatVBO.indices.data(),
+        GL_DYNAMIC_DRAW);
 
-    glBindVertexArray(0); // Отвязываем VAO (EBO останется привязанным к VAO)
+    glBindVertexArray(0);
 
-    // Проверка на ошибки OpenGL после загрузки
     GLenum err = glGetError();
     if (err != GL_NO_ERROR) {
         LogRenderer("ERROR: OpenGL Error 0x%x after EBO update (glBufferData)! Check buffer size and memory.", err);
     }
-    // LogRenderer("DEBUG: UpdateSplatEBO finished."); // Слишком часто
 }
 
-// --- Инициализация и Вспомогательные Функции ---
 static void InitializeDefaultSplats() { LogRenderer("Default splat disabled."); g_splats.clear(); g_splatSortIndices.clear(); g_splatVBO.needsUpdate = true; }
 static void EnsureTextureInitialized() { if (!g_textureInitialized) { g_gaussTexture = CreateGaussianTexture(64, 0.3f); g_textureInitialized = true; if (g_gaussTexture == 0) LogRenderer("ERR: Gauss texture failed."); } }
 static void LoadHookFunctions() {
@@ -368,20 +348,46 @@ static void Normalize3(float* vector) {
 }
 static void CrossProduct(const float* v1, const float* v2, float* r) { r[0] = v1[1] * v2[2] - v1[2] * v2[1]; r[1] = v1[2] * v2[0] - v1[0] * v2[2]; r[2] = v1[0] * v2[1] - v1[1] * v2[0]; }
 
-// --- Экспортируемые функции управления данными ---
 extern "C" EXPORT void SetPointCloud(const double* points_in, int count) { LogRenderer("SetPointCloud called."); if (!points_in || count <= 0)return; LoadHookFunctions(); g_points.clear(); g_points.reserve(count * 6); for (int i = 0;i < count;++i) { g_points.push_back((float)points_in[i * 6 + 0]); g_points.push_back((float)points_in[i * 6 + 1]); g_points.push_back((float)points_in[i * 6 + 2]); g_points.push_back((float)points_in[i * 6 + 3] / 255.f); g_points.push_back((float)points_in[i * 6 + 4] / 255.f); g_points.push_back((float)points_in[i * 6 + 5] / 255.f); } g_dataReady = true; }
 extern "C" EXPORT void AddSplat(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float rotation, bool rotateVertical) { GaussSplat s; s.position[0] = x;s.position[1] = y;s.position[2] = z; s.color[0] = r;s.color[1] = g;s.color[2] = b;s.color[3] = a; s.scale[0] = scaleX;s.scale[1] = scaleY; float an = rotation * M_PI / 180.f, ha = an * .5f, sn = sin(ha), cn = cos(ha); s.rotation[0] = cn; if (rotateVertical) { s.rotation[1] = sn;s.rotation[2] = 0;s.rotation[3] = 0; } else { s.rotation[1] = 0;s.rotation[2] = 0;s.rotation[3] = sn; } g_splats.push_back(s); g_splatVBO.needsUpdate = true; }
 extern "C" EXPORT void AddSplatWithQuaternion(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float qw, float qx, float qy, float qz) { GaussSplat s; s.position[0] = x;s.position[1] = y;s.position[2] = z; s.color[0] = r;s.color[1] = g;s.color[2] = b;s.color[3] = std::max(0.01f, std::min(a, 1.f)); s.scale[0] = scaleX;s.scale[1] = scaleY; float n = sqrt(qw * qw + qx * qx + qy * qy + qz * qz); if (n > 1e-5f) { s.rotation[0] = qw / n;s.rotation[1] = qx / n;s.rotation[2] = qy / n;s.rotation[3] = qz / n; } else { s.rotation[0] = 1;s.rotation[1] = 0;s.rotation[2] = 0;s.rotation[3] = 0; } g_splats.push_back(s); g_splatVBO.needsUpdate = true; }
 extern "C" EXPORT void ClearSplats() { LogRenderer("ClearSplats called."); g_splats.clear(); g_splatSortIndices.clear(); g_splatVBO.needsUpdate = true; }
 extern "C" EXPORT void SetSplatSortingMode(SplatSortingMode mode) { if (mode >= 0 && mode <= 5) { g_sortingMode = mode; LogRenderer("Sort mode set %d.", mode); } else LogRenderer("Invalid sort mode %d.", mode); }
 
-// --- Рендеринг ---
 static void RenderSingleSplatIM(const GaussSplat& splat, const float* viewMatrix, const float* projectionMatrix) { glPushMatrix(); glTranslatef(splat.position[0], splat.position[1], splat.position[2]); float rm[16]; QuaternionToMatrix(splat.rotation[0], splat.rotation[1], splat.rotation[2], splat.rotation[3], rm); glMultMatrixf(rm); glScalef(splat.scale[0], splat.scale[1], 1.0f); glColor4f(splat.color[0], splat.color[1], splat.color[2], splat.color[3]); float qs = 1.0f; glBegin(GL_QUADS); glTexCoord2f(0, 0);glVertex3f(-qs, -qs, 0); glTexCoord2f(1, 0);glVertex3f(qs, -qs, 0); glTexCoord2f(1, 1);glVertex3f(qs, qs, 0); glTexCoord2f(0, 1);glVertex3f(-qs, qs, 0); glEnd(); glPopMatrix(); }
+extern "C" EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz) {
+    // Bounds are consumed by the SketchUp-side proxy to keep clip planes stable.
+    if (!out_min_xyz || !out_max_xyz || g_splats.empty()) {
+        return 0;
+    }
+
+    double min_x = g_splats[0].position[0];
+    double min_y = g_splats[0].position[1];
+    double min_z = g_splats[0].position[2];
+    double max_x = min_x;
+    double max_y = min_y;
+    double max_z = min_z;
+
+    for (const GaussSplat& splat : g_splats) {
+        min_x = std::min(min_x, static_cast<double>(splat.position[0]));
+        min_y = std::min(min_y, static_cast<double>(splat.position[1]));
+        min_z = std::min(min_z, static_cast<double>(splat.position[2]));
+        max_x = std::max(max_x, static_cast<double>(splat.position[0]));
+        max_y = std::max(max_y, static_cast<double>(splat.position[1]));
+        max_z = std::max(max_z, static_cast<double>(splat.position[2]));
+    }
+
+    out_min_xyz[0] = min_x;
+    out_min_xyz[1] = min_y;
+    out_min_xyz[2] = min_z;
+    out_max_xyz[0] = max_x;
+    out_max_xyz[1] = max_y;
+    out_max_xyz[2] = max_z;
+    return 1;
+}
 static bool CheckGLCapabilities() { GLenum e = glewInit(); if (e != GLEW_OK) { LogRenderer("GLEW failed:%s", glewGetErrorString(e));return false; } if (!GLEW_VERSION_2_0 || !GLEW_ARB_vertex_buffer_object) { LogRenderer("WARN No VBO/Shader support");return false; } LogRenderer("OpenGL VBO/Shader support detected."); return true; }
 
-// --- Основная функция рендеринга ---
 extern "C" EXPORT void renderPointCloud() {
-    // LogRenderer("DEBUG: renderPointCloud ENTER"); // Слишком часто
     LoadHookFunctions(); if (!GetMatrixByLocation) { LogRenderer("ERROR: GetMatrixByLocation is NULL, cannot proceed."); return; } if (!GetCameraState) { LogRenderer("ERROR: GetCameraState is NULL, cannot proceed."); return; }
 
     static bool firstCall = true; static bool useVBO = false;
@@ -399,7 +405,7 @@ extern "C" EXPORT void renderPointCloud() {
         if (!g_splatVBO.initialized) { LogRenderer("WARN: VBO re-init failed. Disabling VBO path."); useVBO = false; }
     }
 
-    if (g_splats.empty()) { return; } // Нечего рендерить
+    if (g_splats.empty()) { return; }
 
     if (g_splatVBO.needsUpdate) {
         LogRenderer("DEBUG: renderPointCloud - needsUpdate=true, calling UpdateSplatVBOVertices()");
@@ -443,13 +449,11 @@ extern "C" EXPORT void renderPointCloud() {
         if (g_splatSortIndices.size() != g_splats.size()) {
             g_splatSortIndices.resize(g_splats.size()); std::iota(g_splatSortIndices.begin(), g_splatSortIndices.end(), 0);
             LogRenderer("DEBUG: Resized sort indices to %zu in sort block.", g_splatSortIndices.size());
-            sorting_done = true; // Нужно обновить EBO после изменения размера
+            sorting_done = true;
         }
 
-        // Проверяем, нужно ли выполнять сортировку
         bool needSorting = false;
 
-        // Проверяем, значительно ли изменилась камера
         float posDistSq =
             (camPos[0] - g_lastCamPos[0]) * (camPos[0] - g_lastCamPos[0]) +
             (camPos[1] - g_lastCamPos[1]) * (camPos[1] - g_lastCamPos[1]) +
@@ -460,82 +464,62 @@ extern "C" EXPORT void renderPointCloud() {
             (viewDir[1] - g_lastViewDir[1]) * (viewDir[1] - g_lastViewDir[1]) +
             (viewDir[2] - g_lastViewDir[2]) * (viewDir[2] - g_lastViewDir[2]);
 
-        // Увеличиваем счетчик кадров
         g_framesSinceLastSort++;
 
-        // Если камера сдвинулась более чем на 0.01 единиц или поворот более 0.001 рад
-        // или прошло достаточно кадров - выполняем сортировку
         if (posDistSq > 0.0001f || dirDiff > 0.000001f || g_framesSinceLastSort >= SORT_EVERY_N_FRAMES) {
             needSorting = true;
 
-            // Обновляем последнюю позицию камеры
             memcpy(g_lastCamPos, camPos, 3 * sizeof(float));
             memcpy(g_lastViewDir, viewDir, 3 * sizeof(float));
 
-            // Сбрасываем счетчик кадров
             g_framesSinceLastSort = 0;
         }
 
-        // Если нужна сортировка, выполняем её
         if (needSorting) {
             LogRenderer("DEBUG: Sorting %zu indices for view changes or frame limit...", g_splats.size());
 
-            // Предварительное вычисление данных для сортировки
             g_splatSortCache.resize(g_splats.size());
 
-            // Заполняем кэш данными для сортировки
+            // Cache the current camera-relative ordering so alpha blending stays stable.
             for (size_t i = 0; i < g_splats.size(); ++i) {
                 const GaussSplat& splat = g_splats[i];
                 SplatSortData& sortData = g_splatSortCache[i];
 
                 sortData.index = i;
 
-                // Вычисление вектора от камеры к сплату
                 float vec[3] = {
                     splat.position[0] - camPos[0],
                     splat.position[1] - camPos[1],
                     splat.position[2] - camPos[2]
                 };
 
-                // Проекция вектора на направление взгляда
                 sortData.projValue = vec[0] * viewDir[0] + vec[1] * viewDir[1] + vec[2] * viewDir[2];
 
-                // Квадрат расстояния
                 sortData.distanceSquared = vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2];
 
-                // Направлен ли сплат от нас
                 sortData.isBackfacing = (sortData.projValue <= 0);
 
-                // Вычисление ключа сортировки
                 if (!sortData.isBackfacing) {
-                    // Для передних граней: проекция + небольшая доля расстояния
                     float distanceFactor = sortData.distanceSquared * 0.001f;
-                    // Защита от деления на очень маленькие числа
                     if (sortData.projValue > 0.001f) {
                         distanceFactor /= sortData.projValue;
                     }
                     sortData.sortKey = sortData.projValue + distanceFactor;
                 }
                 else {
-                    // Для задних граней: только по расстоянию
                     sortData.sortKey = sortData.distanceSquared;
                 }
             }
 
-            // Быстрая сортировка по предварительно вычисленным значениям
             std::sort(g_splatSortCache.begin(), g_splatSortCache.end(),
                 [](const SplatSortData& a, const SplatSortData& b) -> bool {
-                    // Сначала разделяем по направлению (forward/backward)
                     if (a.isBackfacing != b.isBackfacing) return a.isBackfacing;
 
-                    // Если оба направлены от нас, сортируем по квадрату расстояния (дальние первыми)
                     if (a.isBackfacing) return a.distanceSquared > b.distanceSquared;
 
-                    // Если оба направлены к нам, используем предварительно вычисленный ключ
                     return a.sortKey > b.sortKey;
                 });
 
-            // Обновляем индексы сортировки
             for (size_t i = 0; i < g_splatSortCache.size(); ++i) {
                 g_splatSortIndices[i] = g_splatSortCache[i].index;
             }
@@ -548,9 +532,8 @@ extern "C" EXPORT void renderPointCloud() {
         if (g_splatVBO.indices.size() != g_splatSortIndices.size() * 6) { LogRenderer("DEBUG: EBO needs update (default order)."); UpdateSplatEBO(); }
     }
 
-    if (sorting_done) { /* LogRenderer("DEBUG: Calling UpdateSplatEBO() after sort.");*/ UpdateSplatEBO(); } // Обновляем EBO *после* сортировки
+    if (sorting_done) { /* LogRenderer("DEBUG: Calling UpdateSplatEBO() after sort.");*/ UpdateSplatEBO(); }
 
-    // --- Рендеринг ---
     GLint oldProg = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg); GLboolean blendEn = glIsEnabled(GL_BLEND); GLint oldBlendSrcRGB, oldBlendDstRGB, oldBlendSrcAlpha, oldBlendDstAlpha; glGetIntegerv(GL_BLEND_SRC_RGB, &oldBlendSrcRGB); glGetIntegerv(GL_BLEND_DST_RGB, &oldBlendDstRGB); glGetIntegerv(GL_BLEND_SRC_ALPHA, &oldBlendSrcAlpha); glGetIntegerv(GL_BLEND_DST_ALPHA, &oldBlendDstAlpha); GLboolean depthEn = glIsEnabled(GL_DEPTH_TEST); GLboolean depthMask; glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask); GLint oldDepthFunc; glGetIntegerv(GL_DEPTH_FUNC, &oldDepthFunc); GLboolean cullEn = glIsEnabled(GL_CULL_FACE); GLint oldCullMode; glGetIntegerv(GL_CULL_FACE_MODE, &oldCullMode); GLboolean texEn = glIsEnabled(GL_TEXTURE_2D); GLint oldActiveTex = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTex); GLint oldTexBind = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexBind);
 
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_FALSE);
@@ -563,7 +546,6 @@ extern "C" EXPORT void renderPointCloud() {
             GLint eboSizeCheck = 0; glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo); glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_SIZE, &eboSizeCheck); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
             if (eboSizeCheck == 0 && g_splatSortIndices.size() > 0) { LogRenderer("WARN: EBO size is 0 but we have sort indices! Skipping draw."); }
             else if (eboSizeCheck > 0) {
-                // LogRenderer("DEBUG: Rendering %d indices using VBO...", eboSizeCheck / sizeof(GLuint)); // Слишком часто
                 glUseProgram(g_splatShader);
                 GLint mvpLoc = glGetUniformLocation(g_splatShader, "uMVP"); if (mvpLoc != -1) glUniformMatrix4fv(mvpLoc, 1, GL_TRUE, mvpMatrix); else LogRenderer("ERR uMVP loc");
                 GLint texLoc = glGetUniformLocation(g_splatShader, "uTexture"); if (texLoc != -1 && g_gaussTexture != 0) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_gaussTexture); glUniform1i(texLoc, 0); }
@@ -575,7 +557,7 @@ extern "C" EXPORT void renderPointCloud() {
             }
         }
     }
-    else if (!useVBO && hasView && hasProj) { // Проверяем hasProj для IM
+    else if (!useVBO && hasView && hasProj) {
         LogRenderer("DEBUG: Using Immediate Mode fallback for %zu splats.", g_splatSortIndices.size());
         glUseProgram(0);
         float projectionMatrixGL[16]; float viewMatrixGL[16];
@@ -584,7 +566,7 @@ extern "C" EXPORT void renderPointCloud() {
         glEnable(GL_TEXTURE_2D); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_gaussTexture);
         glMatrixMode(GL_PROJECTION); glLoadMatrixf(projectionMatrixGL);
         glMatrixMode(GL_MODELVIEW); glLoadMatrixf(viewMatrixGL);
-        for (GLuint splatIndex : g_splatSortIndices) { if (splatIndex < g_splats.size()) RenderSingleSplatIM(g_splats[splatIndex], viewMatrix, projectionMatrix); } // Добавил проверку индекса
+        for (GLuint splatIndex : g_splatSortIndices) { if (splatIndex < g_splats.size()) RenderSingleSplatIM(g_splats[splatIndex], viewMatrix, projectionMatrix); }
         glBindTexture(GL_TEXTURE_2D, 0);
         if (!texEn) glDisable(GL_TEXTURE_2D);
     }
@@ -599,16 +581,15 @@ extern "C" EXPORT void renderPointCloud() {
     else glDisable(GL_CULL_FACE); glActiveTexture(oldActiveTex); glBindTexture(GL_TEXTURE_2D, oldTexBind); if (!texEn && oldTexBind == 0) glDisable(GL_TEXTURE_2D); else if (texEn) glEnable(GL_TEXTURE_2D);
 
     GLenum renderErr = glGetError(); if (renderErr != GL_NO_ERROR) LogRenderer("GL Error after render: 0x%x", renderErr);
-    // LogRenderer("DEBUG: renderPointCloud EXIT"); // Слишком часто
 }
 
 
-// --- Функции загрузки PLY ---
 void ConvertColor(float dc0, float dc1, float dc2, float& r, float& g, float& b) { auto sig = [](float x) {return 1.f / (1.f + exp(-x));}; r = sig(dc0); g = sig(dc1); b = sig(dc2); }
 void ConvertScale(float s0, float s1, float& sx, float& sy) { float rx = exp(s0); float ry = exp(s1); float sf = 45.f; sx = rx * sf; sy = ry * sf; }
 extern "C" EXPORT void LoadSplatsFromPLY(const char* filename) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); AddSplatsFromPLYData(pts, cnt); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); LogRenderer("PLY load finished."); }
 extern "C" EXPORT void AddSplatsFromPLYData(PLYGaussianPoint* points, int count) {
     LogRenderer("Adding %d splats from PLY data...", count); ClearSplats(); g_splats.reserve(count);
+    // Imported splats come in a tiny local space, so scale them up for SketchUp units.
     float scaleDistance = 20.0f; float opacityMultiplier = 3.0f; int addedCount = 0;
     for (int i = 0; i < count; ++i) {
         float x = points[i].position[0] * scaleDistance; float y = -points[i].position[1] * scaleDistance; float z = points[i].position[2] * scaleDistance;
@@ -621,11 +602,10 @@ extern "C" EXPORT void AddSplatsFromPLYData(PLYGaussianPoint* points, int count)
     } g_splatVBO.needsUpdate = true; LogRenderer("Added %d splats. Total: %zu.", addedCount, g_splats.size());
 }
 
-// --- Точка входа DLL и очистка ---
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH: LogRenderer("DLL_PROCESS_ATTACH"); LoadHookFunctions(); break;
-    case DLL_PROCESS_DETACH: LogRenderer("DLL_PROCESS_DETACH"); /* Очистка OpenGL закомментирована */ break;
+    case DLL_PROCESS_DETACH: LogRenderer("DLL_PROCESS_DETACH"); break;
     case DLL_THREAD_ATTACH: break;
     case DLL_THREAD_DETACH: break;
     }

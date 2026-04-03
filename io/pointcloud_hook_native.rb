@@ -50,5 +50,13 @@ module GaussianPoints
       @set_pointcloud_data.call(mem, count)
       true
     end
+
+    def self.clear_pointcloud
+      return false unless setup_dll
+      return false unless install_hooks
+
+      @set_pointcloud_data.call(0, 0)
+      true
+    end
   end
 end

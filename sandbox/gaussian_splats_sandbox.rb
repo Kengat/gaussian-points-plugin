@@ -22,8 +22,9 @@ module GaussianPoints
     def self.renderer_dll_path
       candidates = [
         File.join(plugin_dir, 'runtime', 'GaussianSplatRenderer.dll'),
+        File.join(plugin_dir, 'GaussianSplatRenderer.dll'),
         File.join(plugin_dir, 'cpp', 'build', 'GaussianSplatRenderer', 'GaussianSplatRenderer', 'x64', 'Release', 'GaussianSplatRenderer.dll'),
-        File.join(plugin_dir, 'GaussianSplatRenderer.dll')
+        File.join(plugin_dir, 'build', 'gaussian', 'GaussianSplatRenderer.dll')
       ]
 
       candidates.find { |path| File.exist?(path) }
@@ -144,6 +145,16 @@ module GaussianPoints
           [Fiddle::TYPE_VOIDP],
           Fiddle::TYPE_VOID
         )
+
+        begin
+          @get_splat_bounds = Fiddle::Function.new(
+            @renderer_dll['GetSplatBounds'],
+            [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
+            Fiddle::TYPE_INT
+          )
+        rescue Fiddle::DLError
+          @get_splat_bounds = nil
+        end
       end
 
       if @ply_dll_loaded
@@ -191,6 +202,7 @@ module GaussianPoints
       return false unless @renderer_dll_loaded
 
       @clear_splats.call
+      GaussianPoints::SceneBoundsProxy.clear_splats if defined?(GaussianPoints::SceneBoundsProxy)
       true
     end
 
@@ -228,6 +240,7 @@ module GaussianPoints
 
       c_filename = to_c_string(filename.tr('/', '\\'))
       @load_splats_from_ply.call(c_filename)
+      sync_bounds_proxy_from_renderer
       true
     end
 
@@ -237,6 +250,25 @@ module GaussianPoints
 
     def self.stop_plugin
       clear_splats
+    end
+
+    def self.sync_bounds_proxy_from_renderer
+      return unless defined?(GaussianPoints::SceneBoundsProxy)
+      return unless @get_splat_bounds
+
+      min_buffer = Fiddle::Pointer.malloc(3 * Fiddle::SIZEOF_DOUBLE)
+      max_buffer = Fiddle::Pointer.malloc(3 * Fiddle::SIZEOF_DOUBLE)
+      min_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE] = [0.0, 0.0, 0.0].pack('d*')
+      max_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE] = [0.0, 0.0, 0.0].pack('d*')
+
+      result = @get_splat_bounds.call(min_buffer, max_buffer)
+      return unless result != 0
+
+      min_point = min_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE].unpack('d3')
+      max_point = max_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE].unpack('d3')
+      GaussianPoints::SceneBoundsProxy.update_splats_bounds(min_point, max_point)
+    rescue StandardError => e
+      puts "[GaussianSplats] bounds sync error: #{e.message}"
     end
   end
 end
