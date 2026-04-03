@@ -14,14 +14,17 @@ extern "C" {
 		int enabled,
 		int visible,
 		int gizmo_visible,
-		const double* min_xyz,
-		const double* max_xyz,
+		int center_scale_mode,
+		const double* center_xyz,
+		const double* half_extents_xyz,
+		const double* axes_xyz,
 		int hovered_handle,
 		int active_handle);
 	SKETCHUP_OVERLAY_BRIDGE_API bool GetClipBoxState(
 		int* enabled,
-		double* min_xyz,
-		double* max_xyz);
+		double* center_xyz,
+		double* half_extents_xyz,
+		double* axes_xyz);
 }
 
 #endif // SKETCHUP_OVERLAY_BRIDGE_H

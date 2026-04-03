@@ -8,18 +8,23 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <fstream>
 #include <vector>
 
 namespace {
 
 using PFN_GET_MATRICES = bool (*)(float* modelview, float* projection);
-using PFN_GET_CLIP_BOX_STATE = bool (*)(int* enabled, double* min_xyz, double* max_xyz);
+using PFN_GET_CLIP_BOX_STATE = bool (*)(int* enabled, double* center_xyz, double* half_extents_xyz, double* axes_xyz);
 
 struct ClipBoxState {
   bool enabled = false;
-  double min_xyz[3] = {0.0, 0.0, 0.0};
-  double max_xyz[3] = {0.0, 0.0, 0.0};
+  double center_xyz[3] = {0.0, 0.0, 0.0};
+  double half_extents_xyz[3] = {0.0, 0.0, 0.0};
+  double axes_xyz[9] = {
+      1.0, 0.0, 0.0,
+      0.0, 1.0, 0.0,
+      0.0, 0.0, 1.0};
 };
 
 PFN_GET_MATRICES g_get_current_matrices = nullptr;
@@ -130,7 +135,7 @@ ClipBoxState FetchClipBoxState() {
   }
 
   int enabled = 0;
-  if (!g_get_clip_box_state(&enabled, state.min_xyz, state.max_xyz)) {
+  if (!g_get_clip_box_state(&enabled, state.center_xyz, state.half_extents_xyz, state.axes_xyz)) {
     return state;
   }
 
@@ -143,9 +148,22 @@ bool IsPointInsideClip(const ClipBoxState& clip_box, float x, float y, float z) 
     return true;
   }
 
-  return x >= clip_box.min_xyz[0] && x <= clip_box.max_xyz[0] &&
-      y >= clip_box.min_xyz[1] && y <= clip_box.max_xyz[1] &&
-      z >= clip_box.min_xyz[2] && z <= clip_box.max_xyz[2];
+  const double local_x =
+      (x - clip_box.center_xyz[0]) * clip_box.axes_xyz[0] +
+      (y - clip_box.center_xyz[1]) * clip_box.axes_xyz[1] +
+      (z - clip_box.center_xyz[2]) * clip_box.axes_xyz[2];
+  const double local_y =
+      (x - clip_box.center_xyz[0]) * clip_box.axes_xyz[3] +
+      (y - clip_box.center_xyz[1]) * clip_box.axes_xyz[4] +
+      (z - clip_box.center_xyz[2]) * clip_box.axes_xyz[5];
+  const double local_z =
+      (x - clip_box.center_xyz[0]) * clip_box.axes_xyz[6] +
+      (y - clip_box.center_xyz[1]) * clip_box.axes_xyz[7] +
+      (z - clip_box.center_xyz[2]) * clip_box.axes_xyz[8];
+
+  return std::fabs(local_x) <= clip_box.half_extents_xyz[0] &&
+      std::fabs(local_y) <= clip_box.half_extents_xyz[1] &&
+      std::fabs(local_z) <= clip_box.half_extents_xyz[2];
 }
 
 bool InitializeRenderer() {

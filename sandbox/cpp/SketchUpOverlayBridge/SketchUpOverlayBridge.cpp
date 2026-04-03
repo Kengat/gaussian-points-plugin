@@ -39,8 +39,14 @@ struct ClipBoxState {
   bool enabled = false;
   bool visible = false;
   bool gizmo_visible = false;
-  double min_xyz[3] = { 0.0, 0.0, 0.0 };
-  double max_xyz[3] = { 0.0, 0.0, 0.0 };
+  bool center_scale_mode = false;
+  double center_xyz[3] = { 0.0, 0.0, 0.0 };
+  double half_extents_xyz[3] = { 0.0, 0.0, 0.0 };
+  double axes_xyz[9] = {
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    0.0, 0.0, 1.0
+  };
   int hovered_handle = 0;
   int active_handle = 0;
 };
@@ -60,6 +66,11 @@ constexpr int kHandleResizeMaxZ = 9;
 constexpr int kHandleMovePlaneXY = 10;
 constexpr int kHandleMovePlaneXZ = 11;
 constexpr int kHandleMovePlaneYZ = 12;
+constexpr int kHandleRotateX = 13;
+constexpr int kHandleRotateY = 14;
+constexpr int kHandleRotateZ = 15;
+constexpr int kHandleMoveCenter = 16;
+constexpr int kHandleScaleUniform = 17;
 
 using PFN_RENDER_POINTCLOUD = void (*)();
 using PFN_SET_POINTCLOUD = void (*)(const double*, int);
@@ -201,7 +212,7 @@ Vec3 CameraBillboardUp() {
   return up;
 }
 
-Vec3 AxisVector(char axis) {
+Vec3 WorldAxis(char axis) {
   switch (axis) {
   case 'x': return MakeVec3(1.0f, 0.0f, 0.0f);
   case 'y': return MakeVec3(0.0f, 1.0f, 0.0f);
@@ -210,44 +221,47 @@ Vec3 AxisVector(char axis) {
   }
 }
 
-Vec3 BoxMinVec() {
-  return MakeVec3(
-      static_cast<float>(g_clip_box.min_xyz[0]),
-      static_cast<float>(g_clip_box.min_xyz[1]),
-      static_cast<float>(g_clip_box.min_xyz[2]));
+int AxisIndex(char axis) {
+  switch (axis) {
+  case 'x': return 0;
+  case 'y': return 1;
+  case 'z': return 2;
+  default: return 0;
+  }
 }
 
-Vec3 BoxMaxVec() {
-  return MakeVec3(
-      static_cast<float>(g_clip_box.max_xyz[0]),
-      static_cast<float>(g_clip_box.max_xyz[1]),
-      static_cast<float>(g_clip_box.max_xyz[2]));
+Vec3 ClipAxis(char axis) {
+  const int index = AxisIndex(axis) * 3;
+  const Vec3 vector = Normalize(MakeVec3(
+      static_cast<float>(g_clip_box.axes_xyz[index + 0]),
+      static_cast<float>(g_clip_box.axes_xyz[index + 1]),
+      static_cast<float>(g_clip_box.axes_xyz[index + 2])));
+  return Length(vector) > 1.0e-5f ? vector : WorldAxis(axis);
+}
+
+float HalfExtent(char axis) {
+  return static_cast<float>(g_clip_box.half_extents_xyz[AxisIndex(axis)]);
 }
 
 Vec3 BoxCenterVec() {
-  const Vec3 box_min = BoxMinVec();
-  const Vec3 box_max = BoxMaxVec();
   return MakeVec3(
-      (box_min.x + box_max.x) * 0.5f,
-      (box_min.y + box_max.y) * 0.5f,
-      (box_min.z + box_max.z) * 0.5f);
+      static_cast<float>(g_clip_box.center_xyz[0]),
+      static_cast<float>(g_clip_box.center_xyz[1]),
+      static_cast<float>(g_clip_box.center_xyz[2]));
+}
+
+Vec3 OrientedCorner(float x_sign, float y_sign, float z_sign) {
+  return Add(
+      Add(
+          Add(BoxCenterVec(), Scale(ClipAxis('x'), HalfExtent('x') * x_sign)),
+          Scale(ClipAxis('y'), HalfExtent('y') * y_sign)),
+      Scale(ClipAxis('z'), HalfExtent('z') * z_sign));
 }
 
 Vec3 AxisFaceCenter(char axis, bool positive_side) {
-  const Vec3 box_min = BoxMinVec();
-  const Vec3 box_max = BoxMaxVec();
-  const Vec3 center = BoxCenterVec();
-
-  switch (axis) {
-  case 'x':
-    return MakeVec3(positive_side ? box_max.x : box_min.x, center.y, center.z);
-  case 'y':
-    return MakeVec3(center.x, positive_side ? box_max.y : box_min.y, center.z);
-  case 'z':
-    return MakeVec3(center.x, center.y, positive_side ? box_max.z : box_min.z);
-  default:
-    return center;
-  }
+  return Add(
+      BoxCenterVec(),
+      Scale(ClipAxis(axis), HalfExtent(axis) * (positive_side ? 1.0f : -1.0f)));
 }
 
 float ProjectionScaleY() {
@@ -290,7 +304,7 @@ Vec3 ResizeHandleCenterForId(int handle_id) {
 
 void MoveHandleGeometry(char axis, Vec3* line_start, Vec3* line_tip) {
   const Vec3 face_center = AxisFaceCenter(axis, true);
-  const Vec3 axis_dir = AxisVector(axis);
+  const Vec3 axis_dir = ClipAxis(axis);
   const float gap = PixelsToWorldAt(face_center, 18.0f);
   const float length = PixelsToWorldAt(face_center, 54.0f);
 
@@ -300,13 +314,39 @@ void MoveHandleGeometry(char axis, Vec3* line_start, Vec3* line_tip) {
 
 void PlaneHandleGeometry(char axis_a_name, char axis_b_name, Vec3* center, float* half_size) {
   const Vec3 box_center = BoxCenterVec();
-  const Vec3 axis_a = AxisVector(axis_a_name);
-  const Vec3 axis_b = AxisVector(axis_b_name);
+  const Vec3 axis_a = ClipAxis(axis_a_name);
+  const Vec3 axis_b = ClipAxis(axis_b_name);
   const float local_half_size = PixelsToWorldAt(box_center, 9.0f);
-  const float offset = PixelsToWorldAt(box_center, 16.0f) + local_half_size;
+  const float offset = PixelsToWorldAt(box_center, 24.0f) + local_half_size;
 
   *center = Add(Add(box_center, Scale(axis_a, offset)), Scale(axis_b, offset));
   *half_size = local_half_size;
+}
+
+float CenterHandleHalfSize() {
+  return PixelsToWorldAt(BoxCenterVec(), 6.0f);
+}
+
+void RotationHandleGeometry(char axis_name, Vec3* center, Vec3* axis_a, Vec3* axis_b, float* radius) {
+  const Vec3 box_center = BoxCenterVec();
+  *radius = PixelsToWorldAt(box_center, 120.0f);
+
+  switch (axis_name) {
+  case 'x':
+    *axis_a = ClipAxis('y');
+    *axis_b = ClipAxis('z');
+    break;
+  case 'y':
+    *axis_a = ClipAxis('z');
+    *axis_b = ClipAxis('x');
+    break;
+  case 'z':
+  default:
+    *axis_a = ClipAxis('x');
+    *axis_b = ClipAxis('y');
+    break;
+  }
+  *center = box_center;
 }
 
 void DrawBillboardSquare(const Vec3& center, float half_size, float r, float g, float b, bool highlighted) {
@@ -331,6 +371,30 @@ void DrawBillboardSquare(const Vec3& center, float half_size, float r, float g, 
   glBegin(GL_LINE_LOOP);
   for (int i = 0; i < 4; ++i) {
     DrawVertex(corners[i]);
+  }
+  glEnd();
+}
+
+void DrawBillboardDisc(const Vec3& center, float radius, float r, float g, float b, bool highlighted) {
+  constexpr int kSegments = 24;
+  const Vec3 right = CameraRight();
+  const Vec3 up = CameraBillboardUp();
+
+  glColor4f(0.0f, 0.0f, 0.0f, highlighted ? 0.28f : 0.18f);
+  glBegin(GL_TRIANGLE_FAN);
+  DrawVertex(center);
+  for (int segment = 0; segment <= kSegments; ++segment) {
+    const float angle = static_cast<float>(segment) / static_cast<float>(kSegments) * 6.28318530718f;
+    DrawVertex(Add(Add(center, Scale(right, cosf(angle) * radius)), Scale(up, sinf(angle) * radius)));
+  }
+  glEnd();
+
+  glLineWidth(highlighted ? 2.5f : 1.5f);
+  glColor4f(r, g, b, 1.0f);
+  glBegin(GL_LINE_LOOP);
+  for (int segment = 0; segment < kSegments; ++segment) {
+    const float angle = static_cast<float>(segment) / static_cast<float>(kSegments) * 6.28318530718f;
+    DrawVertex(Add(Add(center, Scale(right, cosf(angle) * radius)), Scale(up, sinf(angle) * radius)));
   }
   glEnd();
 }
@@ -371,22 +435,84 @@ void DrawPlanarDisc(
   glEnd();
 }
 
+void DrawRotationArc(
+    const Vec3& center,
+    const Vec3& axis_a,
+    const Vec3& axis_b,
+    float radius,
+    float r,
+    float g,
+    float b,
+    bool highlighted) {
+  constexpr int kSegments = 24;
+  constexpr float kSweep = 1.00530964915f;
+  const float start_angle = 0.78539816339f - (kSweep * 0.5f);
+
+  glLineWidth(highlighted ? 5.0f : 3.0f);
+  glColor4f(0.0f, 0.0f, 0.0f, 0.22f);
+  glBegin(GL_LINE_STRIP);
+  for (int segment = 0; segment <= kSegments; ++segment) {
+    const float angle = start_angle + (static_cast<float>(segment) / static_cast<float>(kSegments) * kSweep);
+    DrawVertex(Add(
+        Add(center, Scale(axis_a, cosf(angle) * radius)),
+        Scale(axis_b, sinf(angle) * radius)));
+  }
+  glEnd();
+
+  glLineWidth(highlighted ? 3.0f : 2.0f);
+  glColor4f(r, g, b, 1.0f);
+  glBegin(GL_LINE_STRIP);
+  for (int segment = 0; segment <= kSegments; ++segment) {
+    const float angle = start_angle + (static_cast<float>(segment) / static_cast<float>(kSegments) * kSweep);
+    DrawVertex(Add(
+        Add(center, Scale(axis_a, cosf(angle) * radius)),
+        Scale(axis_b, sinf(angle) * radius)));
+  }
+  glEnd();
+
+  const float end_angle = start_angle + kSweep;
+  const Vec3 tip = Add(
+      Add(center, Scale(axis_a, cosf(end_angle) * radius)),
+      Scale(axis_b, sinf(end_angle) * radius));
+  const Vec3 prev = Add(
+      Add(center, Scale(axis_a, cosf(end_angle - 0.08f) * radius)),
+      Scale(axis_b, sinf(end_angle - 0.08f) * radius));
+  const Vec3 direction = Normalize(Subtract(tip, prev));
+  const Vec3 plane_normal = Normalize(Cross(axis_a, axis_b));
+  Vec3 side = Normalize(Cross(direction, plane_normal));
+  if (Length(side) < 1.0e-5f) {
+    side = Normalize(Cross(direction, CameraForward()));
+  }
+  const float arrow_length = PixelsToWorldAt(tip, 10.0f);
+  const Vec3 left_wing = Add(Subtract(tip, Scale(direction, arrow_length)), Scale(side, arrow_length * 0.45f));
+  const Vec3 right_wing = Subtract(Subtract(tip, Scale(direction, arrow_length)), Scale(side, arrow_length * 0.45f));
+
+  glLineWidth(highlighted ? 3.0f : 2.0f);
+  glBegin(GL_LINES);
+  DrawVertex(tip); DrawVertex(left_wing);
+  DrawVertex(tip); DrawVertex(right_wing);
+  glEnd();
+}
+
 void HandleColorForId(int handle_id, float* r, float* g, float* b) {
   float color[3] = { 1.0f, 0.66f, 0.15f };
   switch (handle_id) {
   case kHandleMoveX:
   case kHandleResizeMinX:
   case kHandleResizeMaxX:
+  case kHandleRotateX:
     color[0] = 0.86f; color[1] = 0.27f; color[2] = 0.22f;
     break;
   case kHandleMoveY:
   case kHandleResizeMinY:
   case kHandleResizeMaxY:
+  case kHandleRotateY:
     color[0] = 0.27f; color[1] = 0.74f; color[2] = 0.35f;
     break;
   case kHandleMoveZ:
   case kHandleResizeMinZ:
   case kHandleResizeMaxZ:
+  case kHandleRotateZ:
     color[0] = 0.28f; color[1] = 0.47f; color[2] = 0.90f;
     break;
   case kHandleMovePlaneXY:
@@ -397,6 +523,10 @@ void HandleColorForId(int handle_id, float* r, float* g, float* b) {
     break;
   case kHandleMovePlaneYZ:
     color[0] = 0.29f; color[1] = 0.71f; color[2] = 0.77f;
+    break;
+  case kHandleMoveCenter:
+  case kHandleScaleUniform:
+    color[0] = 1.00f; color[1] = 0.77f; color[2] = 0.38f;
     break;
   }
 
@@ -416,17 +546,15 @@ void DrawBoxOverlay(bool draw_shell, bool draw_gizmo) {
     return;
   }
 
-  const Vec3 box_min = BoxMinVec();
-  const Vec3 box_max = BoxMaxVec();
   const Vec3 corners[8] = {
-    MakeVec3(box_min.x, box_min.y, box_min.z),
-    MakeVec3(box_max.x, box_min.y, box_min.z),
-    MakeVec3(box_max.x, box_max.y, box_min.z),
-    MakeVec3(box_min.x, box_max.y, box_min.z),
-    MakeVec3(box_min.x, box_min.y, box_max.z),
-    MakeVec3(box_max.x, box_min.y, box_max.z),
-    MakeVec3(box_max.x, box_max.y, box_max.z),
-    MakeVec3(box_min.x, box_max.y, box_max.z)
+    OrientedCorner(-1.0f, -1.0f, -1.0f),
+    OrientedCorner( 1.0f, -1.0f, -1.0f),
+    OrientedCorner( 1.0f,  1.0f, -1.0f),
+    OrientedCorner(-1.0f,  1.0f, -1.0f),
+    OrientedCorner(-1.0f, -1.0f,  1.0f),
+    OrientedCorner( 1.0f, -1.0f,  1.0f),
+    OrientedCorner( 1.0f,  1.0f,  1.0f),
+    OrientedCorner(-1.0f,  1.0f,  1.0f)
   };
 
   const int edge_indices[12][2] = {
@@ -528,7 +656,7 @@ void DrawBoxOverlay(bool draw_shell, bool draw_gizmo) {
       float b = 0.0f;
       HandleColorForId(move_ids[i], &r, &g, &b);
 
-      const Vec3 axis_dir = AxisVector(move_axes[i]);
+      const Vec3 axis_dir = ClipAxis(move_axes[i]);
       Vec3 side = Normalize(Cross(axis_dir, CameraForward()));
       if (Length(side) < 1.0e-5f) {
         side = Normalize(Cross(axis_dir, CameraBillboardUp()));
@@ -577,8 +705,8 @@ void DrawBoxOverlay(bool draw_shell, bool draw_gizmo) {
       Vec3 plane_center = {};
       float plane_half_size = 0.0f;
       PlaneHandleGeometry(axis_a, axis_b, &plane_center, &plane_half_size);
-      const Vec3 axis_a_vec = AxisVector(axis_a);
-      const Vec3 axis_b_vec = AxisVector(axis_b);
+      const Vec3 axis_a_vec = ClipAxis(axis_a);
+      const Vec3 axis_b_vec = ClipAxis(axis_b);
 
       float r = 0.0f;
       float g = 0.0f;
@@ -593,6 +721,49 @@ void DrawBoxOverlay(bool draw_shell, bool draw_gizmo) {
           g,
           b,
           IsHandleHighlighted(plane_ids[i]));
+    }
+
+    {
+      const int center_handle_id = g_clip_box.center_scale_mode ? kHandleScaleUniform : kHandleMoveCenter;
+      const bool highlighted =
+          IsHandleHighlighted(kHandleMoveCenter) ||
+          IsHandleHighlighted(kHandleScaleUniform);
+      float r = 0.0f;
+      float g = 0.0f;
+      float b = 0.0f;
+      HandleColorForId(center_handle_id, &r, &g, &b);
+      const Vec3 center = BoxCenterVec();
+      const float half_size = CenterHandleHalfSize() * (highlighted ? 1.15f : 1.0f);
+      if (g_clip_box.center_scale_mode) {
+        DrawBillboardSquare(center, half_size, r, g, b, highlighted);
+      } else {
+        DrawBillboardDisc(center, half_size, r, g, b, highlighted);
+      }
+    }
+
+    const int rotate_ids[3] = { kHandleRotateX, kHandleRotateY, kHandleRotateZ };
+    const char rotate_axes[3] = { 'x', 'y', 'z' };
+
+    for (int i = 0; i < 3; ++i) {
+      Vec3 arc_center = {};
+      Vec3 axis_a = {};
+      Vec3 axis_b = {};
+      float radius = 0.0f;
+      RotationHandleGeometry(rotate_axes[i], &arc_center, &axis_a, &axis_b, &radius);
+
+      float r = 0.0f;
+      float g = 0.0f;
+      float b = 0.0f;
+      HandleColorForId(rotate_ids[i], &r, &g, &b);
+      DrawRotationArc(
+          arc_center,
+          axis_a,
+          axis_b,
+          radius,
+          r,
+          g,
+          b,
+          IsHandleHighlighted(rotate_ids[i]));
     }
 
     const int resize_ids[6] = {
@@ -918,19 +1089,25 @@ extern "C" __declspec(dllexport) void SetClipBoxState(
     int enabled,
     int visible,
     int gizmo_visible,
-    const double* min_xyz,
-    const double* max_xyz,
+    int center_scale_mode,
+    const double* center_xyz,
+    const double* half_extents_xyz,
+    const double* axes_xyz,
     int hovered_handle,
     int active_handle) {
   g_clip_box.enabled = enabled != 0;
   g_clip_box.visible = visible != 0;
   g_clip_box.gizmo_visible = gizmo_visible != 0;
+  g_clip_box.center_scale_mode = center_scale_mode != 0;
 
-  if (min_xyz != nullptr) {
-    memcpy(g_clip_box.min_xyz, min_xyz, sizeof(g_clip_box.min_xyz));
+  if (center_xyz != nullptr) {
+    memcpy(g_clip_box.center_xyz, center_xyz, sizeof(g_clip_box.center_xyz));
   }
-  if (max_xyz != nullptr) {
-    memcpy(g_clip_box.max_xyz, max_xyz, sizeof(g_clip_box.max_xyz));
+  if (half_extents_xyz != nullptr) {
+    memcpy(g_clip_box.half_extents_xyz, half_extents_xyz, sizeof(g_clip_box.half_extents_xyz));
+  }
+  if (axes_xyz != nullptr) {
+    memcpy(g_clip_box.axes_xyz, axes_xyz, sizeof(g_clip_box.axes_xyz));
   }
 
   g_clip_box.hovered_handle = hovered_handle;
@@ -939,15 +1116,17 @@ extern "C" __declspec(dllexport) void SetClipBoxState(
 
 extern "C" __declspec(dllexport) bool GetClipBoxState(
     int* enabled,
-    double* min_xyz,
-    double* max_xyz) {
-  if (enabled == nullptr || min_xyz == nullptr || max_xyz == nullptr) {
+    double* center_xyz,
+    double* half_extents_xyz,
+    double* axes_xyz) {
+  if (enabled == nullptr || center_xyz == nullptr || half_extents_xyz == nullptr || axes_xyz == nullptr) {
     return false;
   }
 
   *enabled = g_clip_box.enabled ? 1 : 0;
-  memcpy(min_xyz, g_clip_box.min_xyz, sizeof(g_clip_box.min_xyz));
-  memcpy(max_xyz, g_clip_box.max_xyz, sizeof(g_clip_box.max_xyz));
+  memcpy(center_xyz, g_clip_box.center_xyz, sizeof(g_clip_box.center_xyz));
+  memcpy(half_extents_xyz, g_clip_box.half_extents_xyz, sizeof(g_clip_box.half_extents_xyz));
+  memcpy(axes_xyz, g_clip_box.axes_xyz, sizeof(g_clip_box.axes_xyz));
   return true;
 }
 

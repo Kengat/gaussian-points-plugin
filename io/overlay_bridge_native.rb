@@ -22,18 +22,21 @@ module GaussianPoints
       false
     end
 
-    def sync_clip_box(enabled:, visible:, gizmo_visible:, min_point:, max_point:, hovered_handle:, active_handle:)
+    def sync_clip_box(enabled:, visible:, gizmo_visible:, center_scale_mode:, center_point:, half_extents:, axes:, hovered_handle:, active_handle:)
       return false unless setup_dll
       return false unless install_hooks
 
-      min_ptr = pack_point(min_point)
-      max_ptr = pack_point(max_point)
+      center_ptr = pack_point(center_point)
+      half_extents_ptr = pack_half_extents(half_extents)
+      axes_ptr = pack_axes(axes)
       @set_clip_box_state.call(
         enabled ? 1 : 0,
         visible ? 1 : 0,
         gizmo_visible ? 1 : 0,
-        min_ptr,
-        max_ptr,
+        center_scale_mode ? 1 : 0,
+        center_ptr,
+        half_extents_ptr,
+        axes_ptr,
         hovered_handle.to_i,
         active_handle.to_i
       )
@@ -56,7 +59,7 @@ module GaussianPoints
       @install_all_hooks = Fiddle::Function.new(@dll['InstallAllHooks'], [], Fiddle::TYPE_VOID)
       @set_clip_box_state = Fiddle::Function.new(
         @dll['SetClipBoxState'],
-        [Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT, Fiddle::TYPE_INT],
+        [Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT, Fiddle::TYPE_INT],
         Fiddle::TYPE_VOID
       )
       @dll_loaded = true
@@ -75,6 +78,42 @@ module GaussianPoints
         end
 
       packed = values.pack('d3')
+      memory = Fiddle::Pointer.malloc(packed.bytesize)
+      memory[0, packed.bytesize] = packed
+      memory
+    end
+
+    def pack_half_extents(half_extents)
+      values =
+        if half_extents
+          [half_extents[:x].to_f, half_extents[:y].to_f, half_extents[:z].to_f]
+        else
+          [0.0, 0.0, 0.0]
+        end
+
+      pack_doubles(values)
+    end
+
+    def pack_axes(axes)
+      values =
+        if axes
+          %i[x y z].flat_map do |axis|
+            vector = axes[axis]
+            if vector
+              [vector.x.to_f, vector.y.to_f, vector.z.to_f]
+            else
+              [0.0, 0.0, 0.0]
+            end
+          end
+        else
+          [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        end
+
+      pack_doubles(values)
+    end
+
+    def pack_doubles(values)
+      packed = values.pack("d#{values.length}")
       memory = Fiddle::Pointer.malloc(packed.bytesize)
       memory[0, packed.bytesize] = packed
       memory

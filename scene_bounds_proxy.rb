@@ -44,6 +44,10 @@ module GaussianPoints
         update_source_bounds(CLIP_BOX_SOURCE, bounds_to_snapshot(bounds_from_min_max(min_point, max_point)))
       end
 
+      def update_clip_box_points(points)
+        update_source_bounds(CLIP_BOX_SOURCE, bounds_from_points(points))
+      end
+
       def clear_clip_box
         clear_source_bounds(CLIP_BOX_SOURCE)
       end

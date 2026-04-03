@@ -20,15 +20,20 @@
 // Functions imported from the SketchUp overlay bridge.
 typedef bool (*PFN_GET_MATRIX_BY_LOC)(int location, float* matrix);
 typedef bool (*PFN_GET_CAMERA_STATE)(float* position, float* target, float* up, int* isPerspective);
-typedef bool (*PFN_GET_CLIP_BOX_STATE)(int* enabled, double* min_xyz, double* max_xyz);
+typedef bool (*PFN_GET_CLIP_BOX_STATE)(int* enabled, double* center_xyz, double* half_extents_xyz, double* axes_xyz);
 static PFN_GET_MATRIX_BY_LOC GetMatrixByLocation = nullptr;
 static PFN_GET_CAMERA_STATE GetCameraState = nullptr;
 static PFN_GET_CLIP_BOX_STATE GetClipBoxState = nullptr;
 
 struct NativeClipBoxState {
     bool enabled = false;
-    double min_xyz[3] = { 0.0, 0.0, 0.0 };
-    double max_xyz[3] = { 0.0, 0.0, 0.0 };
+    double center_xyz[3] = { 0.0, 0.0, 0.0 };
+    double half_extents_xyz[3] = { 0.0, 0.0, 0.0 };
+    double axes_xyz[9] = {
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0
+    };
 };
 
 // Renderer-owned state for splats, buffers, and camera-driven sorting.
@@ -134,7 +139,7 @@ static NativeClipBoxState FetchClipBoxStateSnapshot() {
     }
 
     int enabled = 0;
-    if (!GetClipBoxState(&enabled, state.min_xyz, state.max_xyz)) {
+    if (!GetClipBoxState(&enabled, state.center_xyz, state.half_extents_xyz, state.axes_xyz)) {
         return state;
     }
 
@@ -148,7 +153,14 @@ static bool ClipStatesEqual(const NativeClipBoxState& a, const NativeClipBoxStat
     }
 
     for (int i = 0; i < 3; ++i) {
-        if (fabs(a.min_xyz[i] - b.min_xyz[i]) > 1e-6 || fabs(a.max_xyz[i] - b.max_xyz[i]) > 1e-6) {
+        if (fabs(a.center_xyz[i] - b.center_xyz[i]) > 1e-6 ||
+            fabs(a.half_extents_xyz[i] - b.half_extents_xyz[i]) > 1e-6) {
+            return false;
+        }
+    }
+
+    for (int i = 0; i < 9; ++i) {
+        if (fabs(a.axes_xyz[i] - b.axes_xyz[i]) > 1e-6) {
             return false;
         }
     }
@@ -161,9 +173,22 @@ static bool IsPointInsideClipBox(const NativeClipBoxState& clip_box, float x, fl
         return true;
     }
 
-    return x >= clip_box.min_xyz[0] && x <= clip_box.max_xyz[0] &&
-        y >= clip_box.min_xyz[1] && y <= clip_box.max_xyz[1] &&
-        z >= clip_box.min_xyz[2] && z <= clip_box.max_xyz[2];
+    const double local_x =
+        (x - clip_box.center_xyz[0]) * clip_box.axes_xyz[0] +
+        (y - clip_box.center_xyz[1]) * clip_box.axes_xyz[1] +
+        (z - clip_box.center_xyz[2]) * clip_box.axes_xyz[2];
+    const double local_y =
+        (x - clip_box.center_xyz[0]) * clip_box.axes_xyz[3] +
+        (y - clip_box.center_xyz[1]) * clip_box.axes_xyz[4] +
+        (z - clip_box.center_xyz[2]) * clip_box.axes_xyz[5];
+    const double local_z =
+        (x - clip_box.center_xyz[0]) * clip_box.axes_xyz[6] +
+        (y - clip_box.center_xyz[1]) * clip_box.axes_xyz[7] +
+        (z - clip_box.center_xyz[2]) * clip_box.axes_xyz[8];
+
+    return fabs(local_x) <= clip_box.half_extents_xyz[0] &&
+        fabs(local_y) <= clip_box.half_extents_xyz[1] &&
+        fabs(local_z) <= clip_box.half_extents_xyz[2];
 }
 
 void QuaternionToMatrix(float q0, float q1, float q2, float q3, float matrix[16]) {
