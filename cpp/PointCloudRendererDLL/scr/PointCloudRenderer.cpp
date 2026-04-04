@@ -764,9 +764,12 @@ extern "C" EXPORT int SetPointCloudObjectData(const char* object_id, const doubl
     object.points.push_back(x);
     object.points.push_back(y);
     object.points.push_back(z);
-    object.points.push_back(static_cast<float>(points_in[i * 6 + 3]) / 255.0f);
-    object.points.push_back(static_cast<float>(points_in[i * 6 + 4]) / 255.0f);
-    object.points.push_back(static_cast<float>(points_in[i * 6 + 5]) / 255.0f);
+    const float input_r = static_cast<float>(points_in[i * 6 + 3]);
+    const float input_g = static_cast<float>(points_in[i * 6 + 4]);
+    const float input_b = static_cast<float>(points_in[i * 6 + 5]);
+    object.points.push_back(input_r > 1.001f ? (input_r / 255.0f) : input_r);
+    object.points.push_back(input_g > 1.001f ? (input_g / 255.0f) : input_g);
+    object.points.push_back(input_b > 1.001f ? (input_b / 255.0f) : input_b);
     object.points.push_back(1.0f);
   }
 

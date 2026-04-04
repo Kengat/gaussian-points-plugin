@@ -61,6 +61,85 @@ module GaussianPoints
         nil
       end
 
+      def begin_write_session(project_path:, name:, source_path:, centered_points:, center:, half_extents:)
+        return nil if project_path.nil? || project_path.empty?
+        return nil if centered_points.nil? || centered_points.empty?
+
+        full_count = centered_points.length / 6
+        return nil if full_count <= 0
+
+        preview_count = 0
+        name_bytes = (name || '').to_s.encode(Encoding::UTF_8)
+        source_bytes = (source_path || '').to_s.encode(Encoding::UTF_8)
+
+        FileUtils.mkdir_p(File.dirname(project_path))
+        io = File.open(project_path, 'wb')
+        io.write(MAGIC)
+        io.write([VERSION, FLAGS].pack('V2'))
+        io.write([full_count, preview_count].pack('Q<Q<'))
+        io.write([FULL_POINT_STRIDE, PREVIEW_POINT_STRIDE, name_bytes.bytesize, source_bytes.bytesize].pack('V4'))
+        io.write([
+          center.x.to_f, center.y.to_f, center.z.to_f,
+          half_extents[:x].to_f, half_extents[:y].to_f, half_extents[:z].to_f
+        ].pack('E6'))
+        io.write(name_bytes)
+        io.write(source_bytes)
+
+        {
+          io: io,
+          project_path: project_path,
+          centered_points: centered_points,
+          point_count: full_count,
+          next_index: 0
+        }
+      rescue StandardError => e
+        puts "[GASP] Failed to start write session for #{project_path}: #{e.message}"
+        nil
+      end
+
+      def write_session_chunk(session, chunk_points: WRITE_CHUNK_POINTS)
+        return nil unless session && session[:io]
+
+        io = session[:io]
+        centered_points = session[:centered_points]
+        point_count = session[:point_count].to_i
+        start_index = session[:next_index].to_i
+        return { done: true, written_points: point_count, total_points: point_count } if start_index >= point_count
+
+        finish_index = [start_index + chunk_points, point_count].min
+        chunk = []
+        index = start_index
+        while index < finish_index
+          base = index * 6
+          chunk << centered_points[base + 0].to_f
+          chunk << centered_points[base + 1].to_f
+          chunk << centered_points[base + 2].to_f
+          chunk << normalized_color_component(centered_points[base + 3])
+          chunk << normalized_color_component(centered_points[base + 4])
+          chunk << normalized_color_component(centered_points[base + 5])
+          chunk << 1.0
+          index += 1
+        end
+        io.write(chunk.pack('e*')) unless chunk.empty?
+        session[:next_index] = finish_index
+
+        {
+          done: finish_index >= point_count,
+          written_points: finish_index,
+          total_points: point_count
+        }
+      end
+
+      def finish_write_session(session)
+        return nil unless session
+
+        session[:io]&.close
+        session[:project_path]
+      rescue StandardError => e
+        puts "[GASP] Failed to finish write session: #{e.message}"
+        nil
+      end
+
       private
 
       def compatible_cache_file?(project_path)
