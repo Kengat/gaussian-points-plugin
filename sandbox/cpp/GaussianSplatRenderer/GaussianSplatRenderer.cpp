@@ -152,6 +152,7 @@ static int g_framesSinceLastGeometryUpdate = 0;
 static const int GEOMETRY_UPDATE_EVERY_N_FRAMES = 2;
 static bool g_hasGeometryState = false;
 static bool g_gpuSplatDataDirty = true;
+static bool g_gpuObjectDataDirty = true;
 static const bool g_enableDynamicSorting = true;
 
 static GLuint g_splatShader = 0;
@@ -620,6 +621,7 @@ static void MarkSplatBuffersDirty() {
     g_highlightMaskVBO.needsUpdate = true;
     g_outlineVBO.needsUpdate = true;
     g_gpuSplatDataDirty = true;
+    g_gpuObjectDataDirty = true;
 }
 
 static bool InitializeBufferObjects(SplatVBOData* vbo_data) {
@@ -1576,6 +1578,7 @@ struct GPUComputePipeline {
     GLuint renderVS_FS = 0;
     GLuint emptyVAO = 0;
     GLuint splatDataSSBO = 0;
+    GLuint objectDataSSBO = 0;
     GLuint projectedSSBO = 0;
     GLuint sortKeysSSBO = 0;
     GLuint sortedIndicesSSBO = 0;
@@ -1600,6 +1603,12 @@ struct SplatData {
     vec4 basis_y;
     vec4 basis_z;
 };
+struct ObjectData {
+    vec4 center_scale_x;
+    vec4 axis_x_scale_y;
+    vec4 axis_y_scale_z;
+    vec4 axis_z_visible;
+};
 struct SplatOut {
     vec4 center_depth;
     vec4 axes;
@@ -1613,6 +1622,7 @@ struct SortEntry {
 layout(std430, binding = 0) readonly buffer B0 { SplatData splats[]; };
 layout(std430, binding = 1) writeonly buffer B1 { SplatOut projected[]; };
 layout(std430, binding = 2) writeonly buffer B2 { SortEntry sortEntries[]; };
+layout(std430, binding = 7) readonly buffer B7 { ObjectData objects[]; };
 
 uniform mat4 uView;
 uniform mat4 uProj;
@@ -1629,7 +1639,26 @@ void main() {
     if (id >= uint(uNumSplats)) return;
 
     SplatData s = splats[id];
-    vec3 wPos = s.pos_opacity.xyz;
+    uint objectIndex = uint(s.basis_z.w + 0.5);
+    ObjectData objectData = objects[objectIndex];
+    if (objectData.axis_z_visible.w < 0.5) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+
+    vec3 axisX = objectData.axis_x_scale_y.xyz;
+    vec3 axisY = objectData.axis_y_scale_z.xyz;
+    vec3 axisZ = objectData.axis_z_visible.xyz;
+    float sx = objectData.center_scale_x.w;
+    float sy = objectData.axis_x_scale_y.w;
+    float sz = objectData.axis_y_scale_z.w;
+    vec3 localPos = s.pos_opacity.xyz;
+    vec3 wPos =
+        objectData.center_scale_x.xyz +
+        axisX * (localPos.x * sx) +
+        axisY * (localPos.y * sy) +
+        axisZ * (localPos.z * sz);
 
     // Clip box
     if (uClipEnabled != 0) {
@@ -1653,7 +1682,21 @@ void main() {
     float ndcZ = clip.z / clip.w;
 
     // 3D covariance from basis vectors
-    vec3 bx = s.basis_x.xyz, by = s.basis_y.xyz, bz = s.basis_z.xyz;
+    vec3 localBx = s.basis_x.xyz;
+    vec3 localBy = s.basis_y.xyz;
+    vec3 localBz = s.basis_z.xyz;
+    vec3 bx =
+        axisX * (localBx.x * sx) +
+        axisY * (localBx.y * sy) +
+        axisZ * (localBx.z * sz);
+    vec3 by =
+        axisX * (localBy.x * sx) +
+        axisY * (localBy.y * sy) +
+        axisZ * (localBy.z * sz);
+    vec3 bz =
+        axisX * (localBz.x * sx) +
+        axisY * (localBz.y * sy) +
+        axisZ * (localBz.z * sz);
     mat3 covW = mat3(
         bx.x*bx.x + by.x*by.x + bz.x*bz.x,
         bx.x*bx.y + by.x*by.y + bz.x*bz.y,
@@ -1934,6 +1977,7 @@ static bool InitGPUPipeline() {
     if (!g_gpu.renderVS_FS) { LogRenderer("GPU pipeline: render shader failed."); return false; }
     glGenVertexArrays(1, &g_gpu.emptyVAO);
     glGenBuffers(1, &g_gpu.splatDataSSBO);
+    glGenBuffers(1, &g_gpu.objectDataSSBO);
     glGenBuffers(1, &g_gpu.projectedSSBO);
     glGenBuffers(1, &g_gpu.sortKeysSSBO);
     glGenBuffers(1, &g_gpu.sortedIndicesSSBO);
@@ -1955,7 +1999,73 @@ static bool InitGPUPipeline() {
 
 static void UploadSplatsToGPU() {
     if (!g_gpu.supported || !g_gpuSplatDataDirty) return;
-    int n = static_cast<int>(g_splats.size());
+    struct GPUSplatData {
+        float pos_opacity[4];
+        float color_pad[4];
+        float basis_x[4];
+        float basis_y[4];
+        float basis_z[4];
+    };
+
+    std::vector<GPUSplatData> buf;
+    if (!g_splatObjects.empty()) {
+        size_t total = 0;
+        for (const SplatObject& object : g_splatObjects) {
+            total += object.local_splats.size();
+        }
+        buf.reserve(total);
+        for (size_t objectIndex = 0; objectIndex < g_splatObjects.size(); ++objectIndex) {
+            const SplatObject& object = g_splatObjects[objectIndex];
+            for (const GaussSplat& s : object.local_splats) {
+                GPUSplatData gpuSplat = {};
+                gpuSplat.pos_opacity[0] = s.position[0];
+                gpuSplat.pos_opacity[1] = s.position[1];
+                gpuSplat.pos_opacity[2] = s.position[2];
+                gpuSplat.pos_opacity[3] = s.color[3];
+                gpuSplat.color_pad[0] = s.color[0];
+                gpuSplat.color_pad[1] = s.color[1];
+                gpuSplat.color_pad[2] = s.color[2];
+                gpuSplat.color_pad[3] = 0.0f;
+                gpuSplat.basis_x[0] = s.basis_x[0];
+                gpuSplat.basis_x[1] = s.basis_x[1];
+                gpuSplat.basis_x[2] = s.basis_x[2];
+                gpuSplat.basis_y[0] = s.basis_y[0];
+                gpuSplat.basis_y[1] = s.basis_y[1];
+                gpuSplat.basis_y[2] = s.basis_y[2];
+                gpuSplat.basis_z[0] = s.basis_z[0];
+                gpuSplat.basis_z[1] = s.basis_z[1];
+                gpuSplat.basis_z[2] = s.basis_z[2];
+                gpuSplat.basis_z[3] = static_cast<float>(objectIndex);
+                buf.push_back(gpuSplat);
+            }
+        }
+    }
+    else {
+        buf.resize(g_splats.size());
+        for (size_t i = 0; i < g_splats.size(); ++i) {
+            const GaussSplat& s = g_splats[i];
+            buf[i].pos_opacity[0] = s.position[0];
+            buf[i].pos_opacity[1] = s.position[1];
+            buf[i].pos_opacity[2] = s.position[2];
+            buf[i].pos_opacity[3] = s.color[3];
+            buf[i].color_pad[0] = s.color[0];
+            buf[i].color_pad[1] = s.color[1];
+            buf[i].color_pad[2] = s.color[2];
+            buf[i].color_pad[3] = 0.0f;
+            buf[i].basis_x[0] = s.basis_x[0];
+            buf[i].basis_x[1] = s.basis_x[1];
+            buf[i].basis_x[2] = s.basis_x[2];
+            buf[i].basis_y[0] = s.basis_y[0];
+            buf[i].basis_y[1] = s.basis_y[1];
+            buf[i].basis_y[2] = s.basis_y[2];
+            buf[i].basis_z[0] = s.basis_z[0];
+            buf[i].basis_z[1] = s.basis_z[1];
+            buf[i].basis_z[2] = s.basis_z[2];
+            buf[i].basis_z[3] = 0.0f;
+        }
+    }
+
+    int n = static_cast<int>(buf.size());
     if (n == 0) {
         g_gpu.uploadedSplatCount = 0;
         g_gpu.drawSplatCount = 0;
@@ -1963,16 +2073,6 @@ static void UploadSplatsToGPU() {
         return;
     }
 
-    struct GPUSplatData { float pos_opacity[4]; float color_pad[4]; float basis_x[4]; float basis_y[4]; float basis_z[4]; };
-    std::vector<GPUSplatData> buf(n);
-    for (int i = 0; i < n; ++i) {
-        const GaussSplat& s = g_splats[i];
-        buf[i].pos_opacity[0] = s.position[0]; buf[i].pos_opacity[1] = s.position[1]; buf[i].pos_opacity[2] = s.position[2]; buf[i].pos_opacity[3] = s.color[3];
-        buf[i].color_pad[0] = s.color[0]; buf[i].color_pad[1] = s.color[1]; buf[i].color_pad[2] = s.color[2]; buf[i].color_pad[3] = 0.0f;
-        buf[i].basis_x[0] = s.basis_x[0]; buf[i].basis_x[1] = s.basis_x[1]; buf[i].basis_x[2] = s.basis_x[2]; buf[i].basis_x[3] = 0.0f;
-        buf[i].basis_y[0] = s.basis_y[0]; buf[i].basis_y[1] = s.basis_y[1]; buf[i].basis_y[2] = s.basis_y[2]; buf[i].basis_y[3] = 0.0f;
-        buf[i].basis_z[0] = s.basis_z[0]; buf[i].basis_z[1] = s.basis_z[1]; buf[i].basis_z[2] = s.basis_z[2]; buf[i].basis_z[3] = 0.0f;
-    }
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.splatDataSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(GPUSplatData), buf.data(), GL_STATIC_DRAW);
 
@@ -1992,6 +2092,64 @@ static void UploadSplatsToGPU() {
     g_gpu.drawSplatCount = 0;
     g_gpuSplatDataDirty = false;
     LogRenderer("GPU: Uploaded %d splats to SSBOs (%.1f MB)", n, n * sizeof(GPUSplatData) / (1024.0f * 1024.0f));
+}
+
+static bool UploadGPUObjectData() {
+    if (!g_gpu.supported || !g_gpuObjectDataDirty) {
+        return false;
+    }
+
+    struct GPUObjectData {
+        float center_scale_x[4];
+        float axis_x_scale_y[4];
+        float axis_y_scale_z[4];
+        float axis_z_visible[4];
+    };
+
+    std::vector<GPUObjectData> buf;
+    if (!g_splatObjects.empty()) {
+        buf.reserve(g_splatObjects.size());
+        for (const SplatObject& object : g_splatObjects) {
+            const double sx = object.base_half_extents_xyz[0] > 1.0e-8 ? (object.half_extents_xyz[0] / object.base_half_extents_xyz[0]) : 1.0;
+            const double sy = object.base_half_extents_xyz[1] > 1.0e-8 ? (object.half_extents_xyz[1] / object.base_half_extents_xyz[1]) : 1.0;
+            const double sz = object.base_half_extents_xyz[2] > 1.0e-8 ? (object.half_extents_xyz[2] / object.base_half_extents_xyz[2]) : 1.0;
+            GPUObjectData gpuObject = {};
+            gpuObject.center_scale_x[0] = static_cast<float>(object.center_xyz[0]);
+            gpuObject.center_scale_x[1] = static_cast<float>(object.center_xyz[1]);
+            gpuObject.center_scale_x[2] = static_cast<float>(object.center_xyz[2]);
+            gpuObject.center_scale_x[3] = static_cast<float>(sx);
+            gpuObject.axis_x_scale_y[0] = static_cast<float>(object.axes_xyz[0]);
+            gpuObject.axis_x_scale_y[1] = static_cast<float>(object.axes_xyz[1]);
+            gpuObject.axis_x_scale_y[2] = static_cast<float>(object.axes_xyz[2]);
+            gpuObject.axis_x_scale_y[3] = static_cast<float>(sy);
+            gpuObject.axis_y_scale_z[0] = static_cast<float>(object.axes_xyz[3]);
+            gpuObject.axis_y_scale_z[1] = static_cast<float>(object.axes_xyz[4]);
+            gpuObject.axis_y_scale_z[2] = static_cast<float>(object.axes_xyz[5]);
+            gpuObject.axis_y_scale_z[3] = static_cast<float>(sz);
+            gpuObject.axis_z_visible[0] = static_cast<float>(object.axes_xyz[6]);
+            gpuObject.axis_z_visible[1] = static_cast<float>(object.axes_xyz[7]);
+            gpuObject.axis_z_visible[2] = static_cast<float>(object.axes_xyz[8]);
+            gpuObject.axis_z_visible[3] = object.visible ? 1.0f : 0.0f;
+            buf.push_back(gpuObject);
+        }
+    }
+    else {
+        GPUObjectData identity = {};
+        identity.center_scale_x[3] = 1.0f;
+        identity.axis_x_scale_y[0] = 1.0f;
+        identity.axis_x_scale_y[3] = 1.0f;
+        identity.axis_y_scale_z[1] = 1.0f;
+        identity.axis_y_scale_z[3] = 1.0f;
+        identity.axis_z_visible[2] = 1.0f;
+        identity.axis_z_visible[3] = 1.0f;
+        buf.push_back(identity);
+    }
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.objectDataSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(buf.size() * sizeof(GPUObjectData)), buf.data(), GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    g_gpuObjectDataDirty = false;
+    return true;
 }
 
 static void DispatchGPUProjection(const float* viewMatrix, const float* projMatrix, int vpW, int vpH, int isPerspective, const NativeClipBoxState& clipBox) {
@@ -2015,6 +2173,7 @@ static void DispatchGPUProjection(const float* viewMatrix, const float* projMatr
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_gpu.splatDataSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_gpu.projectedSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, g_gpu.objectDataSSBO);
 
     glDispatchCompute((n + 255) / 256, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -2189,8 +2348,10 @@ extern "C" EXPORT void renderPointCloud() {
     bool gpuPathActive = false;
 
     if (useGPU) {
+        const bool uploadedSplats = (g_gpuSplatDataDirty && g_gpu.supported);
+        const bool uploadedObjects = UploadGPUObjectData();
         UploadSplatsToGPU();
-        if (g_gpu.uploadedSplatCount > 0 && (g_splatVBO.needsUpdate || geometryStateChanged || clipStateChanged)) {
+        if (g_gpu.uploadedSplatCount > 0 && (uploadedSplats || uploadedObjects || g_splatVBO.needsUpdate || geometryStateChanged || clipStateChanged)) {
             DispatchGPUProjection(viewMatrix, projectionMatrix, viewport[2], viewport[3], isPerspective, clipBoxState);
             GPUCountingSort();
             memcpy(g_lastGeometryCamPos, camPos, 3 * sizeof(float));
@@ -2789,6 +2950,12 @@ extern "C" EXPORT int SetSplatObjectTransform(const char* object_id, const doubl
         memcpy(object->axes_xyz, axes_xyz, sizeof(object->axes_xyz));
     }
     object->visible = visible != 0;
+    if (g_gpu.supported) {
+        g_gpuObjectDataDirty = true;
+        g_splatVBO.needsUpdate = false;
+        g_hasGeometryState = false;
+        return 1;
+    }
     RefreshWorldSplatsFromObjects();
     return 1;
 }
