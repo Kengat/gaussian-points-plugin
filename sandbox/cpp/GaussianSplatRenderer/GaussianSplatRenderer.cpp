@@ -151,6 +151,7 @@ static int g_lastGeometryPerspective = 1;
 static int g_framesSinceLastGeometryUpdate = 0;
 static const int GEOMETRY_UPDATE_EVERY_N_FRAMES = 2;
 static bool g_hasGeometryState = false;
+static bool g_gpuSplatDataDirty = true;
 static const bool g_enableDynamicSorting = true;
 
 static GLuint g_splatShader = 0;
@@ -618,6 +619,7 @@ static void MarkSplatBuffersDirty() {
     g_splatVBO.needsUpdate = true;
     g_highlightMaskVBO.needsUpdate = true;
     g_outlineVBO.needsUpdate = true;
+    g_gpuSplatDataDirty = true;
 }
 
 static bool InitializeBufferObjects(SplatVBOData* vbo_data) {
@@ -1558,19 +1560,554 @@ extern "C" EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz) {
 }
 static bool CheckGLCapabilities() { GLenum e = glewInit(); if (e != GLEW_OK) { LogRenderer("GLEW failed:%s", glewGetErrorString(e));return false; } if (!GLEW_VERSION_2_0 || !GLEW_ARB_vertex_buffer_object) { LogRenderer("WARN No VBO/Shader support");return false; } LogRenderer("OpenGL VBO/Shader support detected."); return true; }
 
+// ============================================================
+// GPU Compute Pipeline (OpenGL 4.3+)
+// ============================================================
+struct GPUComputePipeline {
+    bool initialized = false;
+    bool supported = false;
+    GLuint projectCS = 0;
+    GLuint clearCS = 0;
+    GLuint histogramCS = 0;
+    GLuint scanBlocksCS = 0;
+    GLuint scanTopCS = 0;
+    GLuint addOffsetsCS = 0;
+    GLuint scatterCS = 0;
+    GLuint renderVS_FS = 0;
+    GLuint emptyVAO = 0;
+    GLuint splatDataSSBO = 0;
+    GLuint projectedSSBO = 0;
+    GLuint sortKeysSSBO = 0;
+    GLuint sortedIndicesSSBO = 0;
+    GLuint histogramSSBO = 0;
+    GLuint blockSumsSSBO = 0;
+    GLuint binCountersSSBO = 0;
+    int uploadedSplatCount = 0;
+    int drawSplatCount = 0;
+};
+static GPUComputePipeline g_gpu;
+static const GLuint kGPUSortBinCount = 65536u;
+static const GLuint kGPUSortBlockSize = 256u;
+static const GLuint kGPUSortBlockCount = kGPUSortBinCount / kGPUSortBlockSize;
+
+static const char* g_projectCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+
+struct SplatData {
+    vec4 pos_opacity;
+    vec4 color_pad;
+    vec4 basis_x;
+    vec4 basis_y;
+    vec4 basis_z;
+};
+struct SplatOut {
+    vec4 center_depth;
+    vec4 axes;
+    vec4 color;
+};
+struct SortEntry {
+    uint key;
+    uint idx;
+};
+
+layout(std430, binding = 0) readonly buffer B0 { SplatData splats[]; };
+layout(std430, binding = 1) writeonly buffer B1 { SplatOut projected[]; };
+layout(std430, binding = 2) writeonly buffer B2 { SortEntry sortEntries[]; };
+
+uniform mat4 uView;
+uniform mat4 uProj;
+uniform ivec2 uViewport;
+uniform int uIsPerspective;
+uniform int uNumSplats;
+uniform int uClipEnabled;
+uniform vec3 uClipCenter;
+uniform vec3 uClipHalfExtents;
+uniform mat3 uClipAxes;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(uNumSplats)) return;
+
+    SplatData s = splats[id];
+    vec3 wPos = s.pos_opacity.xyz;
+
+    // Clip box
+    if (uClipEnabled != 0) {
+        vec3 local = uClipAxes * (wPos - uClipCenter);
+        if (any(greaterThan(abs(local), uClipHalfExtents))) {
+            projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+            sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+            return;
+        }
+    }
+
+    vec4 vPos4 = uView * vec4(wPos, 1.0);
+    vec3 vPos = vPos4.xyz;
+    vec4 clip = uProj * vPos4;
+    if (abs(clip.w) < 1e-6) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+    vec2 ndc = clip.xy / clip.w;
+    float ndcZ = clip.z / clip.w;
+
+    // 3D covariance from basis vectors
+    vec3 bx = s.basis_x.xyz, by = s.basis_y.xyz, bz = s.basis_z.xyz;
+    mat3 covW = mat3(
+        bx.x*bx.x + by.x*by.x + bz.x*bz.x,
+        bx.x*bx.y + by.x*by.y + bz.x*bz.y,
+        bx.x*bx.z + by.x*by.z + bz.x*bz.z,
+        bx.x*bx.y + by.x*by.y + bz.x*bz.y,
+        bx.y*bx.y + by.y*by.y + bz.y*bz.y,
+        bx.y*bx.z + by.y*by.z + bz.y*bz.z,
+        bx.x*bx.z + by.x*by.z + bz.x*bz.z,
+        bx.y*bx.z + by.y*by.z + bz.y*bz.z,
+        bx.z*bx.z + by.z*by.z + bz.z*bz.z);
+
+    // Camera-space covariance
+    mat3 W = mat3(uView);
+    mat3 covC = W * covW * transpose(W);
+
+    float fx = abs(uProj[0][0]) * 0.5 * float(uViewport.x);
+    float fy = abs(uProj[1][1]) * 0.5 * float(uViewport.y);
+    if (fx < 1e-6 || fy < 1e-6) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+
+    float depth = max(abs(vPos.z), 1e-4);
+    float J00, J02, J11, J12;
+    if (uIsPerspective != 0) {
+        J00 = fx / depth;
+        J02 = (fx * vPos.x) / (depth * depth);
+        J11 = fy / depth;
+        J12 = (fy * vPos.y) / (depth * depth);
+    } else {
+        J00 = fx; J02 = 0.0; J11 = fy; J12 = 0.0;
+    }
+
+    // covC element access: covC[col][row]
+    float c00 = covC[0][0], c01 = covC[1][0], c02 = covC[2][0];
+    float c11 = covC[1][1], c12 = covC[2][1], c22 = covC[2][2];
+
+    float cxx = J00*J00*c00 + 2.0*J00*J02*c02 + J02*J02*c22 + 0.3;
+    float cxy = J00*J11*c01 + J00*J12*c02 + J02*J11*c12 + J02*J12*c22;
+    float cyy = J11*J11*c11 + 2.0*J11*J12*c12 + J12*J12*c22 + 0.3;
+
+    float tr = cxx + cyy;
+    float det = cxx * cyy - cxy * cxy;
+    if (det <= 0.0 || !isinf(tr) == false) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+    float mid = 0.5 * tr;
+    float disc = max(mid * mid - det, 0.0);
+    float root = sqrt(disc);
+    float lMaj = max(mid + root, 1e-4);
+    float lMin = max(mid - root, 1e-4);
+    float rMaj = 3.0 * sqrt(lMaj);
+    float rMin = 3.0 * sqrt(lMin);
+
+    vec2 eMaj = vec2(1.0, 0.0);
+    if (abs(cxy) > 1e-6) eMaj = normalize(vec2(lMaj - cyy, cxy));
+    vec2 eMin = vec2(-eMaj.y, eMaj.x);
+
+    vec2 p2n = 2.0 / vec2(uViewport);
+    vec2 ndcMaj = eMaj * rMaj * p2n;
+    vec2 ndcMin = eMin * rMin * p2n;
+
+    projected[id].center_depth = vec4(ndc, ndcZ, 1.0);
+    projected[id].axes = vec4(ndcMaj, ndcMin);
+    projected[id].color = s.color_pad;
+    projected[id].color.a = s.pos_opacity.w;
+
+    uint sortKey = 0xFFFFFFFFu - floatBitsToUint(depth);
+    sortEntries[id] = SortEntry(sortKey, uint(id));
+}
+)";
+
+static const char* g_gpuRenderVS_Source = R"(#version 430
+struct SplatOut { vec4 center_depth; vec4 axes; vec4 color; };
+layout(std430, binding = 1) readonly buffer B1 { SplatOut projected[]; };
+layout(std430, binding = 3) readonly buffer B3 { uint sortedIndices[]; };
+out vec2 vTexCoord;
+out vec4 vColor;
+void main() {
+    int splatDraw = gl_VertexID / 6;
+    int v = gl_VertexID % 6;
+    int corner = (v < 3) ? v : (v == 3 ? 0 : (v == 4 ? 2 : 3));
+    vec2 off[4] = vec2[4](vec2(-1,-1), vec2(1,-1), vec2(1,1), vec2(-1,1));
+    uint si = sortedIndices[splatDraw];
+    SplatOut sp = projected[si];
+    vec2 o = off[corner];
+    vTexCoord = o * 0.5 + 0.5;
+    vColor = sp.color;
+    if (sp.center_depth.w <= 0.0) { gl_Position = vec4(0,0,-2,1); return; }
+    vec2 p = sp.center_depth.xy + o.x * sp.axes.xy + o.y * sp.axes.zw;
+    gl_Position = vec4(p, sp.center_depth.z, 1.0);
+}
+)";
+
+static const char* g_gpuRenderFS_Source = R"(#version 430
+in vec2 vTexCoord;
+in vec4 vColor;
+out vec4 fragColor;
+void main() {
+    vec2 d = vTexCoord * 2.0 - 1.0;
+    float g = exp(-dot(d, d) / 0.18);
+    float a = g * vColor.a;
+    if (a < 0.004) discard;
+    fragColor = vec4(vColor.rgb, a);
+}
+)";
+
+static const char* g_clearCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 4) buffer B4 { uint data[]; };
+uniform uint uCount;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id < uCount) {
+        data[id] = 0u;
+    }
+}
+)";
+
+static const char* g_histogramCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+struct SortEntry {
+    uint key;
+    uint idx;
+};
+layout(std430, binding = 2) readonly buffer B2 { SortEntry sortEntries[]; };
+layout(std430, binding = 4) buffer B4 { uint histogram[]; };
+uniform uint uNumSplats;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uNumSplats) return;
+    uint bin = sortEntries[id].key >> 16;
+    atomicAdd(histogram[bin], 1u);
+}
+)";
+
+static const char* g_scanBlocksCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 4) buffer B4 { uint histogram[]; };
+layout(std430, binding = 5) buffer B5 { uint blockSums[]; };
+shared uint scanData[256];
+uniform uint uNumBins;
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_WorkGroupID.x * 256u + lid;
+    uint value = (gid < uNumBins) ? histogram[gid] : 0u;
+    scanData[lid] = value;
+    barrier();
+
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        uint addend = (lid >= offset) ? scanData[lid - offset] : 0u;
+        barrier();
+        scanData[lid] += addend;
+        barrier();
+    }
+
+    if (gid < uNumBins) {
+        histogram[gid] = scanData[lid] - value;
+    }
+    if (lid == 255u) {
+        blockSums[gl_WorkGroupID.x] = scanData[lid];
+    }
+}
+)";
+
+static const char* g_scanTopCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 5) buffer B5 { uint blockSums[]; };
+shared uint scanData[256];
+uniform uint uNumBlocks;
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint value = (lid < uNumBlocks) ? blockSums[lid] : 0u;
+    scanData[lid] = value;
+    barrier();
+
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        uint addend = (lid >= offset) ? scanData[lid - offset] : 0u;
+        barrier();
+        scanData[lid] += addend;
+        barrier();
+    }
+
+    if (lid < uNumBlocks) {
+        blockSums[lid] = scanData[lid] - value;
+    }
+}
+)";
+
+static const char* g_addOffsetsCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 4) buffer B4 { uint histogram[]; };
+layout(std430, binding = 5) readonly buffer B5 { uint blockSums[]; };
+uniform uint uNumBins;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uNumBins) return;
+    uint block = gid / 256u;
+    histogram[gid] += blockSums[block];
+}
+)";
+
+static const char* g_scatterCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+struct SortEntry {
+    uint key;
+    uint idx;
+};
+layout(std430, binding = 2) readonly buffer B2 { SortEntry sortEntries[]; };
+layout(std430, binding = 3) writeonly buffer B3 { uint sortedIndices[]; };
+layout(std430, binding = 4) readonly buffer B4 { uint histogram[]; };
+layout(std430, binding = 6) buffer B6 { uint binCounters[]; };
+uniform uint uNumSplats;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uNumSplats) return;
+    SortEntry entry = sortEntries[id];
+    uint bin = entry.key >> 16;
+    uint dst = histogram[bin] + atomicAdd(binCounters[bin], 1u);
+    sortedIndices[dst] = entry.idx;
+}
+)";
+
+static GLuint CompileComputeShader(const char* source) {
+    GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(cs, 1, &source, NULL);
+    glCompileShader(cs);
+    GLint ok; glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[1024]; glGetShaderInfoLog(cs, 1024, NULL, log); LogRenderer("CS compile err: %s", log); glDeleteShader(cs); return 0; }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, cs);
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[1024]; glGetProgramInfoLog(prog, 1024, NULL, log); LogRenderer("CS link err: %s", log); glDeleteProgram(prog); glDeleteShader(cs); return 0; }
+    glDeleteShader(cs);
+    return prog;
+}
+
+static GLuint CompileRenderShader(const char* vs, const char* fs) {
+    GLuint v = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(v, 1, &vs, NULL); glCompileShader(v);
+    GLint ok; glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[1024]; glGetShaderInfoLog(v, 1024, NULL, log); LogRenderer("GPU VS err: %s", log); glDeleteShader(v); return 0; }
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, NULL); glCompileShader(f);
+    glGetShaderiv(f, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[1024]; glGetShaderInfoLog(f, 1024, NULL, log); LogRenderer("GPU FS err: %s", log); glDeleteShader(v); glDeleteShader(f); return 0; }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, v); glAttachShader(prog, f);
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[1024]; glGetProgramInfoLog(prog, 1024, NULL, log); LogRenderer("GPU link err: %s", log); glDeleteProgram(prog); }
+    glDeleteShader(v); glDeleteShader(f);
+    return prog;
+}
+
+static bool InitGPUPipeline() {
+    if (g_gpu.initialized) return g_gpu.supported;
+    g_gpu.initialized = true;
+    if (!GLEW_VERSION_4_3) { LogRenderer("GPU pipeline: GL 4.3 not available, using CPU path."); return false; }
+    LogRenderer("GPU pipeline: GL 4.3 detected, initializing compute path.");
+    g_gpu.projectCS = CompileComputeShader(g_projectCS_Source);
+    if (!g_gpu.projectCS) { LogRenderer("GPU pipeline: compute shader failed."); return false; }
+    g_gpu.clearCS = CompileComputeShader(g_clearCS_Source);
+    g_gpu.histogramCS = CompileComputeShader(g_histogramCS_Source);
+    g_gpu.scanBlocksCS = CompileComputeShader(g_scanBlocksCS_Source);
+    g_gpu.scanTopCS = CompileComputeShader(g_scanTopCS_Source);
+    g_gpu.addOffsetsCS = CompileComputeShader(g_addOffsetsCS_Source);
+    g_gpu.scatterCS = CompileComputeShader(g_scatterCS_Source);
+    if (!g_gpu.clearCS || !g_gpu.histogramCS || !g_gpu.scanBlocksCS || !g_gpu.scanTopCS || !g_gpu.addOffsetsCS || !g_gpu.scatterCS) {
+        LogRenderer("GPU pipeline: sort compute shader initialization failed.");
+        return false;
+    }
+    g_gpu.renderVS_FS = CompileRenderShader(g_gpuRenderVS_Source, g_gpuRenderFS_Source);
+    if (!g_gpu.renderVS_FS) { LogRenderer("GPU pipeline: render shader failed."); return false; }
+    glGenVertexArrays(1, &g_gpu.emptyVAO);
+    glGenBuffers(1, &g_gpu.splatDataSSBO);
+    glGenBuffers(1, &g_gpu.projectedSSBO);
+    glGenBuffers(1, &g_gpu.sortKeysSSBO);
+    glGenBuffers(1, &g_gpu.sortedIndicesSSBO);
+    glGenBuffers(1, &g_gpu.histogramSSBO);
+    glGenBuffers(1, &g_gpu.blockSumsSSBO);
+    glGenBuffers(1, &g_gpu.binCountersSSBO);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.histogramSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, kGPUSortBinCount * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.blockSumsSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, kGPUSortBlockCount * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.binCountersSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, kGPUSortBinCount * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    g_gpu.supported = true;
+    LogRenderer("GPU pipeline initialized successfully.");
+    return true;
+}
+
+static void UploadSplatsToGPU() {
+    if (!g_gpu.supported || !g_gpuSplatDataDirty) return;
+    int n = static_cast<int>(g_splats.size());
+    if (n == 0) {
+        g_gpu.uploadedSplatCount = 0;
+        g_gpu.drawSplatCount = 0;
+        g_gpuSplatDataDirty = false;
+        return;
+    }
+
+    struct GPUSplatData { float pos_opacity[4]; float color_pad[4]; float basis_x[4]; float basis_y[4]; float basis_z[4]; };
+    std::vector<GPUSplatData> buf(n);
+    for (int i = 0; i < n; ++i) {
+        const GaussSplat& s = g_splats[i];
+        buf[i].pos_opacity[0] = s.position[0]; buf[i].pos_opacity[1] = s.position[1]; buf[i].pos_opacity[2] = s.position[2]; buf[i].pos_opacity[3] = s.color[3];
+        buf[i].color_pad[0] = s.color[0]; buf[i].color_pad[1] = s.color[1]; buf[i].color_pad[2] = s.color[2]; buf[i].color_pad[3] = 0.0f;
+        buf[i].basis_x[0] = s.basis_x[0]; buf[i].basis_x[1] = s.basis_x[1]; buf[i].basis_x[2] = s.basis_x[2]; buf[i].basis_x[3] = 0.0f;
+        buf[i].basis_y[0] = s.basis_y[0]; buf[i].basis_y[1] = s.basis_y[1]; buf[i].basis_y[2] = s.basis_y[2]; buf[i].basis_y[3] = 0.0f;
+        buf[i].basis_z[0] = s.basis_z[0]; buf[i].basis_z[1] = s.basis_z[1]; buf[i].basis_z[2] = s.basis_z[2]; buf[i].basis_z[3] = 0.0f;
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.splatDataSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(GPUSplatData), buf.data(), GL_STATIC_DRAW);
+
+    struct GPUSplatOut { float d[12]; };
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.projectedSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(GPUSplatOut), nullptr, GL_DYNAMIC_DRAW);
+
+    struct GPUSortEntry { uint32_t key; uint32_t idx; };
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.sortKeysSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(GPUSortEntry), nullptr, GL_DYNAMIC_DRAW);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.sortedIndicesSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(uint32_t), nullptr, GL_DYNAMIC_DRAW);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    g_gpu.uploadedSplatCount = n;
+    g_gpu.drawSplatCount = 0;
+    g_gpuSplatDataDirty = false;
+    LogRenderer("GPU: Uploaded %d splats to SSBOs (%.1f MB)", n, n * sizeof(GPUSplatData) / (1024.0f * 1024.0f));
+}
+
+static void DispatchGPUProjection(const float* viewMatrix, const float* projMatrix, int vpW, int vpH, int isPerspective, const NativeClipBoxState& clipBox) {
+    if (!g_gpu.supported || g_gpu.uploadedSplatCount == 0) return;
+    int n = g_gpu.uploadedSplatCount;
+
+    glUseProgram(g_gpu.projectCS);
+    glUniformMatrix4fv(glGetUniformLocation(g_gpu.projectCS, "uView"), 1, GL_TRUE, viewMatrix);
+    glUniformMatrix4fv(glGetUniformLocation(g_gpu.projectCS, "uProj"), 1, GL_TRUE, projMatrix);
+    glUniform2i(glGetUniformLocation(g_gpu.projectCS, "uViewport"), vpW, vpH);
+    glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uIsPerspective"), isPerspective);
+    glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uNumSplats"), n);
+    glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uClipEnabled"), clipBox.enabled ? 1 : 0);
+    if (clipBox.enabled) {
+        glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uClipCenter"), (float)clipBox.center_xyz[0], (float)clipBox.center_xyz[1], (float)clipBox.center_xyz[2]);
+        glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uClipHalfExtents"), (float)clipBox.half_extents_xyz[0], (float)clipBox.half_extents_xyz[1], (float)clipBox.half_extents_xyz[2]);
+        float axes[9]; for (int i = 0; i < 9; ++i) axes[i] = (float)clipBox.axes_xyz[i];
+        glUniformMatrix3fv(glGetUniformLocation(g_gpu.projectCS, "uClipAxes"), 1, GL_TRUE, axes);
+    }
+
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_gpu.splatDataSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_gpu.projectedSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
+
+    glDispatchCompute((n + 255) / 256, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+}
+
+static void ClearGPUUIntBuffer(GLuint buffer, GLuint count) {
+    if (!g_gpu.supported || count == 0) {
+        return;
+    }
+
+    glUseProgram(g_gpu.clearCS);
+    glUniform1ui(glGetUniformLocation(g_gpu.clearCS, "uCount"), count);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, buffer);
+    glDispatchCompute((count + 255u) / 256u, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+}
+
+static void GPUCountingSort() {
+    int n = g_gpu.uploadedSplatCount;
+    if (n <= 0) {
+        g_gpu.drawSplatCount = 0;
+        return;
+    }
+
+    ClearGPUUIntBuffer(g_gpu.histogramSSBO, kGPUSortBinCount);
+
+    glUseProgram(g_gpu.histogramCS);
+    glUniform1ui(glGetUniformLocation(g_gpu.histogramCS, "uNumSplats"), static_cast<GLuint>(n));
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
+    glDispatchCompute((static_cast<GLuint>(n) + 255u) / 256u, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    glUseProgram(g_gpu.scanBlocksCS);
+    glUniform1ui(glGetUniformLocation(g_gpu.scanBlocksCS, "uNumBins"), kGPUSortBinCount);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
+    glDispatchCompute(kGPUSortBlockCount, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    glUseProgram(g_gpu.scanTopCS);
+    glUniform1ui(glGetUniformLocation(g_gpu.scanTopCS, "uNumBlocks"), kGPUSortBlockCount);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    glUseProgram(g_gpu.addOffsetsCS);
+    glUniform1ui(glGetUniformLocation(g_gpu.addOffsetsCS, "uNumBins"), kGPUSortBinCount);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
+    glDispatchCompute(kGPUSortBlockCount, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    ClearGPUUIntBuffer(g_gpu.binCountersSSBO, kGPUSortBinCount);
+
+    glUseProgram(g_gpu.scatterCS);
+    glUniform1ui(glGetUniformLocation(g_gpu.scatterCS, "uNumSplats"), static_cast<GLuint>(n));
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, g_gpu.sortedIndicesSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, g_gpu.binCountersSSBO);
+    glDispatchCompute((static_cast<GLuint>(n) + 255u) / 256u, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    glUseProgram(0);
+    g_gpu.drawSplatCount = n;
+}
+
+static void DrawGPUSplats() {
+    if (!g_gpu.supported || g_gpu.drawSplatCount == 0) return;
+
+    glUseProgram(g_gpu.renderVS_FS);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_gpu.projectedSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, g_gpu.sortedIndicesSSBO);
+    glBindVertexArray(g_gpu.emptyVAO);
+    glDrawArrays(GL_TRIANGLES, 0, g_gpu.drawSplatCount * 6);
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
 extern "C" EXPORT void renderPointCloud() {
     std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     LogRenderer("CHK: renderPointCloud enter");
     LoadHookFunctions(); if (!GetMatrixByLocation) { LogRenderer("ERROR: GetMatrixByLocation is NULL, cannot proceed."); return; } if (!GetCameraState) { LogRenderer("ERROR: GetCameraState is NULL, cannot proceed."); return; }
     LogRenderer("CHK: hook functions ready");
 
-    static bool firstCall = true; static bool useVBO = false;
+    static bool firstCall = true; static bool useVBO = false; static bool useGPU = false;
     if (firstCall) {
         LogRenderer("DEBUG: First call to renderPointCloud.");
         EnsureTextureInitialized();
         useVBO = CheckGLCapabilities();
         if (useVBO) InitializeSplatVBO();
-        // Do not inject a synthetic test splat on startup.
+        useGPU = InitGPUPipeline();
         firstCall = false;
     }
     if (useVBO && !g_splatVBO.initialized) {
@@ -1620,6 +2157,13 @@ extern "C" EXPORT void renderPointCloud() {
     MultiplyMat4(projectionMatrix, viewMatrix, mvpMatrix);
     GLint viewport[4] = { 0, 0, 1, 1 };
     glGetIntegerv(GL_VIEWPORT, viewport);
+    const NativeClipBoxState clipBoxState = FetchClipBoxStateSnapshot();
+    const bool clipStateChanged = !g_hasLastClipBoxState || !ClipStatesEqual(clipBoxState, g_lastClipBoxState);
+    if (clipStateChanged) {
+        g_lastClipBoxState = clipBoxState;
+        g_hasLastClipBoxState = true;
+        g_outlineVBO.needsUpdate = true;
+    }
 
     if (g_renderBisectStage == 1) {
         LogRenderer("BISect stage 1: stopping after camera/view/projection fetch.");
@@ -1642,8 +2186,26 @@ extern "C" EXPORT void renderPointCloud() {
         g_lastGeometryViewportHeight != viewport[3] ||
         g_lastGeometryPerspective != isPerspective;
     bool geometryUpdated = false;
+    bool gpuPathActive = false;
 
-    if (useVBO) {
+    if (useGPU) {
+        UploadSplatsToGPU();
+        if (g_gpu.uploadedSplatCount > 0 && (g_splatVBO.needsUpdate || geometryStateChanged || clipStateChanged)) {
+            DispatchGPUProjection(viewMatrix, projectionMatrix, viewport[2], viewport[3], isPerspective, clipBoxState);
+            GPUCountingSort();
+            memcpy(g_lastGeometryCamPos, camPos, 3 * sizeof(float));
+            memcpy(g_lastGeometryViewDir, viewDir, 3 * sizeof(float));
+            g_lastGeometryViewportWidth = viewport[2];
+            g_lastGeometryViewportHeight = viewport[3];
+            g_lastGeometryPerspective = isPerspective;
+            g_hasGeometryState = true;
+            g_splatVBO.needsUpdate = false;
+            geometryUpdated = true;
+        }
+        gpuPathActive = g_gpu.drawSplatCount > 0;
+    }
+
+    if (!gpuPathActive && useVBO) {
         g_framesSinceLastGeometryUpdate++;
         bool needGeometryUpdate = g_splatVBO.needsUpdate || geometryStateChanged;
         if (geometryStateChanged && !g_splatVBO.needsUpdate && g_framesSinceLastGeometryUpdate < GEOMETRY_UPDATE_EVERY_N_FRAMES) {
@@ -1669,14 +2231,6 @@ extern "C" EXPORT void renderPointCloud() {
         return;
     }
 
-    const NativeClipBoxState clipBoxState = FetchClipBoxStateSnapshot();
-    const bool clipStateChanged = !g_hasLastClipBoxState || !ClipStatesEqual(clipBoxState, g_lastClipBoxState);
-    if (clipStateChanged) {
-        g_lastClipBoxState = clipBoxState;
-        g_hasLastClipBoxState = true;
-        g_outlineVBO.needsUpdate = true;
-    }
-
     if (g_enableHighlightRendering && useVBO && g_highlightMaskVBO.initialized && g_outlineVBO.initialized) {
         UpdateHighlightVBOVertices(clipBoxState, viewMatrix, projectionMatrix, camPos, isPerspective, viewport[2], viewport[3], geometryUpdated);
     }
@@ -1687,7 +2241,7 @@ extern "C" EXPORT void renderPointCloud() {
     }
 
     bool sorting_done = false;
-    if (g_enableDynamicSorting && hasCamera) {
+    if (!gpuPathActive && g_enableDynamicSorting && hasCamera) {
         bool needSorting = false;
 
         float posDistSq =
@@ -1784,7 +2338,10 @@ extern "C" EXPORT void renderPointCloud() {
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_CULL_FACE);
 
-    if (useVBO && g_splatVBO.initialized && g_splatShader != 0) {
+    if (gpuPathActive) {
+        DrawGPUSplats();
+    }
+    else if (useVBO && g_splatVBO.initialized && g_splatShader != 0) {
         if (g_splatVBO.ebo == 0) { LogRenderer("ERROR: EBO is 0, cannot draw!"); }
         else {
             GLint eboSizeCheck = 0; glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_splatVBO.ebo); glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_SIZE, &eboSizeCheck); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
@@ -2278,4 +2835,3 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     }
     return TRUE;
 }
-
