@@ -53,8 +53,8 @@ module GaussianPoints
 
     def self.e57_importer_dll
       first_existing(
-        File.join(plugin_root, 'E57ImporterDLL.dll'),
-        File.join(plugin_root, 'cpp', 'build', 'E57ImporterDLL', 'x64', 'Release', 'E57ImporterDLL.dll')
+        File.join(plugin_root, 'cpp', 'build', 'E57ImporterDLL', 'x64', 'Release', 'E57ImporterDLL.dll'),
+        File.join(plugin_root, 'E57ImporterDLL.dll')
       )
     end
 

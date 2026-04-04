@@ -67,6 +67,7 @@ require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'overlay_bridge_native.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'pointcloud_hook_native.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'e57_importer_native.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'octree_processor_native.rb')
+require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'gasp_project.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'importer.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'exporter.rb')
 

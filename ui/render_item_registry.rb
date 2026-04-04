@@ -56,6 +56,28 @@ module GaussianPoints
         items[id]
       end
 
+      def register_pointcloud_project(name:, project_path:, source_path: nil)
+        id = next_id('pc')
+        GaussianPoints::Hook.clear_pointcloud_objects if pointcloud_items.empty?
+        initial_state = GaussianPoints::Hook.load_pointcloud_object_from_gasp(id, project_path)
+        return nil unless initial_state
+
+        items[id] = {
+          id: id,
+          type: :pointcloud,
+          name: name,
+          source_path: source_path,
+          project_path: project_path,
+          box_state: duplicate_snapshot(initial_state),
+          base_box_state: duplicate_snapshot(initial_state),
+          created_at: monotonic_stamp
+        }
+
+        sync_scene_bounds_proxy!
+        persist_to_model!
+        items[id]
+      end
+
       def register_gaussian_file(name:, filename:)
         id = next_id('gs')
         GaussianPoints::GaussianSplats.clear_splat_objects if gaussian_items.empty?

@@ -31,6 +31,11 @@ module GaussianPoints
           [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
           Fiddle::TYPE_INT
         )
+        @load_pointcloud_object_from_gasp = Fiddle::Function.new(
+          @renderer_dll['LoadPointCloudObjectFromGasp'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_INT
+        )
         @set_pointcloud_object_transform = Fiddle::Function.new(
           @renderer_dll['SetPointCloudObjectTransform'],
           [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
@@ -53,6 +58,7 @@ module GaussianPoints
         )
       rescue Fiddle::DLError
         @set_pointcloud_object_data = nil
+        @load_pointcloud_object_from_gasp = nil
         @set_pointcloud_object_transform = nil
         @set_pointcloud_object_highlight = nil
         @remove_pointcloud_object = nil
@@ -96,6 +102,10 @@ module GaussianPoints
       setup_dll && !@set_pointcloud_object_data.nil? && !@set_pointcloud_object_transform.nil?
     end
 
+    def self.supports_gasp_api?
+      setup_dll && !@load_pointcloud_object_from_gasp.nil?
+    end
+
     def self.supports_highlight_api?
       setup_dll && !@set_pointcloud_object_highlight.nil?
     end
@@ -123,6 +133,38 @@ module GaussianPoints
         pack_axes(snapshot[:axes]),
         visible ? 1 : 0
       ) != 0
+    end
+
+    def self.load_pointcloud_object_from_gasp(id, filename)
+      return nil unless setup_dll
+      return nil unless install_hooks
+      return nil unless supports_gasp_api?
+
+      center_ptr = pack_doubles([0.0, 0.0, 0.0])
+      half_extents_ptr = pack_doubles([0.0, 0.0, 0.0])
+      result = @load_pointcloud_object_from_gasp.call(
+        c_string(id),
+        c_string(filename),
+        center_ptr,
+        half_extents_ptr
+      )
+      return nil if result == 0
+
+      center = center_ptr[0, 24].unpack('d3')
+      half_extents = half_extents_ptr[0, 24].unpack('d3')
+      {
+        center: Geom::Point3d.new(center[0], center[1], center[2]),
+        half_extents: {
+          x: half_extents[0],
+          y: half_extents[1],
+          z: half_extents[2]
+        },
+        axes: {
+          x: Geom::Vector3d.new(1, 0, 0),
+          y: Geom::Vector3d.new(0, 1, 0),
+          z: Geom::Vector3d.new(0, 0, 1)
+        }
+      }
     end
 
     def self.remove_pointcloud_object(id)

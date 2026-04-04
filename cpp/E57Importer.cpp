@@ -1,4 +1,4 @@
-// E57Importer.cpp
+п»ї// E57Importer.cpp
 
 #include "E57Importer.h"
 #include <E57SimpleReader.h>
@@ -8,6 +8,12 @@
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
+
+struct RawPoint {
+    double x, y, z;
+    uint16_t r, g, b;
+    bool colorValid;
+};
 
 struct E57Point {
     double x, y, z;
@@ -22,7 +28,7 @@ extern "C" {
     {
         g_points.clear();
         try {
-            e57::ReaderOptions options;  // Можно задать дополнительные опции при необходимости
+            e57::ReaderOptions options;
             e57::Reader reader(filename, options);
             if (!reader.IsOpen()) {
                 std::cerr << "[importE57] Can't open: " << filename << "\n";
@@ -42,10 +48,8 @@ extern "C" {
                 return -1;
             }
 
-            // Размер "пачки" точек
             const size_t BATCH = 10000;
 
-            // Выделяем буферы для координат и цветовых каналов
             std::vector<double>   xVals(BATCH), yVals(BATCH), zVals(BATCH);
             std::vector<uint16_t> rVals(BATCH), gVals(BATCH), bVals(BATCH);
             std::vector<int8_t>   colorInvalid(BATCH, 0);
@@ -59,53 +63,72 @@ extern "C" {
             buffers.colorBlue = bVals.data();
             buffers.isColorInvalid = colorInvalid.data();
 
-            e57::CompressedVectorReader cReader = reader.SetUpData3DPointsData(0, BATCH, buffers);
+            // РџРµСЂРІС‹Р№ РїСЂРѕС…РѕРґ: С‡РёС‚Р°РµРј РІСЃРµ С‚РѕС‡РєРё СЃ СЃС‹СЂС‹РјРё uint16 С†РІРµС‚Р°РјРё
+            // Рё РЅР°С…РѕРґРёРј РіР»РѕР±Р°Р»СЊРЅС‹Р№ РјР°РєСЃРёРјСѓРј РїРѕ РєР°Р¶РґРѕРјСѓ РєР°РЅР°Р»Сѓ.
+            std::vector<RawPoint> rawPoints;
+            uint16_t globalMaxR = 0, globalMaxG = 0, globalMaxB = 0;
 
+            e57::CompressedVectorReader cReader = reader.SetUpData3DPointsData(0, BATCH, buffers);
             while (true) {
                 size_t got = cReader.read();
                 if (got == 0)
                     break;
 
-                // Определяем коэффициент масштабирования для преобразования цвета.
-                // Если максимальное значение красного канала в блоке > 255,
-                // предполагаем, что значения в диапазоне 0..65535 и делим на 257,
-                // иначе – значения уже в диапазоне 0..255.
-                uint16_t max_r = 0;
                 for (size_t i = 0; i < got; i++) {
-                    if (rVals[i] > max_r)
-                        max_r = rVals[i];
-                }
-                uint16_t scale = (max_r > 255 ? 257 : 1);
+                    RawPoint rp;
+                    rp.x = xVals[i];
+                    rp.y = yVals[i];
+                    rp.z = zVals[i];
+                    rp.colorValid = (colorInvalid[i] == 0);
+                    rp.r = rVals[i];
+                    rp.g = gVals[i];
+                    rp.b = bVals[i];
 
-                for (size_t i = 0; i < got; i++) {
-                    E57Point pt;
-                    pt.x = xVals[i];
-                    pt.y = yVals[i];
-                    pt.z = zVals[i];
-
-                    if (colorInvalid[i] != 0) {
-                        // Если цвет недопустим, подставляем значение по умолчанию (128,128,128)
-                        pt.r = 128;
-                        pt.g = 128;
-                        pt.b = 128;
-                    }
-                    else {
-                        // Преобразуем цвет: если значения в 16-битном формате – делим на scale,
-                        // иначе оставляем как есть.
-                        pt.r = static_cast<uint8_t>(rVals[i] / scale);
-                        pt.g = static_cast<uint8_t>(gVals[i] / scale);
-                        pt.b = static_cast<uint8_t>(bVals[i] / scale);
+                    if (rp.colorValid) {
+                        if (rp.r > globalMaxR) globalMaxR = rp.r;
+                        if (rp.g > globalMaxG) globalMaxG = rp.g;
+                        if (rp.b > globalMaxB) globalMaxB = rp.b;
                     }
 
-                    g_points.push_back(pt);
+                    rawPoints.push_back(rp);
                 }
 
                 if (got < BATCH)
                     break;
             }
-
             cReader.close();
             reader.Close();
+
+            // РћРїСЂРµРґРµР»СЏРµРј РјР°СЃС€С‚Р°Р± РїРѕ РіР»РѕР±Р°Р»СЊРЅРѕРјСѓ РјР°РєСЃРёРјСѓРјСѓ РІСЃРµРіРѕ С„Р°Р№Р»Р°.
+            uint16_t scale_r = (globalMaxR > 255) ? 257 : 1;
+            uint16_t scale_g = (globalMaxG > 255) ? 257 : 1;
+            uint16_t scale_b = (globalMaxB > 255) ? 257 : 1;
+
+            std::cerr << "[importE57] Color scale: R=" << scale_r
+                      << " G=" << scale_g << " B=" << scale_b
+                      << " (globalMax R=" << globalMaxR
+                      << " G=" << globalMaxG << " B=" << globalMaxB << ")\n";
+
+            // Р’С‚РѕСЂРѕР№ РїСЂРѕС…РѕРґ: РєРѕРЅРІРµСЂС‚РёСЂСѓРµРј С†РІРµС‚Р° СЃ РµРґРёРЅС‹Рј РјР°СЃС€С‚Р°Р±РѕРј.
+            g_points.reserve(rawPoints.size());
+            for (const auto& rp : rawPoints) {
+                E57Point pt;
+                pt.x = rp.x;
+                pt.y = rp.y;
+                pt.z = rp.z;
+
+                if (!rp.colorValid) {
+                    pt.r = 128;
+                    pt.g = 128;
+                    pt.b = 128;
+                } else {
+                    pt.r = static_cast<uint8_t>(rp.r / scale_r);
+                    pt.g = static_cast<uint8_t>(rp.g / scale_g);
+                    pt.b = static_cast<uint8_t>(rp.b / scale_b);
+                }
+
+                g_points.push_back(pt);
+            }
 
             return static_cast<int>(g_points.size());
         }

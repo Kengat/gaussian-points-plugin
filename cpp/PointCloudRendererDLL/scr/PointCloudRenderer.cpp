@@ -1,5 +1,6 @@
 #include "PointCloudRenderer.h"
 
+#define NOMINMAX
 #include <windows.h>
 
 #include <GL/glew.h>
@@ -10,9 +11,14 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
+
+#undef min
+#undef max
 
 namespace {
 
@@ -31,12 +37,19 @@ struct ClipBoxState {
 
 PFN_GET_MATRICES g_get_current_matrices = nullptr;
 PFN_GET_CLIP_BOX_STATE g_get_clip_box_state = nullptr;
-std::vector<float> g_points;
 bool g_data_ready = false;
-bool g_gpu_data_dirty = false;
 GLuint g_program = 0;
-GLuint g_vao = 0;
-GLuint g_vbo = 0;
+GLint g_u_view_projection = -1;
+GLint g_u_object = -1;
+GLint g_u_point_size = -1;
+GLint g_u_use_override_color = -1;
+GLint g_u_override_color = -1;
+GLint g_u_clip_enabled = -1;
+GLint g_u_clip_center = -1;
+GLint g_u_clip_half_extents = -1;
+GLint g_u_clip_axis_x = -1;
+GLint g_u_clip_axis_y = -1;
+GLint g_u_clip_axis_z = -1;
 
 struct PointCloudObject {
   std::string id;
@@ -50,18 +63,124 @@ struct PointCloudObject {
       0.0, 0.0, 1.0};
   bool visible = true;
   int highlight_mode = 0;
+  GLuint vao = 0;
+  GLuint vbo = 0;
+  bool gpu_dirty = true;
+  GLsizei gpu_point_count = 0;
 };
 
 std::vector<PointCloudObject> g_pointcloud_objects;
 constexpr int kHighlightNone = 0;
 constexpr int kHighlightHover = 1;
 constexpr int kHighlightSelected = 2;
+constexpr GLsizei kHeavyHighlightPointThreshold = 1000000;
+constexpr char kGaspMagic[4] = {'G', 'A', 'S', 'P'};
+constexpr std::uint32_t kGaspVersion = 2u;
+constexpr std::uint32_t kGaspPointStride = 7u;
 
 extern "C" EXPORT int SetPointCloudObjectData(const char* object_id, const double* points_in, int count);
+extern "C" EXPORT int LoadPointCloudObjectFromGasp(const char* object_id, const char* filename, double* out_center_xyz, double* out_half_extents_xyz);
 extern "C" EXPORT int SetPointCloudObjectTransform(const char* object_id, const double* center_xyz, const double* half_extents_xyz, const double* axes_xyz, int visible);
 extern "C" EXPORT int SetPointCloudObjectHighlight(const char* object_id, int highlight_mode);
 extern "C" EXPORT int RemovePointCloudObject(const char* object_id);
 extern "C" EXPORT void ClearPointCloudObjects();
+
+struct GaspHeader {
+  char magic[4];
+  std::uint32_t version = 0;
+  std::uint32_t flags = 0;
+  std::uint64_t full_count = 0;
+  std::uint64_t preview_count = 0;
+  std::uint32_t full_stride = 0;
+  std::uint32_t preview_stride = 0;
+  std::uint32_t name_length = 0;
+  std::uint32_t source_length = 0;
+  double center_xyz[3] = {0.0, 0.0, 0.0};
+  double half_extents_xyz[3] = {0.0, 0.0, 0.0};
+};
+
+std::wstring Utf8ToWide(const char* utf8_text) {
+  if (utf8_text == nullptr || utf8_text[0] == '\0') {
+    return std::wstring();
+  }
+
+  const int wide_length = MultiByteToWideChar(CP_UTF8, 0, utf8_text, -1, nullptr, 0);
+  if (wide_length <= 1) {
+    return std::wstring();
+  }
+
+  std::wstring wide_text(static_cast<size_t>(wide_length), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, 0, utf8_text, -1, &wide_text[0], wide_length) <= 0) {
+    return std::wstring();
+  }
+  wide_text.resize(static_cast<size_t>(wide_length - 1));
+
+  return wide_text;
+}
+
+bool ReadExact(std::ifstream& input, void* destination, size_t byte_count) {
+  if (byte_count == 0) {
+    return true;
+  }
+
+  input.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(byte_count));
+  return input.good();
+}
+
+bool SkipBytes(std::ifstream& input, std::uint64_t byte_count) {
+  if (byte_count == 0) {
+    return true;
+  }
+  if (byte_count > static_cast<std::uint64_t>((std::numeric_limits<std::streamoff>::max)())) {
+    return false;
+  }
+
+  input.seekg(static_cast<std::streamoff>(byte_count), std::ios::cur);
+  return input.good();
+}
+
+bool ReadGaspHeader(std::ifstream& input, GaspHeader* header) {
+  if (header == nullptr) {
+    return false;
+  }
+
+  return
+      ReadExact(input, header->magic, sizeof(header->magic)) &&
+      ReadExact(input, &header->version, sizeof(header->version)) &&
+      ReadExact(input, &header->flags, sizeof(header->flags)) &&
+      ReadExact(input, &header->full_count, sizeof(header->full_count)) &&
+      ReadExact(input, &header->preview_count, sizeof(header->preview_count)) &&
+      ReadExact(input, &header->full_stride, sizeof(header->full_stride)) &&
+      ReadExact(input, &header->preview_stride, sizeof(header->preview_stride)) &&
+      ReadExact(input, &header->name_length, sizeof(header->name_length)) &&
+      ReadExact(input, &header->source_length, sizeof(header->source_length)) &&
+      ReadExact(input, header->center_xyz, sizeof(header->center_xyz)) &&
+      ReadExact(input, header->half_extents_xyz, sizeof(header->half_extents_xyz));
+}
+
+void NormalizeLoadedPointColorsIfNeeded(PointCloudObject& object) {
+  bool needs_normalization = false;
+  for (size_t index = 0; index + 6 < object.points.size(); index += 7) {
+    if (object.points[index + 3] > 1.0f ||
+        object.points[index + 4] > 1.0f ||
+        object.points[index + 5] > 1.0f ||
+        object.points[index + 6] > 1.0f) {
+      needs_normalization = true;
+      break;
+    }
+  }
+
+  if (!needs_normalization) {
+    return;
+  }
+
+  for (size_t index = 0; index + 6 < object.points.size(); index += 7) {
+    object.points[index + 3] /= 255.0f;
+    object.points[index + 4] /= 255.0f;
+    object.points[index + 5] /= 255.0f;
+    object.points[index + 6] /= 255.0f;
+  }
+}
 
 void LogMessage(const char* format, ...) {
   char buffer[1024];
@@ -116,14 +235,6 @@ void MultiplyMat4(const float* left, const float* right, float* result) {
           left[row * 4 + 1] * right[1 * 4 + col] +
           left[row * 4 + 2] * right[2 * 4 + col] +
           left[row * 4 + 3] * right[3 * 4 + col];
-    }
-  }
-}
-
-void TransposeMat4(const float* input, float* output) {
-  for (int row = 0; row < 4; ++row) {
-    for (int col = 0; col < 4; ++col) {
-      output[col * 4 + row] = input[row * 4 + col];
     }
   }
 }
@@ -227,29 +338,39 @@ void ResetObjectTransform(PointCloudObject& object) {
   object.axes_xyz[6] = 0.0; object.axes_xyz[7] = 0.0; object.axes_xyz[8] = 1.0;
 }
 
-void TransformPoint(const PointCloudObject& object, float local_x, float local_y, float local_z, float* out_xyz) {
+void ReleaseObjectGPUResources(PointCloudObject& object) {
+  if (object.vbo != 0) {
+    glDeleteBuffers(1, &object.vbo);
+    object.vbo = 0;
+  }
+  if (object.vao != 0) {
+    glDeleteVertexArrays(1, &object.vao);
+    object.vao = 0;
+  }
+  object.gpu_point_count = 0;
+  object.gpu_dirty = true;
+}
+
+void BuildObjectMatrix(const PointCloudObject& object, float* out_matrix) {
   const double sx = object.base_half_extents[0] > 1.0e-6f ? (object.half_extents_xyz[0] / object.base_half_extents[0]) : 1.0;
   const double sy = object.base_half_extents[1] > 1.0e-6f ? (object.half_extents_xyz[1] / object.base_half_extents[1]) : 1.0;
   const double sz = object.base_half_extents[2] > 1.0e-6f ? (object.half_extents_xyz[2] / object.base_half_extents[2]) : 1.0;
-  const double scaled_x = static_cast<double>(local_x) * sx;
-  const double scaled_y = static_cast<double>(local_y) * sy;
-  const double scaled_z = static_cast<double>(local_z) * sz;
-
-  out_xyz[0] = static_cast<float>(
-      object.center_xyz[0] +
-      (object.axes_xyz[0] * scaled_x) +
-      (object.axes_xyz[3] * scaled_y) +
-      (object.axes_xyz[6] * scaled_z));
-  out_xyz[1] = static_cast<float>(
-      object.center_xyz[1] +
-      (object.axes_xyz[1] * scaled_x) +
-      (object.axes_xyz[4] * scaled_y) +
-      (object.axes_xyz[7] * scaled_z));
-  out_xyz[2] = static_cast<float>(
-      object.center_xyz[2] +
-      (object.axes_xyz[2] * scaled_x) +
-      (object.axes_xyz[5] * scaled_y) +
-      (object.axes_xyz[8] * scaled_z));
+  out_matrix[0] = static_cast<float>(object.axes_xyz[0] * sx);
+  out_matrix[1] = static_cast<float>(object.axes_xyz[3] * sy);
+  out_matrix[2] = static_cast<float>(object.axes_xyz[6] * sz);
+  out_matrix[3] = static_cast<float>(object.center_xyz[0]);
+  out_matrix[4] = static_cast<float>(object.axes_xyz[1] * sx);
+  out_matrix[5] = static_cast<float>(object.axes_xyz[4] * sy);
+  out_matrix[6] = static_cast<float>(object.axes_xyz[7] * sz);
+  out_matrix[7] = static_cast<float>(object.center_xyz[1]);
+  out_matrix[8] = static_cast<float>(object.axes_xyz[2] * sx);
+  out_matrix[9] = static_cast<float>(object.axes_xyz[5] * sy);
+  out_matrix[10] = static_cast<float>(object.axes_xyz[8] * sz);
+  out_matrix[11] = static_cast<float>(object.center_xyz[2]);
+  out_matrix[12] = 0.0f;
+  out_matrix[13] = 0.0f;
+  out_matrix[14] = 0.0f;
+  out_matrix[15] = 1.0f;
 }
 
 bool InitializeRenderer() {
@@ -267,23 +388,45 @@ bool InitializeRenderer() {
     #version 150
     in vec3 aPosition;
     in vec4 aColor;
-    uniform mat4 uMVP;
+    uniform mat4 uViewProjection;
+    uniform mat4 uObject;
     uniform float uPointSize;
+    uniform int uUseOverrideColor;
+    uniform vec4 uOverrideColor;
+    uniform int uClipEnabled;
+    uniform vec3 uClipCenter;
+    uniform vec3 uClipHalfExtents;
+    uniform vec3 uClipAxisX;
+    uniform vec3 uClipAxisY;
+    uniform vec3 uClipAxisZ;
     out vec4 vColor;
+    flat out int vVisible;
     void main() {
-      gl_Position = uMVP * vec4(aPosition, 1.0);
+      vec4 world = uObject * vec4(aPosition, 1.0);
+      bool visible = true;
+      if (uClipEnabled != 0) {
+        vec3 delta = world.xyz - uClipCenter;
+        vec3 local = vec3(
+          dot(delta, uClipAxisX),
+          dot(delta, uClipAxisY),
+          dot(delta, uClipAxisZ)
+        );
+        visible = all(lessThanEqual(abs(local), uClipHalfExtents));
+      }
+      vVisible = visible ? 1 : 0;
+      gl_Position = visible ? (uViewProjection * world) : vec4(2.0, 2.0, 2.0, 1.0);
       gl_PointSize = uPointSize;
-      vColor = aColor;
+      vColor = (uUseOverrideColor != 0) ? uOverrideColor : aColor;
     }
   )";
 
   const char* fragment_shader_source = R"(
     #version 150
     in vec4 vColor;
+    flat in int vVisible;
     out vec4 fragColor;
     void main() {
-      vec2 coord = gl_PointCoord * 2.0 - 1.0;
-      if (dot(coord, coord) > 1.0) {
+      if (vVisible == 0) {
         discard;
       }
       fragColor = vColor;
@@ -319,34 +462,53 @@ bool InitializeRenderer() {
     return false;
   }
 
-  glGenVertexArrays(1, &g_vao);
-  glGenBuffers(1, &g_vbo);
-  return g_program != 0 && g_vao != 0 && g_vbo != 0;
+  g_u_view_projection = glGetUniformLocation(g_program, "uViewProjection");
+  g_u_object = glGetUniformLocation(g_program, "uObject");
+  g_u_point_size = glGetUniformLocation(g_program, "uPointSize");
+  g_u_use_override_color = glGetUniformLocation(g_program, "uUseOverrideColor");
+  g_u_override_color = glGetUniformLocation(g_program, "uOverrideColor");
+  g_u_clip_enabled = glGetUniformLocation(g_program, "uClipEnabled");
+  g_u_clip_center = glGetUniformLocation(g_program, "uClipCenter");
+  g_u_clip_half_extents = glGetUniformLocation(g_program, "uClipHalfExtents");
+  g_u_clip_axis_x = glGetUniformLocation(g_program, "uClipAxisX");
+  g_u_clip_axis_y = glGetUniformLocation(g_program, "uClipAxisY");
+  g_u_clip_axis_z = glGetUniformLocation(g_program, "uClipAxisZ");
+  return g_program != 0;
 }
 
 void CleanupRenderer() {
-  if (g_vbo != 0) glDeleteBuffers(1, &g_vbo);
-  if (g_vao != 0) glDeleteVertexArrays(1, &g_vao);
+  for (PointCloudObject& object : g_pointcloud_objects) {
+    ReleaseObjectGPUResources(object);
+  }
   if (g_program != 0) glDeleteProgram(g_program);
-  g_vbo = 0;
-  g_vao = 0;
   g_program = 0;
 }
 
-void UploadPointDataIfNeeded() {
-  if (!g_gpu_data_dirty) {
-    return;
+bool UploadObjectPointDataIfNeeded(PointCloudObject& object) {
+  if (!object.gpu_dirty) {
+    return object.vao != 0 && object.vbo != 0;
   }
 
   if (!InitializeRenderer()) {
-    return;
+    return false;
   }
 
-  glBindVertexArray(g_vao);
-  glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+  if (object.vao == 0) {
+    glGenVertexArrays(1, &object.vao);
+  }
+  if (object.vbo == 0) {
+    glGenBuffers(1, &object.vbo);
+  }
+  if (object.vao == 0 || object.vbo == 0) {
+    LogMessage("Failed to allocate point cloud object buffers for '%s'.", object.id.c_str());
+    return false;
+  }
+
+  glBindVertexArray(object.vao);
+  glBindBuffer(GL_ARRAY_BUFFER, object.vbo);
   glBufferData(GL_ARRAY_BUFFER,
-      static_cast<GLsizeiptr>(g_points.size() * sizeof(float)),
-      g_points.data(),
+      static_cast<GLsizeiptr>(object.points.size() * sizeof(float)),
+      object.points.empty() ? nullptr : object.points.data(),
       GL_STATIC_DRAW);
 
   glEnableVertexAttribArray(0);
@@ -356,7 +518,36 @@ void UploadPointDataIfNeeded() {
 
   glBindBuffer(GL_ARRAY_BUFFER, 0);
   glBindVertexArray(0);
-  g_gpu_data_dirty = false;
+  object.gpu_point_count = static_cast<GLsizei>(object.points.size() / 7);
+  object.gpu_dirty = false;
+  return true;
+}
+
+void SetClipUniforms(const ClipBoxState& clip_box) {
+  glUniform1i(g_u_clip_enabled, clip_box.enabled ? 1 : 0);
+  if (!clip_box.enabled) {
+    return;
+  }
+  glUniform3f(g_u_clip_center,
+      static_cast<float>(clip_box.center_xyz[0]),
+      static_cast<float>(clip_box.center_xyz[1]),
+      static_cast<float>(clip_box.center_xyz[2]));
+  glUniform3f(g_u_clip_half_extents,
+      static_cast<float>(clip_box.half_extents_xyz[0]),
+      static_cast<float>(clip_box.half_extents_xyz[1]),
+      static_cast<float>(clip_box.half_extents_xyz[2]));
+  glUniform3f(g_u_clip_axis_x,
+      static_cast<float>(clip_box.axes_xyz[0]),
+      static_cast<float>(clip_box.axes_xyz[1]),
+      static_cast<float>(clip_box.axes_xyz[2]));
+  glUniform3f(g_u_clip_axis_y,
+      static_cast<float>(clip_box.axes_xyz[3]),
+      static_cast<float>(clip_box.axes_xyz[4]),
+      static_cast<float>(clip_box.axes_xyz[5]));
+  glUniform3f(g_u_clip_axis_z,
+      static_cast<float>(clip_box.axes_xyz[6]),
+      static_cast<float>(clip_box.axes_xyz[7]),
+      static_cast<float>(clip_box.axes_xyz[8]));
 }
 
 void HighlightColorForMode(int highlight_mode, float* r, float* g, float* b, float* a) {
@@ -375,11 +566,130 @@ float HighlightOutlinePointSizeForMode(int highlight_mode) {
   return highlight_mode == kHighlightHover ? 20.0f : 16.0f;
 }
 
+bool ShouldRenderNativeHighlight(const PointCloudObject& object) {
+  return static_cast<GLsizei>(object.points.size() / 7) <= kHeavyHighlightPointThreshold;
+}
+
+bool LoadObjectFromGaspFile(
+    PointCloudObject& object,
+    const char* filename,
+    double* out_center_xyz,
+    double* out_half_extents_xyz) {
+  if (filename == nullptr) {
+    return false;
+  }
+
+  const std::wstring wide_filename = Utf8ToWide(filename);
+  if (wide_filename.empty()) {
+    LogMessage("Failed to convert GASP path from UTF-8: %s", filename);
+    return false;
+  }
+
+  std::ifstream input(wide_filename.c_str(), std::ios::binary);
+  if (!input.is_open()) {
+    LogMessage("Failed to open GASP file: %s", filename);
+    return false;
+  }
+
+  GaspHeader header = {};
+  if (!ReadGaspHeader(input, &header)) {
+    LogMessage("Failed to read GASP header: %s", filename);
+    return false;
+  }
+
+  if (std::memcmp(header.magic, kGaspMagic, sizeof(kGaspMagic)) != 0) {
+    LogMessage("Invalid GASP magic: %s", filename);
+    return false;
+  }
+  if (header.version != kGaspVersion) {
+    LogMessage("Unsupported GASP version %u: %s", header.version, filename);
+    return false;
+  }
+  if (header.full_stride != kGaspPointStride) {
+    LogMessage("Unsupported GASP point stride %u: %s", header.full_stride, filename);
+    return false;
+  }
+  if (header.preview_count > 0 && header.preview_stride != kGaspPointStride) {
+    LogMessage("Unsupported GASP preview stride %u: %s", header.preview_stride, filename);
+    return false;
+  }
+  if (header.full_count == 0) {
+    LogMessage("GASP file contains no points: %s", filename);
+    return false;
+  }
+  if (header.full_count > (static_cast<std::uint64_t>((std::numeric_limits<size_t>::max)()) / kGaspPointStride)) {
+    LogMessage("GASP point count is too large: %s", filename);
+    return false;
+  }
+
+  if (!SkipBytes(input, header.name_length) || !SkipBytes(input, header.source_length)) {
+    LogMessage("Failed to skip GASP metadata strings: %s", filename);
+    return false;
+  }
+
+  const size_t point_value_count = static_cast<size_t>(header.full_count) * static_cast<size_t>(header.full_stride);
+  object.points.resize(point_value_count);
+  const std::uint64_t point_buffer_bytes =
+      static_cast<std::uint64_t>(point_value_count) * static_cast<std::uint64_t>(sizeof(float));
+  if (point_buffer_bytes > static_cast<std::uint64_t>((std::numeric_limits<std::streamsize>::max)()) ||
+      !ReadExact(input, object.points.data(), static_cast<size_t>(point_buffer_bytes))) {
+    LogMessage("Failed to read GASP point buffer: %s", filename);
+    object.points.clear();
+    return false;
+  }
+
+  const std::uint64_t preview_bytes =
+      header.preview_count *
+      static_cast<std::uint64_t>(header.preview_stride) *
+      static_cast<std::uint64_t>(sizeof(float));
+  if (!SkipBytes(input, preview_bytes)) {
+    LogMessage("Failed to skip GASP preview buffer: %s", filename);
+    object.points.clear();
+    return false;
+  }
+
+  NormalizeLoadedPointColorsIfNeeded(object);
+
+  object.base_half_extents[0] = static_cast<float>(header.half_extents_xyz[0] > 0.001 ? header.half_extents_xyz[0] : 0.001);
+  object.base_half_extents[1] = static_cast<float>(header.half_extents_xyz[1] > 0.001 ? header.half_extents_xyz[1] : 0.001);
+  object.base_half_extents[2] = static_cast<float>(header.half_extents_xyz[2] > 0.001 ? header.half_extents_xyz[2] : 0.001);
+  object.center_xyz[0] = header.center_xyz[0];
+  object.center_xyz[1] = header.center_xyz[1];
+  object.center_xyz[2] = header.center_xyz[2];
+  object.half_extents_xyz[0] = header.half_extents_xyz[0];
+  object.half_extents_xyz[1] = header.half_extents_xyz[1];
+  object.half_extents_xyz[2] = header.half_extents_xyz[2];
+  ResetObjectTransform(object);
+  object.gpu_dirty = true;
+  object.visible = true;
+
+  if (out_center_xyz != nullptr) {
+    out_center_xyz[0] = header.center_xyz[0];
+    out_center_xyz[1] = header.center_xyz[1];
+    out_center_xyz[2] = header.center_xyz[2];
+  }
+  if (out_half_extents_xyz != nullptr) {
+    out_half_extents_xyz[0] = header.half_extents_xyz[0];
+    out_half_extents_xyz[1] = header.half_extents_xyz[1];
+    out_half_extents_xyz[2] = header.half_extents_xyz[2];
+  }
+
+  return true;
+}
+
 void DrawPointCloudObject(
     const PointCloudObject& object,
     const ClipBoxState& clip_box,
-    bool highlight_pass) {
-  const GLsizei object_point_count = static_cast<GLsizei>(object.points.size() / 7);
+    const float* view_projection,
+    bool highlight_pass,
+    float point_size) {
+  PointCloudObject& mutable_object = const_cast<PointCloudObject&>(object);
+  if (!UploadObjectPointDataIfNeeded(mutable_object) || mutable_object.gpu_point_count <= 0) {
+    return;
+  }
+
+  float object_matrix[16] = {0.0f};
+  BuildObjectMatrix(object, object_matrix);
   float r = 0.0f;
   float g = 0.0f;
   float b = 0.0f;
@@ -388,27 +698,16 @@ void DrawPointCloudObject(
     HighlightColorForMode(object.highlight_mode, &r, &g, &b, &a);
   }
 
-  glBegin(GL_POINTS);
-  for (GLsizei i = 0; i < object_point_count; ++i) {
-    const size_t base = static_cast<size_t>(i) * 7;
-    float world[3] = {0.0f, 0.0f, 0.0f};
-    TransformPoint(object, object.points[base + 0], object.points[base + 1], object.points[base + 2], world);
-    if (!IsPointInsideClip(clip_box, world[0], world[1], world[2])) {
-      continue;
-    }
+  glUniformMatrix4fv(g_u_view_projection, 1, GL_TRUE, view_projection);
+  glUniformMatrix4fv(g_u_object, 1, GL_TRUE, object_matrix);
+  glUniform1f(g_u_point_size, point_size);
+  glUniform1i(g_u_use_override_color, highlight_pass ? 1 : 0);
+  glUniform4f(g_u_override_color, r, g, b, a);
+  SetClipUniforms(clip_box);
 
-    if (highlight_pass) {
-      glColor4f(r, g, b, a);
-    } else {
-      glColor4f(
-          object.points[base + 3],
-          object.points[base + 4],
-          object.points[base + 5],
-          object.points[base + 6]);
-    }
-    glVertex3f(world[0], world[1], world[2]);
-  }
-  glEnd();
+  glBindVertexArray(mutable_object.vao);
+  glDrawArrays(GL_POINTS, 0, mutable_object.gpu_point_count);
+  glBindVertexArray(0);
 }
 
 }  // namespace
@@ -432,6 +731,7 @@ extern "C" EXPORT int SetPointCloudObjectData(const char* object_id, const doubl
   PointCloudObject& object = UpsertObject(object_id);
   object.points.clear();
   object.points.reserve(static_cast<size_t>(count) * 7);
+  object.gpu_dirty = true;
   ResetObjectTransform(object);
 
   float min_x = 0.0f;
@@ -480,8 +780,34 @@ extern "C" EXPORT int SetPointCloudObjectData(const char* object_id, const doubl
   }
 
   g_data_ready = !g_pointcloud_objects.empty();
-  g_gpu_data_dirty = true;
   LogMessage("SetPointCloudObjectData stored %d points for '%s'.", count, object.id.c_str());
+  return 1;
+}
+
+extern "C" EXPORT int LoadPointCloudObjectFromGasp(
+    const char* object_id,
+    const char* filename,
+    double* out_center_xyz,
+    double* out_half_extents_xyz) {
+  if (object_id == nullptr || filename == nullptr) {
+    return 0;
+  }
+
+  PointCloudObject& object = UpsertObject(object_id);
+  ReleaseObjectGPUResources(object);
+  object.points.clear();
+  object.id = object_id;
+  if (!LoadObjectFromGaspFile(object, filename, out_center_xyz, out_half_extents_xyz)) {
+    object.points.clear();
+    g_data_ready = !g_pointcloud_objects.empty();
+    return 0;
+  }
+
+  g_data_ready = !g_pointcloud_objects.empty();
+  LogMessage("Loaded GASP project '%s' for '%s' (%d points).",
+      filename,
+      object.id.c_str(),
+      static_cast<int>(object.points.size() / 7));
   return 1;
 }
 
@@ -525,24 +851,26 @@ extern "C" EXPORT int RemovePointCloudObject(const char* object_id) {
     return 0;
   }
 
-  const auto new_end = std::remove_if(
-      g_pointcloud_objects.begin(),
-      g_pointcloud_objects.end(),
-      [object_id](const PointCloudObject& object) { return object.id == object_id; });
-  if (new_end == g_pointcloud_objects.end()) {
-    return 0;
+  for (auto it = g_pointcloud_objects.begin(); it != g_pointcloud_objects.end(); ++it) {
+    if (it->id != object_id) {
+      continue;
+    }
+
+    ReleaseObjectGPUResources(*it);
+    g_pointcloud_objects.erase(it);
+    g_data_ready = !g_pointcloud_objects.empty();
+    return 1;
   }
 
-  g_pointcloud_objects.erase(new_end, g_pointcloud_objects.end());
-  g_data_ready = !g_pointcloud_objects.empty();
-  return 1;
+  return 0;
 }
 
 extern "C" EXPORT void ClearPointCloudObjects() {
+  for (PointCloudObject& object : g_pointcloud_objects) {
+    ReleaseObjectGPUResources(object);
+  }
   g_pointcloud_objects.clear();
-  g_points.clear();
   g_data_ready = false;
-  g_gpu_data_dirty = false;
 }
 
 extern "C" EXPORT void renderPointCloud() {
@@ -562,17 +890,12 @@ extern "C" EXPORT void renderPointCloud() {
   }
   const ClipBoxState clip_box = FetchClipBoxState();
 
-  float mvp[16] = {0.0f};
-  MultiplyMat4(projection, view, mvp);
-  float projection_gl[16] = {0.0f};
-  float view_gl[16] = {0.0f};
-  TransposeMat4(projection, projection_gl);
-  TransposeMat4(view, view_gl);
+  float view_projection[16] = {0.0f};
+  MultiplyMat4(projection, view, view_projection);
 
   GLint old_program = 0;
   GLint old_vao = 0;
   GLint old_array_buffer = 0;
-  GLint old_matrix_mode = 0;
   GLint stencil_bits = 0;
   GLint old_stencil_func = GL_ALWAYS;
   GLint old_stencil_ref = 0;
@@ -598,7 +921,6 @@ extern "C" EXPORT void renderPointCloud() {
   glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
   glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
   glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array_buffer);
-  glGetIntegerv(GL_MATRIX_MODE, &old_matrix_mode);
   glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
   glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
   glGetIntegerv(GL_STENCIL_BITS, &stencil_bits);
@@ -620,19 +942,10 @@ extern "C" EXPORT void renderPointCloud() {
   glDepthFunc(GL_LEQUAL);
   glDepthMask(GL_TRUE);
   glDisable(GL_BLEND);
-  glDisable(GL_PROGRAM_POINT_SIZE);
+  glEnable(GL_PROGRAM_POINT_SIZE);
   glDisable(GL_TEXTURE_2D);
-
-  glUseProgram(0);
-  glBindVertexArray(0);
+  glUseProgram(g_program);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadMatrixf(projection_gl);
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadMatrixf(view_gl);
-  glPointSize(4.0f);
 
   GLsizei point_count = 0;
   for (const PointCloudObject& object : g_pointcloud_objects) {
@@ -641,13 +954,15 @@ extern "C" EXPORT void renderPointCloud() {
     }
 
     point_count += static_cast<GLsizei>(object.points.size() / 7);
-    DrawPointCloudObject(object, clip_box, false);
+    DrawPointCloudObject(object, clip_box, view_projection, false, 4.0f);
   }
   LogMessage("Rendering %d points.", point_count);
 
   bool has_highlighted_objects = false;
   for (const PointCloudObject& object : g_pointcloud_objects) {
-    if (object.visible && object.highlight_mode != kHighlightNone) {
+    if (object.visible &&
+        object.highlight_mode != kHighlightNone &&
+        ShouldRenderNativeHighlight(object)) {
       has_highlighted_objects = true;
       break;
     }
@@ -664,12 +979,13 @@ extern "C" EXPORT void renderPointCloud() {
     glDepthMask(GL_FALSE);
 
     for (const PointCloudObject& object : g_pointcloud_objects) {
-      if (!object.visible || object.highlight_mode == kHighlightNone) {
+      if (!object.visible ||
+          object.highlight_mode == kHighlightNone ||
+          !ShouldRenderNativeHighlight(object)) {
         continue;
       }
 
-      glPointSize(HighlightMaskPointSizeForMode(object.highlight_mode));
-      DrawPointCloudObject(object, clip_box, false);
+      DrawPointCloudObject(object, clip_box, view_projection, false, HighlightMaskPointSizeForMode(object.highlight_mode));
     }
 
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -680,12 +996,13 @@ extern "C" EXPORT void renderPointCloud() {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     for (const PointCloudObject& object : g_pointcloud_objects) {
-      if (!object.visible || object.highlight_mode == kHighlightNone) {
+      if (!object.visible ||
+          object.highlight_mode == kHighlightNone ||
+          !ShouldRenderNativeHighlight(object)) {
         continue;
       }
 
-      glPointSize(HighlightOutlinePointSizeForMode(object.highlight_mode));
-      DrawPointCloudObject(object, clip_box, true);
+      DrawPointCloudObject(object, clip_box, view_projection, true, HighlightOutlinePointSizeForMode(object.highlight_mode));
     }
 
     glDisable(GL_BLEND);
@@ -699,11 +1016,6 @@ extern "C" EXPORT void renderPointCloud() {
   }
 
   glPointSize(old_point_size);
-  glMatrixMode(GL_MODELVIEW);
-  glPopMatrix();
-  glMatrixMode(GL_PROJECTION);
-  glPopMatrix();
-  glMatrixMode(old_matrix_mode);
   glBindVertexArray(old_vao);
   glBindBuffer(GL_ARRAY_BUFFER, old_array_buffer);
   glUseProgram(old_program);
