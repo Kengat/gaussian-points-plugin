@@ -155,6 +155,7 @@ static bool g_hasGeometryState = false;
 static bool g_gpuSplatDataDirty = true;
 static bool g_gpuObjectDataDirty = true;
 static const bool g_enableDynamicSorting = true;
+static bool g_enableFastApproximateSorting = false;
 
 static GLuint g_splatShader = 0;
 static GLuint g_outlineCompositeShader = 0;
@@ -1580,6 +1581,17 @@ extern "C" EXPORT void AddSplatWithQuaternion(float x, float y, float z, float r
 extern "C" EXPORT void ClearSplats() { LogRenderer("ClearSplats called."); ResetSplatObjects(); }
 extern "C" EXPORT void ClearSplatObjects() { ResetSplatObjects(); }
 extern "C" EXPORT void SetSplatSortingMode(SplatSortingMode mode) { if (mode >= 0 && mode <= 5) { g_sortingMode = mode; LogRenderer("Sort mode set %d.", mode); } else LogRenderer("Invalid sort mode %d.", mode); }
+extern "C" EXPORT void SetFastApproximateSortingEnabled(int enabled) {
+    g_enableFastApproximateSorting = (enabled != 0);
+    g_framesSinceLastSort = SORT_EVERY_N_FRAMES;
+    g_framesSinceLastGeometryUpdate = GEOMETRY_UPDATE_EVERY_N_FRAMES;
+    g_splatVBO.needsUpdate = true;
+    g_highlightMaskVBO.needsUpdate = true;
+    g_gpuSplatDataDirty = true;
+    g_gpuObjectDataDirty = true;
+    LogRenderer("Fast approximate sorting %s.", g_enableFastApproximateSorting ? "enabled" : "disabled");
+}
+extern "C" EXPORT int GetFastApproximateSortingEnabled() { return g_enableFastApproximateSorting ? 1 : 0; }
 
 static void RenderSingleSplatIM(
     const GaussSplat& splat,
@@ -1667,6 +1679,8 @@ struct GPUComputePipeline {
     bool initialized = false;
     bool supported = false;
     GLuint projectCS = 0;
+    GLuint bitonicSortCS = 0;
+    GLuint extractSortedIndicesCS = 0;
     GLuint clearCS = 0;
     GLuint histogramCS = 0;
     GLuint scanBlocksCS = 0;
@@ -1686,6 +1700,7 @@ struct GPUComputePipeline {
     GLuint binCountersSSBO = 0;
     int uploadedSplatCount = 0;
     int drawSplatCount = 0;
+    GLuint sortCapacity = 0;
 };
 static GPUComputePipeline g_gpu;
 struct GPUObjectRange {
@@ -1735,6 +1750,7 @@ uniform mat4 uProj;
 uniform ivec2 uViewport;
 uniform int uIsPerspective;
 uniform int uNumSplats;
+uniform int uSortCapacity;
 uniform vec3 uCameraWorld;
 uniform int uSHDegreeOverride;
 uniform int uClipEnabled;
@@ -1814,7 +1830,11 @@ vec3 EvaluateSHColor(in SplatData s, in vec3 localDir) {
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
-    if (id >= uint(uNumSplats)) return;
+    if (id >= uint(uSortCapacity)) return;
+    if (id >= uint(uNumSplats)) {
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, 0xFFFFFFFFu);
+        return;
+    }
 
     SplatData s = splats[id];
     uint objectIndex = uint(s.basis_z.w + 0.5);
@@ -1962,6 +1982,55 @@ void main() {
 
     uint sortKey = 0xFFFFFFFFu - floatBitsToUint(depth);
     sortEntries[id] = SortEntry(sortKey, uint(id));
+}
+)";
+
+static const char* g_bitonicSortCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+struct SortEntry {
+    uint key;
+    uint idx;
+};
+layout(std430, binding = 2) buffer B2 { SortEntry sortEntries[]; };
+uniform uint uNumEntries;
+uniform uint uStageMask;
+uniform uint uStepMask;
+
+bool SortEntryLess(in SortEntry a, in SortEntry b) {
+    return (a.key < b.key) || (a.key == b.key && a.idx < b.idx);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uNumEntries) return;
+
+    uint partner = id ^ uStepMask;
+    if (partner <= id || partner >= uNumEntries) return;
+
+    SortEntry left = sortEntries[id];
+    SortEntry right = sortEntries[partner];
+    bool ascending = (id & uStageMask) == 0u;
+    bool shouldSwap = ascending ? SortEntryLess(right, left) : SortEntryLess(left, right);
+    if (shouldSwap) {
+        sortEntries[id] = right;
+        sortEntries[partner] = left;
+    }
+}
+)";
+
+static const char* g_extractSortedIndicesCS_Source = R"(#version 430
+layout(local_size_x = 256) in;
+struct SortEntry {
+    uint key;
+    uint idx;
+};
+layout(std430, binding = 2) readonly buffer B2 { SortEntry sortEntries[]; };
+layout(std430, binding = 3) writeonly buffer B3 { uint sortedIndices[]; };
+uniform uint uNumSplats;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uNumSplats) return;
+    sortedIndices[id] = sortEntries[id].idx;
 }
 )";
 
@@ -2202,13 +2271,16 @@ static bool InitGPUPipeline() {
     LogRenderer("GPU pipeline: GL 4.3 detected, initializing compute path.");
     g_gpu.projectCS = CompileComputeShader(g_projectCS_Source);
     if (!g_gpu.projectCS) { LogRenderer("GPU pipeline: compute shader failed."); return false; }
+    g_gpu.bitonicSortCS = CompileComputeShader(g_bitonicSortCS_Source);
+    g_gpu.extractSortedIndicesCS = CompileComputeShader(g_extractSortedIndicesCS_Source);
     g_gpu.clearCS = CompileComputeShader(g_clearCS_Source);
     g_gpu.histogramCS = CompileComputeShader(g_histogramCS_Source);
     g_gpu.scanBlocksCS = CompileComputeShader(g_scanBlocksCS_Source);
     g_gpu.scanTopCS = CompileComputeShader(g_scanTopCS_Source);
     g_gpu.addOffsetsCS = CompileComputeShader(g_addOffsetsCS_Source);
     g_gpu.scatterCS = CompileComputeShader(g_scatterCS_Source);
-    if (!g_gpu.clearCS || !g_gpu.histogramCS || !g_gpu.scanBlocksCS || !g_gpu.scanTopCS || !g_gpu.addOffsetsCS || !g_gpu.scatterCS) {
+    if (!g_gpu.bitonicSortCS || !g_gpu.extractSortedIndicesCS ||
+        !g_gpu.clearCS || !g_gpu.histogramCS || !g_gpu.scanBlocksCS || !g_gpu.scanTopCS || !g_gpu.addOffsetsCS || !g_gpu.scatterCS) {
         LogRenderer("GPU pipeline: sort compute shader initialization failed.");
         return false;
     }
@@ -2236,6 +2308,19 @@ static bool InitGPUPipeline() {
     g_gpu.supported = true;
     LogRenderer("GPU pipeline initialized successfully.");
     return true;
+}
+
+static GLuint NextPowerOfTwo(GLuint value) {
+    if (value <= 1u) {
+        return 1u;
+    }
+    value--;
+    value |= value >> 1u;
+    value |= value >> 2u;
+    value |= value >> 4u;
+    value |= value >> 8u;
+    value |= value >> 16u;
+    return value + 1u;
 }
 
 static void UploadSplatsToGPU() {
@@ -2337,8 +2422,9 @@ static void UploadSplatsToGPU() {
     glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(GPUSplatOut), nullptr, GL_DYNAMIC_DRAW);
 
     struct GPUSortEntry { uint32_t key; uint32_t idx; };
+    g_gpu.sortCapacity = NextPowerOfTwo(static_cast<GLuint>(std::max(n, 1)));
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.sortKeysSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(GPUSortEntry), nullptr, GL_DYNAMIC_DRAW);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, g_gpu.sortCapacity * sizeof(GPUSortEntry), nullptr, GL_DYNAMIC_DRAW);
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.sortedIndicesSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(uint32_t), nullptr, GL_DYNAMIC_DRAW);
@@ -2411,6 +2497,7 @@ static bool UploadGPUObjectData() {
 static void DispatchGPUProjection(const float* viewMatrix, const float* projMatrix, const float* cameraPosition, int vpW, int vpH, int isPerspective, const NativeClipBoxState& clipBox) {
     if (!g_gpu.supported || g_gpu.uploadedSplatCount == 0) return;
     int n = g_gpu.uploadedSplatCount;
+    GLuint sortCapacity = std::max(g_gpu.sortCapacity, 1u);
 
     glUseProgram(g_gpu.projectCS);
     glUniformMatrix4fv(glGetUniformLocation(g_gpu.projectCS, "uView"), 1, GL_TRUE, viewMatrix);
@@ -2418,6 +2505,7 @@ static void DispatchGPUProjection(const float* viewMatrix, const float* projMatr
     glUniform2i(glGetUniformLocation(g_gpu.projectCS, "uViewport"), vpW, vpH);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uIsPerspective"), isPerspective);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uNumSplats"), n);
+    glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uSortCapacity"), static_cast<GLint>(sortCapacity));
     glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uCameraWorld"), cameraPosition[0], cameraPosition[1], cameraPosition[2]);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uSHDegreeOverride"), g_shRenderDegreeOverride);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uClipEnabled"), clipBox.enabled ? 1 : 0);
@@ -2433,7 +2521,7 @@ static void DispatchGPUProjection(const float* viewMatrix, const float* projMatr
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, g_gpu.objectDataSSBO);
 
-    glDispatchCompute((n + 255) / 256, 1, 1);
+    glDispatchCompute((sortCapacity + 255u) / 256u, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
 
@@ -2456,43 +2544,70 @@ static void GPUCountingSort() {
         return;
     }
 
-    ClearGPUUIntBuffer(g_gpu.histogramSSBO, kGPUSortBinCount);
+    if (g_enableFastApproximateSorting) {
+        ClearGPUUIntBuffer(g_gpu.histogramSSBO, kGPUSortBinCount);
 
-    glUseProgram(g_gpu.histogramCS);
-    glUniform1ui(glGetUniformLocation(g_gpu.histogramCS, "uNumSplats"), static_cast<GLuint>(n));
+        glUseProgram(g_gpu.histogramCS);
+        glUniform1ui(glGetUniformLocation(g_gpu.histogramCS, "uNumSplats"), static_cast<GLuint>(n));
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
+        glDispatchCompute((static_cast<GLuint>(n) + 255u) / 256u, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glUseProgram(g_gpu.scanBlocksCS);
+        glUniform1ui(glGetUniformLocation(g_gpu.scanBlocksCS, "uNumBins"), kGPUSortBinCount);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
+        glDispatchCompute(kGPUSortBlockCount, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glUseProgram(g_gpu.scanTopCS);
+        glUniform1ui(glGetUniformLocation(g_gpu.scanTopCS, "uNumBlocks"), kGPUSortBlockCount);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
+        glDispatchCompute(1, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glUseProgram(g_gpu.addOffsetsCS);
+        glUniform1ui(glGetUniformLocation(g_gpu.addOffsetsCS, "uNumBins"), kGPUSortBinCount);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
+        glDispatchCompute(kGPUSortBlockCount, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        ClearGPUUIntBuffer(g_gpu.binCountersSSBO, kGPUSortBinCount);
+
+        glUseProgram(g_gpu.scatterCS);
+        glUniform1ui(glGetUniformLocation(g_gpu.scatterCS, "uNumSplats"), static_cast<GLuint>(n));
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, g_gpu.sortedIndicesSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, g_gpu.binCountersSSBO);
+        glDispatchCompute((static_cast<GLuint>(n) + 255u) / 256u, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        glUseProgram(0);
+        g_gpu.drawSplatCount = n;
+        return;
+    }
+
+    const GLuint sortCapacity = std::max(g_gpu.sortCapacity, 1u);
+
+    glUseProgram(g_gpu.bitonicSortCS);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
-    glDispatchCompute((static_cast<GLuint>(n) + 255u) / 256u, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    glUniform1ui(glGetUniformLocation(g_gpu.bitonicSortCS, "uNumEntries"), sortCapacity);
+    for (GLuint stageMask = 2u; stageMask <= sortCapacity; stageMask <<= 1u) {
+        glUniform1ui(glGetUniformLocation(g_gpu.bitonicSortCS, "uStageMask"), stageMask);
+        for (GLuint stepMask = stageMask >> 1u; stepMask > 0u; stepMask >>= 1u) {
+            glUniform1ui(glGetUniformLocation(g_gpu.bitonicSortCS, "uStepMask"), stepMask);
+            glDispatchCompute((sortCapacity + 255u) / 256u, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+    }
 
-    glUseProgram(g_gpu.scanBlocksCS);
-    glUniform1ui(glGetUniformLocation(g_gpu.scanBlocksCS, "uNumBins"), kGPUSortBinCount);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
-    glDispatchCompute(kGPUSortBlockCount, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-    glUseProgram(g_gpu.scanTopCS);
-    glUniform1ui(glGetUniformLocation(g_gpu.scanTopCS, "uNumBlocks"), kGPUSortBlockCount);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
-    glDispatchCompute(1, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-    glUseProgram(g_gpu.addOffsetsCS);
-    glUniform1ui(glGetUniformLocation(g_gpu.addOffsetsCS, "uNumBins"), kGPUSortBinCount);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, g_gpu.blockSumsSSBO);
-    glDispatchCompute(kGPUSortBlockCount, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-    ClearGPUUIntBuffer(g_gpu.binCountersSSBO, kGPUSortBinCount);
-
-    glUseProgram(g_gpu.scatterCS);
-    glUniform1ui(glGetUniformLocation(g_gpu.scatterCS, "uNumSplats"), static_cast<GLuint>(n));
+    glUseProgram(g_gpu.extractSortedIndicesCS);
+    glUniform1ui(glGetUniformLocation(g_gpu.extractSortedIndicesCS, "uNumSplats"), static_cast<GLuint>(n));
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, g_gpu.sortedIndicesSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, g_gpu.binCountersSSBO);
     glDispatchCompute((static_cast<GLuint>(n) + 255u) / 256u, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
@@ -2749,34 +2864,53 @@ extern "C" EXPORT void renderPointCloud() {
                     splat.position[2] - camPos[2]
                 };
 
-                sortData.projValue = vec[0] * viewDir[0] + vec[1] * viewDir[1] + vec[2] * viewDir[2];
+                float viewPosition[3] = {};
+                TransformPointMat4(viewMatrix, splat.position, viewPosition);
+                sortData.projValue = -viewPosition[2];
 
                 sortData.distanceSquared = vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2];
 
                 sortData.isBackfacing = (sortData.projValue <= 0);
 
-                if (!sortData.isBackfacing) {
-                    float distanceFactor = sortData.distanceSquared * 0.001f;
-                    if (sortData.projValue > 0.001f) {
-                        distanceFactor /= sortData.projValue;
-                    }
-                    sortData.sortKey = sortData.projValue + distanceFactor;
-                }
-                else {
-                    sortData.sortKey = sortData.distanceSquared;
-                }
+                sortData.sortKey = sortData.projValue;
 
                 g_splatSortCache.push_back(sortData);
             }
 
-            std::sort(g_splatSortCache.begin(), g_splatSortCache.end(),
-                [](const SplatSortData& a, const SplatSortData& b) -> bool {
-                    if (a.isBackfacing != b.isBackfacing) return a.isBackfacing;
+            if (g_enableFastApproximateSorting) {
+                std::sort(g_splatSortCache.begin(), g_splatSortCache.end(),
+                    [](const SplatSortData& a, const SplatSortData& b) -> bool {
+                        if (a.isBackfacing != b.isBackfacing) return a.isBackfacing;
 
-                    if (a.isBackfacing) return a.distanceSquared > b.distanceSquared;
+                        if (a.isBackfacing) return a.distanceSquared > b.distanceSquared;
 
-                    return a.sortKey > b.sortKey;
-                });
+                        float aKey = a.sortKey;
+                        float bKey = b.sortKey;
+                        float aDistanceFactor = a.distanceSquared * 0.001f;
+                        float bDistanceFactor = b.distanceSquared * 0.001f;
+                        if (a.sortKey > 0.001f) {
+                            aDistanceFactor /= a.sortKey;
+                        }
+                        if (b.sortKey > 0.001f) {
+                            bDistanceFactor /= b.sortKey;
+                        }
+                        aKey += aDistanceFactor;
+                        bKey += bDistanceFactor;
+                        return aKey > bKey;
+                    });
+            }
+            else {
+                std::stable_sort(g_splatSortCache.begin(), g_splatSortCache.end(),
+                    [](const SplatSortData& a, const SplatSortData& b) -> bool {
+                        if (a.isBackfacing != b.isBackfacing) return !a.isBackfacing;
+
+                        if (fabs(a.sortKey - b.sortKey) > 1.0e-5f) return a.sortKey > b.sortKey;
+
+                        if (fabs(a.distanceSquared - b.distanceSquared) > 1.0e-4f) return a.distanceSquared > b.distanceSquared;
+
+                        return a.index < b.index;
+                    });
+            }
 
             g_splatSortIndices.resize(g_splatSortCache.size());
             for (size_t i = 0; i < g_splatSortCache.size(); ++i) {

@@ -49,6 +49,8 @@ extern "C" {
     EXPORT void ClearSplatObjects();
     EXPORT void SetSHRenderDegree(int degree);
     EXPORT int GetSHRenderDegree();
+    EXPORT void SetFastApproximateSortingEnabled(int enabled);
+    EXPORT int GetFastApproximateSortingEnabled();
 
     // Report an axis-aligned bounds box for the loaded splats.
     EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz);

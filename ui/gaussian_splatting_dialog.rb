@@ -311,6 +311,78 @@ module GaussianPoints
                 border-color: rgba(155, 92, 22, 0.24);
                 background: rgba(155, 92, 22, 0.08);
               }
+
+              .toggle-card {
+                margin-top: 12px;
+                padding: 14px;
+                border-radius: 14px;
+                border: 1px solid var(--line);
+                background: rgba(255,255,255,0.76);
+              }
+
+              .toggle-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 14px;
+              }
+
+              .toggle-copy strong {
+                display: block;
+                font-size: 14px;
+                margin-bottom: 4px;
+              }
+
+              .toggle-copy span {
+                display: block;
+                color: var(--muted);
+                font-size: 12px;
+                line-height: 1.45;
+              }
+
+              .switch {
+                position: relative;
+                display: inline-flex;
+                width: 52px;
+                height: 30px;
+                flex: 0 0 auto;
+              }
+
+              .switch input {
+                opacity: 0;
+                width: 0;
+                height: 0;
+              }
+
+              .slider {
+                position: absolute;
+                inset: 0;
+                cursor: pointer;
+                background: rgba(108, 97, 88, 0.25);
+                border-radius: 999px;
+                transition: background 0.15s ease;
+              }
+
+              .slider:before {
+                content: "";
+                position: absolute;
+                height: 24px;
+                width: 24px;
+                left: 3px;
+                top: 3px;
+                background: white;
+                border-radius: 50%;
+                box-shadow: 0 4px 10px rgba(33, 26, 21, 0.2);
+                transition: transform 0.15s ease;
+              }
+
+              .switch input:checked + .slider {
+                background: linear-gradient(135deg, var(--accent), #d07f52);
+              }
+
+              .switch input:checked + .slider:before {
+                transform: translateX(22px);
+              }
             </style>
           </head>
           <body>
@@ -385,6 +457,18 @@ module GaussianPoints
                     <span>3 · Full</span>
                   </div>
                 </div>
+                <div class="toggle-card">
+                  <div class="toggle-row">
+                    <div class="toggle-copy">
+                      <strong>Acceleration</strong>
+                      <span>Uses the old fast approximate sorting path for higher FPS. Can reintroduce flickering at distance.</span>
+                    </div>
+                    <label class="switch">
+                      <input id="fastApproximateSorting" type="checkbox" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
                 <div class="secondary-row">
                   <button class="mini" data-action="initialize">Initialize</button>
                   <button class="mini" data-action="render_now">Show Now</button>
@@ -405,6 +489,7 @@ module GaussianPoints
               const upAxisMode = document.getElementById('upAxisMode');
               const shDegree = document.getElementById('shDegree');
               const shDegreeValue = document.getElementById('shDegreeValue');
+              const fastApproximateSorting = document.getElementById('fastApproximateSorting');
 
               function setStatus(message, level) {
                 statusBar.textContent = message;
@@ -418,6 +503,7 @@ module GaussianPoints
                 upAxisMode.value = payload.up_axis_mode || 'swap_b';
                 shDegree.value = String(payload.sh_render_degree ?? 3);
                 shDegreeValue.textContent = shDegree.value;
+                fastApproximateSorting.checked = payload.fast_approximate_sorting === true;
                 if (payload.message) {
                   setStatus(payload.message, payload.level || '');
                 }
@@ -446,6 +532,11 @@ module GaussianPoints
                 sketchup.set_sh_render_degree(shDegree.value);
               });
 
+              fastApproximateSorting.addEventListener('change', () => {
+                setStatus('Switching render acceleration mode...', '');
+                sketchup.set_fast_approximate_sorting(fastApproximateSorting.checked ? 'true' : 'false');
+              });
+
               document.addEventListener('DOMContentLoaded', () => {
                 sketchup.dialog_ready();
               });
@@ -470,6 +561,16 @@ module GaussianPoints
           degree = GaussianPoints::GaussianSplats.set_sh_render_degree(value)
           GaussianPoints::GaussianSplats.render_splats
           push_state("SH render level set to #{degree}. Compare 0 against 3 live in the same camera view.", 'ok')
+        end
+
+        @@dialog.add_action_callback('set_fast_approximate_sorting') do |_ctx, value|
+          enabled = GaussianPoints::GaussianSplats.set_fast_approximate_sorting_enabled(value)
+          GaussianPoints::GaussianSplats.render_splats
+          if enabled
+            push_state('Acceleration enabled. Fast legacy sorting is active, so FPS should improve but distant flickering can return.', 'warn')
+          else
+            push_state('Acceleration disabled. Stable anti-flicker sorting is active.', 'ok')
+          end
         end
 
         @@dialog.add_action_callback('initialize') do |_ctx|

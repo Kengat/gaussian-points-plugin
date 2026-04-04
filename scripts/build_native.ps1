@@ -60,17 +60,27 @@ function Invoke-NativeProjectBuild {
     throw "MSBuild failed for $Name with exit code $exitCode and did not produce $DllName."
   }
 
-  if ($exitCode -ne 0 -and (Test-Path $builtDll)) {
-    Write-Warning "MSBuild returned exit code $exitCode for $Name, but $DllName was produced. Continuing."
-  }
-
   if (-not (Test-Path $builtDll)) {
     throw "$Name build finished without $DllName."
+  }
+
+  $builtDllInfo = Get-Item -LiteralPath $builtDll
+  if ($builtDllInfo.Length -le 0) {
+    throw "$Name build produced an empty $DllName. Aborting before runtime copy."
+  }
+
+  if ($exitCode -ne 0) {
+    Write-Warning "MSBuild returned exit code $exitCode for $Name, but $DllName was produced. Continuing."
   }
 
   $runtimeDir = Split-Path -Parent $RuntimeDestination
   New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
   Copy-Item -LiteralPath $builtDll -Destination $RuntimeDestination -Force
+
+  $runtimeDllInfo = Get-Item -LiteralPath $RuntimeDestination
+  if ($runtimeDllInfo.Length -le 0) {
+    throw "Runtime copy for $Name resulted in an empty $DllName."
+  }
 
   [PSCustomObject]@{
     Target = $Name

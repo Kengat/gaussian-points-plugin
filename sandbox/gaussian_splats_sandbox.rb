@@ -9,6 +9,7 @@ module GaussianPoints
     PREF_NAMESPACE = 'GaussianPoints'.freeze
     PREF_UP_AXIS_KEY = 'gaussian_splats_up_axis'.freeze
     PREF_SH_RENDER_DEGREE_KEY = 'gaussian_splats_sh_render_degree'.freeze
+    PREF_FAST_APPROXIMATE_SORTING_KEY = 'gaussian_splats_fast_approximate_sorting'.freeze
     ORIENTATION_LEGACY = 'legacy'.freeze
     ORIENTATION_SWAP_A = 'swap_a'.freeze
     ORIENTATION_SWAP_B = 'swap_b'.freeze
@@ -103,6 +104,22 @@ module GaussianPoints
       GaussianPoints::NativePaths.bridge_dll
     end
 
+    def self.fast_approximate_sorting_enabled?
+      Sketchup.read_default(PREF_NAMESPACE, PREF_FAST_APPROXIMATE_SORTING_KEY, false) == true
+    rescue StandardError
+      false
+    end
+
+    def self.set_fast_approximate_sorting_enabled(value)
+      enabled = (value == true || value.to_s == 'true' || value.to_s == '1')
+      Sketchup.write_default(PREF_NAMESPACE, PREF_FAST_APPROXIMATE_SORTING_KEY, enabled)
+      apply_fast_approximate_sorting(enabled)
+      Sketchup.active_model&.active_view&.invalidate
+      enabled
+    rescue StandardError
+      false
+    end
+
     def self.renderer_dll_path
       first_valid_dll(
         File.join(plugin_dir, 'runtime', 'GaussianSplatRenderer.dll'),
@@ -156,6 +173,15 @@ module GaussianPoints
         loaded: loaded?,
         up_axis_mode: up_axis_mode,
         sh_render_degree: native_sh_degree,
+        fast_approximate_sorting: begin
+          if @renderer_dll_loaded && @get_fast_approximate_sorting_enabled
+            @get_fast_approximate_sorting_enabled.call != 0
+          else
+            fast_approximate_sorting_enabled?
+          end
+        rescue StandardError
+          fast_approximate_sorting_enabled?
+        end,
         sandbox_dir: plugin_dir,
         hook_loaded: @hook_dll_loaded == true,
         renderer_loaded: @renderer_dll_loaded == true,
@@ -323,6 +349,26 @@ module GaussianPoints
         end
 
         begin
+          @set_fast_approximate_sorting_enabled = Fiddle::Function.new(
+            @renderer_dll['SetFastApproximateSortingEnabled'],
+            [Fiddle::TYPE_INT],
+            Fiddle::TYPE_VOID
+          )
+        rescue Fiddle::DLError
+          @set_fast_approximate_sorting_enabled = nil
+        end
+
+        begin
+          @get_fast_approximate_sorting_enabled = Fiddle::Function.new(
+            @renderer_dll['GetFastApproximateSortingEnabled'],
+            [],
+            Fiddle::TYPE_INT
+          )
+        rescue Fiddle::DLError
+          @get_fast_approximate_sorting_enabled = nil
+        end
+
+        begin
           @get_splat_bounds = Fiddle::Function.new(
             @renderer_dll['GetSplatBounds'],
             [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
@@ -360,6 +406,7 @@ module GaussianPoints
       @install_all_hooks.call
       @initialized = true
       apply_sh_render_degree(sh_render_degree)
+      apply_fast_approximate_sorting(fast_approximate_sorting_enabled?)
       puts 'Gaussian splat hooks installed'
       true
     rescue StandardError => e
@@ -520,6 +567,15 @@ module GaussianPoints
       return false unless @set_sh_render_degree
 
       @set_sh_render_degree.call(normalize_sh_render_degree(degree))
+      true
+    end
+
+    def self.apply_fast_approximate_sorting(enabled = fast_approximate_sorting_enabled?)
+      return false unless setup_dlls
+      return false unless @renderer_dll_loaded
+      return false unless @set_fast_approximate_sorting_enabled
+
+      @set_fast_approximate_sorting_enabled.call(enabled ? 1 : 0)
       true
     end
 
