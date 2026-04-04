@@ -11,6 +11,7 @@
 #include <cmath>
 #include <algorithm>
 #include <map>
+#include <mutex>
 #include <numeric>
 
 #define NOMINMAX
@@ -25,6 +26,8 @@ typedef bool (*PFN_GET_CLIP_BOX_STATE)(int* enabled, double* center_xyz, double*
 static PFN_GET_MATRIX_BY_LOC GetMatrixByLocation = nullptr;
 static PFN_GET_CAMERA_STATE GetCameraState = nullptr;
 static PFN_GET_CLIP_BOX_STATE GetClipBoxState = nullptr;
+
+static void Normalize3(float* vector);
 
 struct NativeClipBoxState {
     bool enabled = false;
@@ -43,7 +46,7 @@ static bool g_dataReady = false;
 static GLuint g_gaussTexture = 0;
 static bool g_textureInitialized = false;
 
-// Runtime representation of a single billboarded gaussian splat.
+// Runtime representation of a single gaussian splat after import/object transforms.
 struct GaussSplat {
     float position[3];
     float color[4];    // R, G, B, A
@@ -51,10 +54,34 @@ struct GaussSplat {
     float rotation[4];
     float basis_x[3];
     float basis_y[3];
+    float basis_z[3];
+    float sh_coeffs[48];
+    float world_to_local_dir[9];
+    int sh_degree = 0;
     int use_custom_basis = 0;
+    int use_sh = 0;
     int highlight_mode = 0;
 };
 static std::vector<GaussSplat> g_splats;
+
+static constexpr float SH_C0 = 0.28209479177387814f;
+static constexpr float SH_C1 = 0.4886025119029199f;
+static const float SH_C2[5] = {
+    1.0925484305920792f,
+    -1.0925484305920792f,
+    0.31539156525252005f,
+    -1.0925484305920792f,
+    0.5462742152960396f
+};
+static const float SH_C3[7] = {
+    -0.5900435899266435f,
+    2.890611442640554f,
+    -0.4570457994644658f,
+    0.3731763325901154f,
+    -0.4570457994644658f,
+    1.445305721320277f,
+    -0.5900435899266435f
+};
 
 struct SplatObject {
     std::string id;
@@ -108,13 +135,23 @@ struct SplatSortData {
     bool isBackfacing;
 };
 static std::vector<SplatSortData> g_splatSortCache;
+static std::recursive_mutex g_splatStateMutex;
 
 static float g_lastCamPos[3] = { 0, 0, 0 };
 static float g_lastViewDir[3] = { 0, 0, 0 };
 static int g_framesSinceLastSort = 0;
-static const int SORT_EVERY_N_FRAMES = 2;
+static const int SORT_EVERY_N_FRAMES = 6;
 static NativeClipBoxState g_lastClipBoxState = {};
 static bool g_hasLastClipBoxState = false;
+static float g_lastGeometryCamPos[3] = { 0, 0, 0 };
+static float g_lastGeometryViewDir[3] = { 0, 0, 0 };
+static int g_lastGeometryViewportWidth = 0;
+static int g_lastGeometryViewportHeight = 0;
+static int g_lastGeometryPerspective = 1;
+static int g_framesSinceLastGeometryUpdate = 0;
+static const int GEOMETRY_UPDATE_EVERY_N_FRAMES = 2;
+static bool g_hasGeometryState = false;
+static const bool g_enableDynamicSorting = true;
 
 static GLuint g_splatShader = 0;
 static GLuint g_outlineCompositeShader = 0;
@@ -126,6 +163,13 @@ static GLuint g_outlineQuadVAO = 0;
 static GLuint g_outlineQuadVBO = 0;
 static int g_outlineViewportWidth = 0;
 static int g_outlineViewportHeight = 0;
+static const bool g_enableHighlightRendering = false;
+// Render bisection stage:
+// 0 = normal path
+// 1 = stop after camera/view/projection fetch
+// 2 = stop after geometry update
+// 3 = stop after clip-box snapshot
+static const int g_renderBisectStage = 0;
 
 static void LogRenderer(const char* format, ...) {
     char buffer[1024]; va_list args; va_start(args, format);
@@ -263,6 +307,302 @@ static void ComputeBasisVectors(const GaussSplat& splat, float* out_basis_x, flo
     out_basis_y[0] = splat.scale[1] * rotMatrix[4];
     out_basis_y[1] = splat.scale[1] * rotMatrix[5];
     out_basis_y[2] = splat.scale[1] * rotMatrix[6];
+}
+
+static float Dot3(const float* a, const float* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static void CopyIdentity3x3(float* matrix) {
+    memset(matrix, 0, sizeof(float) * 9);
+    matrix[0] = 1.0f;
+    matrix[4] = 1.0f;
+    matrix[8] = 1.0f;
+}
+
+static void MultiplyMat3Vec(const float* matrix, const float* vector, float* result) {
+    result[0] = matrix[0] * vector[0] + matrix[1] * vector[1] + matrix[2] * vector[2];
+    result[1] = matrix[3] * vector[0] + matrix[4] * vector[1] + matrix[5] * vector[2];
+    result[2] = matrix[6] * vector[0] + matrix[7] * vector[1] + matrix[8] * vector[2];
+}
+
+static void TransformPointMat4(const float* matrix, const float* point, float* result) {
+    result[0] = matrix[0] * point[0] + matrix[1] * point[1] + matrix[2] * point[2] + matrix[3];
+    result[1] = matrix[4] * point[0] + matrix[5] * point[1] + matrix[6] * point[2] + matrix[7];
+    result[2] = matrix[8] * point[0] + matrix[9] * point[1] + matrix[10] * point[2] + matrix[11];
+}
+
+static void ComputeThreeBasisVectorsFromQuaternion(
+    float qw, float qx, float qy, float qz,
+    float sx, float sy, float sz,
+    float* out_basis_x,
+    float* out_basis_y,
+    float* out_basis_z) {
+    float rotMatrix[16];
+    QuaternionToMatrix(qw, qx, qy, qz, rotMatrix);
+    // Extract columns (not rows) to match the reference 3DGS covariance convention:
+    // Sigma = R^T * S^2 * R, where columns of R are the local-to-world basis vectors.
+    out_basis_x[0] = sx * rotMatrix[0];
+    out_basis_x[1] = sx * rotMatrix[4];
+    out_basis_x[2] = sx * rotMatrix[8];
+    out_basis_y[0] = sy * rotMatrix[1];
+    out_basis_y[1] = sy * rotMatrix[5];
+    out_basis_y[2] = sy * rotMatrix[9];
+    out_basis_z[0] = sz * rotMatrix[2];
+    out_basis_z[1] = sz * rotMatrix[6];
+    out_basis_z[2] = sz * rotMatrix[10];
+}
+
+static void ComputeCovarianceFromBasisVectors(const GaussSplat& splat, float* out_cov3d) {
+    const float* basis_vectors[3] = { splat.basis_x, splat.basis_y, splat.basis_z };
+    out_cov3d[0] = out_cov3d[1] = out_cov3d[2] = out_cov3d[3] = out_cov3d[4] = out_cov3d[5] = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        const float* basis = basis_vectors[i];
+        out_cov3d[0] += basis[0] * basis[0];
+        out_cov3d[1] += basis[0] * basis[1];
+        out_cov3d[2] += basis[0] * basis[2];
+        out_cov3d[3] += basis[1] * basis[1];
+        out_cov3d[4] += basis[1] * basis[2];
+        out_cov3d[5] += basis[2] * basis[2];
+    }
+}
+
+static void BuildWorldToLocalDirMatrix(const SplatObject& object, double sx, double sy, double sz, float* out_matrix) {
+    const double inv_sx = fabs(sx) > 1.0e-8 ? (1.0 / sx) : 1.0;
+    const double inv_sy = fabs(sy) > 1.0e-8 ? (1.0 / sy) : 1.0;
+    const double inv_sz = fabs(sz) > 1.0e-8 ? (1.0 / sz) : 1.0;
+
+    out_matrix[0] = static_cast<float>(object.axes_xyz[0] * inv_sx);
+    out_matrix[1] = static_cast<float>(object.axes_xyz[1] * inv_sx);
+    out_matrix[2] = static_cast<float>(object.axes_xyz[2] * inv_sx);
+    out_matrix[3] = static_cast<float>(object.axes_xyz[3] * inv_sy);
+    out_matrix[4] = static_cast<float>(object.axes_xyz[4] * inv_sy);
+    out_matrix[5] = static_cast<float>(object.axes_xyz[5] * inv_sy);
+    out_matrix[6] = static_cast<float>(object.axes_xyz[6] * inv_sz);
+    out_matrix[7] = static_cast<float>(object.axes_xyz[7] * inv_sz);
+    out_matrix[8] = static_cast<float>(object.axes_xyz[8] * inv_sz);
+}
+
+static void EvaluateSHColor(const GaussSplat& splat, const float* camera_position, float* out_rgb) {
+    const float world_dir[3] = {
+        camera_position[0] - splat.position[0],
+        camera_position[1] - splat.position[1],
+        camera_position[2] - splat.position[2]
+    };
+    float local_dir[3] = {};
+    MultiplyMat3Vec(splat.world_to_local_dir, world_dir, local_dir);
+    Normalize3(local_dir);
+
+    const float x = local_dir[0];
+    const float y = local_dir[1];
+    const float z = local_dir[2];
+    const float xx = x * x;
+    const float yy = y * y;
+    const float zz = z * z;
+    const float xy = x * y;
+    const float yz = y * z;
+    const float xz = x * z;
+
+    for (int channel = 0; channel < 3; ++channel) {
+        const float* sh = &splat.sh_coeffs[channel * 16];
+        float result = SH_C0 * sh[0];
+        if (splat.sh_degree > 0) {
+            result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+            if (splat.sh_degree > 1) {
+                result = result +
+                    SH_C2[0] * xy * sh[4] +
+                    SH_C2[1] * yz * sh[5] +
+                    SH_C2[2] * (2.0f * zz - xx - yy) * sh[6] +
+                    SH_C2[3] * xz * sh[7] +
+                    SH_C2[4] * (xx - yy) * sh[8];
+                if (splat.sh_degree > 2) {
+                    result = result +
+                        SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
+                        SH_C3[1] * xy * z * sh[10] +
+                        SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[11] +
+                        SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[12] +
+                        SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[13] +
+                        SH_C3[5] * z * (xx - yy) * sh[14] +
+                        SH_C3[6] * x * (xx - 3.0f * yy) * sh[15];
+                }
+            }
+        }
+        out_rgb[channel] = std::max(result + 0.5f, 0.0f);
+    }
+}
+
+static bool ComputeProjectedBasis(
+    const GaussSplat& splat,
+    const float* view_matrix,
+    const float* projection_matrix,
+    const float* camera_position,
+    int is_perspective,
+    int viewport_width,
+    int viewport_height,
+    float radius_scale,
+    float* out_basis_x,
+    float* out_basis_y,
+    float* out_color) {
+    if (viewport_width <= 0 || viewport_height <= 0) {
+        return false;
+    }
+
+    const float world_position[3] = { splat.position[0], splat.position[1], splat.position[2] };
+    float view_position[3] = {};
+    TransformPointMat4(view_matrix, world_position, view_position);
+
+    const float clip_x =
+        projection_matrix[0] * view_position[0] +
+        projection_matrix[1] * view_position[1] +
+        projection_matrix[2] * view_position[2] +
+        projection_matrix[3];
+    const float clip_y =
+        projection_matrix[4] * view_position[0] +
+        projection_matrix[5] * view_position[1] +
+        projection_matrix[6] * view_position[2] +
+        projection_matrix[7];
+    const float clip_w =
+        projection_matrix[12] * view_position[0] +
+        projection_matrix[13] * view_position[1] +
+        projection_matrix[14] * view_position[2] +
+        projection_matrix[15];
+    if (!std::isfinite(clip_x) || !std::isfinite(clip_y) || !std::isfinite(clip_w) || fabs(clip_w) < 1.0e-6f) {
+        return false;
+    }
+
+    float cov_world[6] = {};
+    ComputeCovarianceFromBasisVectors(splat, cov_world);
+    const float cov_world_full[9] = {
+        cov_world[0], cov_world[1], cov_world[2],
+        cov_world[1], cov_world[3], cov_world[4],
+        cov_world[2], cov_world[4], cov_world[5]
+    };
+
+    const float view_rotation[9] = {
+        view_matrix[0], view_matrix[1], view_matrix[2],
+        view_matrix[4], view_matrix[5], view_matrix[6],
+        view_matrix[8], view_matrix[9], view_matrix[10]
+    };
+    float temp_cov[9] = {};
+    float cov_camera[9] = {};
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            temp_cov[row * 3 + col] =
+                view_rotation[row * 3 + 0] * cov_world_full[0 * 3 + col] +
+                view_rotation[row * 3 + 1] * cov_world_full[1 * 3 + col] +
+                view_rotation[row * 3 + 2] * cov_world_full[2 * 3 + col];
+        }
+    }
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            cov_camera[row * 3 + col] =
+                temp_cov[row * 3 + 0] * view_rotation[col * 3 + 0] +
+                temp_cov[row * 3 + 1] * view_rotation[col * 3 + 1] +
+                temp_cov[row * 3 + 2] * view_rotation[col * 3 + 2];
+        }
+    }
+
+    const float focal_x = fabs(projection_matrix[0]) * (0.5f * static_cast<float>(viewport_width));
+    const float focal_y = fabs(projection_matrix[5]) * (0.5f * static_cast<float>(viewport_height));
+    if (focal_x < 1.0e-6f || focal_y < 1.0e-6f) {
+        return false;
+    }
+
+    const float depth = std::max(fabs(view_position[2]), 1.0e-4f);
+    float J[6] = {};
+    if (is_perspective != 0) {
+        J[0] = focal_x / depth;
+        J[1] = 0.0f;
+        J[2] = (focal_x * view_position[0]) / (depth * depth);
+        J[3] = 0.0f;
+        J[4] = focal_y / depth;
+        J[5] = (focal_y * view_position[1]) / (depth * depth);
+    }
+    else {
+        J[0] = focal_x;
+        J[1] = 0.0f;
+        J[2] = 0.0f;
+        J[3] = 0.0f;
+        J[4] = focal_y;
+        J[5] = 0.0f;
+    }
+
+    float cov2d[4] = {};
+    for (int row = 0; row < 2; ++row) {
+        for (int col = 0; col < 2; ++col) {
+            float sum = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    sum += J[row * 3 + i] * cov_camera[i * 3 + j] * J[col * 3 + j];
+                }
+            }
+            cov2d[row * 2 + col] = sum;
+        }
+    }
+    const float cov2d_xx = cov2d[0] + 0.3f;
+    const float cov2d_xy = cov2d[1];
+    const float cov2d_yy = cov2d[3] + 0.3f;
+
+    const float trace = cov2d_xx + cov2d_yy;
+    const float det = cov2d_xx * cov2d_yy - cov2d_xy * cov2d_xy;
+    if (!std::isfinite(trace) || !std::isfinite(det) || det <= 0.0f) {
+        return false;
+    }
+
+    const float mid = 0.5f * trace;
+    const float discriminant = std::max(mid * mid - det, 0.0f);
+    const float root = sqrt(discriminant);
+    const float lambda_major = std::max(mid + root, 1.0e-4f);
+    const float lambda_minor = std::max(mid - root, 1.0e-4f);
+    const float radius_major = radius_scale * sqrt(lambda_major);
+    const float radius_minor = radius_scale * sqrt(lambda_minor);
+
+    float eig_major[2] = { 1.0f, 0.0f };
+    if (fabs(cov2d_xy) > 1.0e-6f) {
+        eig_major[0] = lambda_major - cov2d_yy;
+        eig_major[1] = cov2d_xy;
+        const float eig_length = sqrt(eig_major[0] * eig_major[0] + eig_major[1] * eig_major[1]);
+        if (eig_length > 1.0e-6f) {
+            eig_major[0] /= eig_length;
+            eig_major[1] /= eig_length;
+        }
+    }
+    const float eig_minor[2] = { -eig_major[1], eig_major[0] };
+
+    const float camera_basis_major[3] = {
+        eig_major[0] * (radius_major / focal_x) * (is_perspective != 0 ? depth : 1.0f),
+        eig_major[1] * (radius_major / focal_y) * (is_perspective != 0 ? depth : 1.0f),
+        0.0f
+    };
+    const float camera_basis_minor[3] = {
+        eig_minor[0] * (radius_minor / focal_x) * (is_perspective != 0 ? depth : 1.0f),
+        eig_minor[1] * (radius_minor / focal_y) * (is_perspective != 0 ? depth : 1.0f),
+        0.0f
+    };
+
+    const float world_rotation_t[9] = {
+        view_rotation[0], view_rotation[3], view_rotation[6],
+        view_rotation[1], view_rotation[4], view_rotation[7],
+        view_rotation[2], view_rotation[5], view_rotation[8]
+    };
+    MultiplyMat3Vec(world_rotation_t, camera_basis_major, out_basis_x);
+    MultiplyMat3Vec(world_rotation_t, camera_basis_minor, out_basis_y);
+
+    if (out_color) {
+        if (splat.use_sh != 0 && splat.sh_degree > 0) {
+            EvaluateSHColor(splat, camera_position, out_color);
+        }
+        else {
+            out_color[0] = splat.color[0];
+            out_color[1] = splat.color[1];
+            out_color[2] = splat.color[2];
+        }
+        out_color[3] = splat.color[3];
+    }
+
+    return
+        std::isfinite(out_basis_x[0]) && std::isfinite(out_basis_x[1]) && std::isfinite(out_basis_x[2]) &&
+        std::isfinite(out_basis_y[0]) && std::isfinite(out_basis_y[1]) && std::isfinite(out_basis_y[2]);
 }
 
 static void TransformVectorByObject(const SplatObject& object, double sx, double sy, double sz, const float* local_vec, float* out_vec) {
@@ -634,11 +974,19 @@ static bool EnsureOutlineTextures(int viewport_width, int viewport_height) {
     return status == GL_FRAMEBUFFER_COMPLETE;
 }
 
-static void UpdateHighlightVBOVertices(const NativeClipBoxState& clip_box_state) {
+static void UpdateHighlightVBOVertices(
+    const NativeClipBoxState& clip_box_state,
+    const float* view_matrix,
+    const float* projection_matrix,
+    const float* camera_position,
+    int is_perspective,
+    int viewport_width,
+    int viewport_height,
+    bool force_update) {
     if (!g_highlightMaskVBO.initialized || !g_outlineVBO.initialized) {
         return;
     }
-    if (!g_highlightMaskVBO.needsUpdate && !g_outlineVBO.needsUpdate) {
+    if (!force_update && !g_highlightMaskVBO.needsUpdate && !g_outlineVBO.needsUpdate) {
         return;
     }
     if (!HasHighlightedObjects() && g_outlineVBO.vertices.empty() && g_highlightMaskVBO.vertices.empty()) {
@@ -652,58 +1000,54 @@ static void UpdateHighlightVBOVertices(const NativeClipBoxState& clip_box_state)
     g_outlineVBO.vertices.clear();
     g_outlineVBO.indices.clear();
 
-    for (const SplatObject& object : g_splatObjects) {
-        if (!object.visible || object.highlight_mode == HIGHLIGHT_NONE || object.local_splats.empty()) {
+    for (const GaussSplat& splat : g_splats) {
+        if (splat.highlight_mode == HIGHLIGHT_NONE) {
             continue;
         }
 
-        const double sx = object.base_half_extents_xyz[0] > 1.0e-8 ? (object.half_extents_xyz[0] / object.base_half_extents_xyz[0]) : 1.0;
-        const double sy = object.base_half_extents_xyz[1] > 1.0e-8 ? (object.half_extents_xyz[1] / object.base_half_extents_xyz[1]) : 1.0;
-        const double sz = object.base_half_extents_xyz[2] > 1.0e-8 ? (object.half_extents_xyz[2] / object.base_half_extents_xyz[2]) : 1.0;
-
         float outline_color[4] = {};
-        HighlightColorForMode(object.highlight_mode, &outline_color[0], &outline_color[1], &outline_color[2], &outline_color[3]);
-        const float mask_scale = HighlightMaskScaleForMode(object.highlight_mode);
-        const float outline_scale = HighlightScaleForMode(object.highlight_mode);
-
-        for (const GaussSplat& local : object.local_splats) {
-            const double local_x = static_cast<double>(local.position[0]) * sx;
-            const double local_y = static_cast<double>(local.position[1]) * sy;
-            const double local_z = static_cast<double>(local.position[2]) * sz;
-            const float world_center[3] = {
-                static_cast<float>(object.center_xyz[0] + (object.axes_xyz[0] * local_x) + (object.axes_xyz[3] * local_y) + (object.axes_xyz[6] * local_z)),
-                static_cast<float>(object.center_xyz[1] + (object.axes_xyz[1] * local_x) + (object.axes_xyz[4] * local_y) + (object.axes_xyz[7] * local_z)),
-                static_cast<float>(object.center_xyz[2] + (object.axes_xyz[2] * local_x) + (object.axes_xyz[5] * local_y) + (object.axes_xyz[8] * local_z))
-            };
-            if (!IsPointInsideClipBox(clip_box_state, world_center[0], world_center[1], world_center[2])) {
-                continue;
-            }
-
-            float local_basis_x[3] = {};
-            float local_basis_y[3] = {};
-            float world_basis_x[3] = {};
-            float world_basis_y[3] = {};
-            float mask_basis_x[3] = {};
-            float mask_basis_y[3] = {};
-            ComputeBasisVectors(local, local_basis_x, local_basis_y);
-            TransformVectorByObject(object, sx, sy, sz, local_basis_x, world_basis_x);
-            TransformVectorByObject(object, sx, sy, sz, local_basis_y, world_basis_y);
-            memcpy(mask_basis_x, world_basis_x, sizeof(mask_basis_x));
-            memcpy(mask_basis_y, world_basis_y, sizeof(mask_basis_y));
-
-            for (int axis = 0; axis < 3; ++axis) {
-                mask_basis_x[axis] *= mask_scale;
-                mask_basis_y[axis] *= mask_scale;
-            }
-            AppendQuadVertices(&g_highlightMaskVBO, world_center, mask_basis_x, mask_basis_y, outline_color);
-
-            for (int axis = 0; axis < 3; ++axis) {
-                world_basis_x[axis] *= outline_scale;
-                world_basis_y[axis] *= outline_scale;
-            }
-
-            AppendQuadVertices(&g_outlineVBO, world_center, world_basis_x, world_basis_y, outline_color);
+        HighlightColorForMode(splat.highlight_mode, &outline_color[0], &outline_color[1], &outline_color[2], &outline_color[3]);
+        const float mask_scale = HighlightMaskScaleForMode(splat.highlight_mode);
+        const float outline_scale = HighlightScaleForMode(splat.highlight_mode);
+        if (!IsPointInsideClipBox(clip_box_state, splat.position[0], splat.position[1], splat.position[2])) {
+            continue;
         }
+
+        float mask_basis_x[3] = {};
+        float mask_basis_y[3] = {};
+        float outline_basis_x[3] = {};
+        float outline_basis_y[3] = {};
+        if (!ComputeProjectedBasis(
+            splat,
+            view_matrix,
+            projection_matrix,
+            camera_position,
+            is_perspective,
+            viewport_width,
+            viewport_height,
+            3.0f * mask_scale,
+            mask_basis_x,
+            mask_basis_y,
+            nullptr)) {
+            continue;
+        }
+        if (!ComputeProjectedBasis(
+            splat,
+            view_matrix,
+            projection_matrix,
+            camera_position,
+            is_perspective,
+            viewport_width,
+            viewport_height,
+            3.0f * outline_scale,
+            outline_basis_x,
+            outline_basis_y,
+            nullptr)) {
+            continue;
+        }
+
+        AppendQuadVertices(&g_highlightMaskVBO, splat.position, mask_basis_x, mask_basis_y, outline_color);
+        AppendQuadVertices(&g_outlineVBO, splat.position, outline_basis_x, outline_basis_y, outline_color);
     }
 
     if (g_highlightMaskVBO.vertices.empty()) {
@@ -790,6 +1134,7 @@ static SplatObject* FindSplatObject(const char* object_id) {
 }
 
 static void ResetSplatObjects() {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     g_splatObjects.clear();
     g_splats.clear();
     g_splatSortIndices.clear();
@@ -798,6 +1143,7 @@ static void ResetSplatObjects() {
 }
 
 static void RefreshWorldSplatsFromObjects() {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     g_splats.clear();
 
     for (const SplatObject& object : g_splatObjects) {
@@ -816,12 +1162,12 @@ static void RefreshWorldSplatsFromObjects() {
             world.position[0] = static_cast<float>(object.center_xyz[0] + (object.axes_xyz[0] * local_x) + (object.axes_xyz[3] * local_y) + (object.axes_xyz[6] * local_z));
             world.position[1] = static_cast<float>(object.center_xyz[1] + (object.axes_xyz[1] * local_x) + (object.axes_xyz[4] * local_y) + (object.axes_xyz[7] * local_z));
             world.position[2] = static_cast<float>(object.center_xyz[2] + (object.axes_xyz[2] * local_x) + (object.axes_xyz[5] * local_y) + (object.axes_xyz[8] * local_z));
-            float local_basis_x[3] = {};
-            float local_basis_y[3] = {};
-            ComputeBasisVectors(local, local_basis_x, local_basis_y);
-            TransformVectorByObject(object, sx, sy, sz, local_basis_x, world.basis_x);
-            TransformVectorByObject(object, sx, sy, sz, local_basis_y, world.basis_y);
+            TransformVectorByObject(object, sx, sy, sz, local.basis_x, world.basis_x);
+            TransformVectorByObject(object, sx, sy, sz, local.basis_y, world.basis_y);
+            TransformVectorByObject(object, sx, sy, sz, local.basis_z, world.basis_z);
+            BuildWorldToLocalDirMatrix(object, sx, sy, sz, world.world_to_local_dir);
             world.use_custom_basis = 1;
+            world.use_sh = local.use_sh;
             world.highlight_mode = object.highlight_mode;
             g_splats.push_back(world);
         }
@@ -927,9 +1273,14 @@ static void InitializeSplatVBO() {
     LogRenderer("Splat VBO initialized successfully (main VAO:%u, mask VAO:%u, outline VAO:%u).", g_splatVBO.vao, g_highlightMaskVBO.vao, g_outlineVBO.vao);
 }
 
-static void UpdateSplatVBOVertices() {
+static void UpdateSplatVBOVertices(
+    const float* view_matrix,
+    const float* projection_matrix,
+    const float* camera_position,
+    int is_perspective,
+    int viewport_width,
+    int viewport_height) {
     if (!g_splatVBO.initialized) { LogRenderer("DEBUG: UpdateVBOVertices skip - not inited"); return; }
-    if (!g_splatVBO.needsUpdate) { return; }
     if (g_splats.empty() && g_splatVBO.vertices.empty()) { g_splatVBO.needsUpdate = false; return; }
 
     LogRenderer("DEBUG: Entering UpdateSplatVBOVertices for %zu splats...", g_splats.size());
@@ -942,23 +1293,40 @@ static void UpdateSplatVBOVertices() {
     else {
         g_splatVBO.vertices.clear();
         g_splatVBO.vertices.reserve(g_splats.size() * 4);
-        float quadSize = 1.0f;
         for (size_t i = 0; i < g_splats.size(); ++i) {
             const GaussSplat& splat = g_splats[i];
             float rotatedXVec[3] = {};
             float rotatedYVec[3] = {};
-            ComputeBasisVectors(splat, rotatedXVec, rotatedYVec);
-            rotatedXVec[0] *= quadSize; rotatedXVec[1] *= quadSize; rotatedXVec[2] *= quadSize;
-            rotatedYVec[0] *= quadSize; rotatedYVec[1] *= quadSize; rotatedYVec[2] *= quadSize;
+            float color[4] = {};
+            if (!ComputeProjectedBasis(
+                splat,
+                view_matrix,
+                projection_matrix,
+                camera_position,
+                is_perspective,
+                viewport_width,
+                viewport_height,
+                3.0f,
+                rotatedXVec,
+                rotatedYVec,
+                color)) {
+                memset(rotatedXVec, 0, sizeof(rotatedXVec));
+                memset(rotatedYVec, 0, sizeof(rotatedYVec));
+                color[0] = color[1] = color[2] = 0.0f;
+                color[3] = 0.0f;
+            }
             SplatVBOData::VertexData v0, v1, v2, v3;
             v0.position[0] = splat.position[0] - rotatedXVec[0] - rotatedYVec[0]; v0.position[1] = splat.position[1] - rotatedXVec[1] - rotatedYVec[1]; v0.position[2] = splat.position[2] - rotatedXVec[2] - rotatedYVec[2]; v0.texCoord[0] = 0.0f; v0.texCoord[1] = 0.0f;
             v1.position[0] = splat.position[0] + rotatedXVec[0] - rotatedYVec[0]; v1.position[1] = splat.position[1] + rotatedXVec[1] - rotatedYVec[1]; v1.position[2] = splat.position[2] + rotatedXVec[2] - rotatedYVec[2]; v1.texCoord[0] = 1.0f; v1.texCoord[1] = 0.0f;
             v2.position[0] = splat.position[0] + rotatedXVec[0] + rotatedYVec[0]; v2.position[1] = splat.position[1] + rotatedXVec[1] + rotatedYVec[1]; v2.position[2] = splat.position[2] + rotatedXVec[2] + rotatedYVec[2]; v2.texCoord[0] = 1.0f; v2.texCoord[1] = 1.0f;
             v3.position[0] = splat.position[0] - rotatedXVec[0] + rotatedYVec[0]; v3.position[1] = splat.position[1] - rotatedXVec[1] + rotatedYVec[1]; v3.position[2] = splat.position[2] - rotatedXVec[2] + rotatedYVec[2]; v3.texCoord[0] = 0.0f; v3.texCoord[1] = 1.0f;
-            v0.color[0] = v1.color[0] = v2.color[0] = v3.color[0] = splat.color[0]; v0.color[1] = v1.color[1] = v2.color[1] = v3.color[1] = splat.color[1]; v0.color[2] = v1.color[2] = v2.color[2] = v3.color[2] = splat.color[2]; v0.color[3] = v1.color[3] = v2.color[3] = v3.color[3] = splat.color[3];
+            v0.color[0] = v1.color[0] = v2.color[0] = v3.color[0] = color[0];
+            v0.color[1] = v1.color[1] = v2.color[1] = v3.color[1] = color[1];
+            v0.color[2] = v1.color[2] = v2.color[2] = v3.color[2] = color[2];
+            v0.color[3] = v1.color[3] = v2.color[3] = v3.color[3] = color[3];
             g_splatVBO.vertices.push_back(v0); g_splatVBO.vertices.push_back(v1); g_splatVBO.vertices.push_back(v2); g_splatVBO.vertices.push_back(v3);
         }
-        UploadBufferData(&g_splatVBO, GL_STATIC_DRAW);
+        UploadBufferData(&g_splatVBO, GL_DYNAMIC_DRAW);
 
         g_splatSortIndices.resize(g_splats.size());
         std::iota(g_splatSortIndices.begin(), g_splatSortIndices.end(), 0);
@@ -1064,57 +1432,101 @@ static void Normalize3(float* vector) {
 static void CrossProduct(const float* v1, const float* v2, float* r) { r[0] = v1[1] * v2[2] - v1[2] * v2[1]; r[1] = v1[2] * v2[0] - v1[0] * v2[2]; r[2] = v1[0] * v2[1] - v1[1] * v2[0]; }
 
 extern "C" EXPORT void SetPointCloud(const double* points_in, int count) { LogRenderer("SetPointCloud called."); if (!points_in || count <= 0)return; LoadHookFunctions(); g_points.clear(); g_points.reserve(count * 6); for (int i = 0;i < count;++i) { g_points.push_back((float)points_in[i * 6 + 0]); g_points.push_back((float)points_in[i * 6 + 1]); g_points.push_back((float)points_in[i * 6 + 2]); g_points.push_back((float)points_in[i * 6 + 3] / 255.f); g_points.push_back((float)points_in[i * 6 + 4] / 255.f); g_points.push_back((float)points_in[i * 6 + 5] / 255.f); } g_dataReady = true; }
-extern "C" EXPORT void AddSplat(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float rotation, bool rotateVertical) { GaussSplat s = {}; s.position[0] = x;s.position[1] = y;s.position[2] = z; s.color[0] = r;s.color[1] = g;s.color[2] = b;s.color[3] = a; s.scale[0] = scaleX;s.scale[1] = scaleY; float an = rotation * M_PI / 180.f, ha = an * .5f, sn = sin(ha), cn = cos(ha); s.rotation[0] = cn; if (rotateVertical) { s.rotation[1] = sn;s.rotation[2] = 0;s.rotation[3] = 0; } else { s.rotation[1] = 0;s.rotation[2] = 0;s.rotation[3] = sn; } s.highlight_mode = HIGHLIGHT_NONE; g_splats.push_back(s); MarkSplatBuffersDirty(); }
-extern "C" EXPORT void AddSplatWithQuaternion(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float qw, float qx, float qy, float qz) { GaussSplat s = {}; s.position[0] = x;s.position[1] = y;s.position[2] = z; s.color[0] = r;s.color[1] = g;s.color[2] = b;s.color[3] = std::max(0.01f, std::min(a, 1.f)); s.scale[0] = scaleX;s.scale[1] = scaleY; float n = sqrt(qw * qw + qx * qx + qy * qy + qz * qz); if (n > 1e-5f) { s.rotation[0] = qw / n;s.rotation[1] = qx / n;s.rotation[2] = qy / n;s.rotation[3] = qz / n; } else { s.rotation[0] = 1;s.rotation[1] = 0;s.rotation[2] = 0;s.rotation[3] = 0; } s.highlight_mode = HIGHLIGHT_NONE; g_splats.push_back(s); MarkSplatBuffersDirty(); }
+extern "C" EXPORT void AddSplat(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float rotation, bool rotateVertical) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    GaussSplat s = {};
+    s.position[0] = x; s.position[1] = y; s.position[2] = z;
+    s.color[0] = r; s.color[1] = g; s.color[2] = b; s.color[3] = std::max(0.0f, std::min(a, 1.0f));
+    s.scale[0] = scaleX; s.scale[1] = scaleY;
+    float an = static_cast<float>(rotation * M_PI / 180.0);
+    float ha = an * 0.5f;
+    float sn = sin(ha);
+    float cn = cos(ha);
+    s.rotation[0] = cn;
+    if (rotateVertical) {
+        s.rotation[1] = sn; s.rotation[2] = 0.0f; s.rotation[3] = 0.0f;
+    }
+    else {
+        s.rotation[1] = 0.0f; s.rotation[2] = 0.0f; s.rotation[3] = sn;
+    }
+    ComputeThreeBasisVectorsFromQuaternion(s.rotation[0], s.rotation[1], s.rotation[2], s.rotation[3], scaleX, scaleY, std::min(scaleX, scaleY), s.basis_x, s.basis_y, s.basis_z);
+    CopyIdentity3x3(s.world_to_local_dir);
+    s.highlight_mode = HIGHLIGHT_NONE;
+    g_splats.push_back(s);
+    MarkSplatBuffersDirty();
+}
+
+extern "C" EXPORT void AddSplatWithQuaternion(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float qw, float qx, float qy, float qz) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    GaussSplat s = {};
+    s.position[0] = x; s.position[1] = y; s.position[2] = z;
+    s.color[0] = r; s.color[1] = g; s.color[2] = b; s.color[3] = std::max(0.0f, std::min(a, 1.0f));
+    s.scale[0] = scaleX; s.scale[1] = scaleY;
+    float n = sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+    if (n > 1e-5f) {
+        s.rotation[0] = qw / n; s.rotation[1] = qx / n; s.rotation[2] = qy / n; s.rotation[3] = qz / n;
+    }
+    else {
+        s.rotation[0] = 1.0f; s.rotation[1] = 0.0f; s.rotation[2] = 0.0f; s.rotation[3] = 0.0f;
+    }
+    ComputeThreeBasisVectorsFromQuaternion(s.rotation[0], s.rotation[1], s.rotation[2], s.rotation[3], scaleX, scaleY, std::min(scaleX, scaleY), s.basis_x, s.basis_y, s.basis_z);
+    CopyIdentity3x3(s.world_to_local_dir);
+    s.highlight_mode = HIGHLIGHT_NONE;
+    g_splats.push_back(s);
+    MarkSplatBuffersDirty();
+}
 extern "C" EXPORT void ClearSplats() { LogRenderer("ClearSplats called."); ResetSplatObjects(); }
 extern "C" EXPORT void ClearSplatObjects() { ResetSplatObjects(); }
 extern "C" EXPORT void SetSplatSortingMode(SplatSortingMode mode) { if (mode >= 0 && mode <= 5) { g_sortingMode = mode; LogRenderer("Sort mode set %d.", mode); } else LogRenderer("Invalid sort mode %d.", mode); }
 
-static void RenderSingleSplatIM(const GaussSplat& splat, const float* viewMatrix, const float* projectionMatrix) { float basis_x[3] = {}; float basis_y[3] = {}; ComputeBasisVectors(splat, basis_x, basis_y); glColor4f(splat.color[0], splat.color[1], splat.color[2], splat.color[3]); glBegin(GL_QUADS); glTexCoord2f(0, 0);glVertex3f(splat.position[0] - basis_x[0] - basis_y[0], splat.position[1] - basis_x[1] - basis_y[1], splat.position[2] - basis_x[2] - basis_y[2]); glTexCoord2f(1, 0);glVertex3f(splat.position[0] + basis_x[0] - basis_y[0], splat.position[1] + basis_x[1] - basis_y[1], splat.position[2] + basis_x[2] - basis_y[2]); glTexCoord2f(1, 1);glVertex3f(splat.position[0] + basis_x[0] + basis_y[0], splat.position[1] + basis_x[1] + basis_y[1], splat.position[2] + basis_x[2] + basis_y[2]); glTexCoord2f(0, 1);glVertex3f(splat.position[0] - basis_x[0] + basis_y[0], splat.position[1] - basis_x[1] + basis_y[1], splat.position[2] - basis_x[2] + basis_y[2]); glEnd(); }
+static void RenderSingleSplatIM(
+    const GaussSplat& splat,
+    const float* view_matrix,
+    const float* projection_matrix,
+    const float* camera_position,
+    int is_perspective,
+    int viewport_width,
+    int viewport_height) {
+    float basis_x[3] = {};
+    float basis_y[3] = {};
+    float color[4] = {};
+    if (!ComputeProjectedBasis(
+        splat,
+        view_matrix,
+        projection_matrix,
+        camera_position,
+        is_perspective,
+        viewport_width,
+        viewport_height,
+        3.0f,
+        basis_x,
+        basis_y,
+        color)) {
+        return;
+    }
+    glColor4f(color[0], color[1], color[2], color[3]);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex3f(splat.position[0] - basis_x[0] - basis_y[0], splat.position[1] - basis_x[1] - basis_y[1], splat.position[2] - basis_x[2] - basis_y[2]);
+    glTexCoord2f(1, 0); glVertex3f(splat.position[0] + basis_x[0] - basis_y[0], splat.position[1] + basis_x[1] - basis_y[1], splat.position[2] + basis_x[2] - basis_y[2]);
+    glTexCoord2f(1, 1); glVertex3f(splat.position[0] + basis_x[0] + basis_y[0], splat.position[1] + basis_x[1] + basis_y[1], splat.position[2] + basis_x[2] + basis_y[2]);
+    glTexCoord2f(0, 1); glVertex3f(splat.position[0] - basis_x[0] + basis_y[0], splat.position[1] - basis_x[1] + basis_y[1], splat.position[2] - basis_x[2] + basis_y[2]);
+    glEnd();
+}
 static void RenderSingleSplatIMWithBasis(const float* center, const float* basis_x, const float* basis_y, const float* color) { glColor4f(color[0], color[1], color[2], color[3]); glBegin(GL_QUADS); glTexCoord2f(0, 0);glVertex3f(center[0] - basis_x[0] - basis_y[0], center[1] - basis_x[1] - basis_y[1], center[2] - basis_x[2] - basis_y[2]); glTexCoord2f(1, 0);glVertex3f(center[0] + basis_x[0] - basis_y[0], center[1] + basis_x[1] - basis_y[1], center[2] + basis_x[2] - basis_y[2]); glTexCoord2f(1, 1);glVertex3f(center[0] + basis_x[0] + basis_y[0], center[1] + basis_x[1] + basis_y[1], center[2] + basis_x[2] + basis_y[2]); glTexCoord2f(0, 1);glVertex3f(center[0] - basis_x[0] + basis_y[0], center[1] - basis_x[1] + basis_y[1], center[2] - basis_x[2] + basis_y[2]); glEnd(); }
 static void RenderHighlightedSplatsIM(const NativeClipBoxState& clip_box_state) {
-    for (const SplatObject& object : g_splatObjects) {
-        if (!object.visible || object.highlight_mode == HIGHLIGHT_NONE || object.local_splats.empty()) {
+    for (const GaussSplat& splat : g_splats) {
+        if (splat.highlight_mode == HIGHLIGHT_NONE) {
             continue;
         }
-
-        const double sx = object.base_half_extents_xyz[0] > 1.0e-8 ? (object.half_extents_xyz[0] / object.base_half_extents_xyz[0]) : 1.0;
-        const double sy = object.base_half_extents_xyz[1] > 1.0e-8 ? (object.half_extents_xyz[1] / object.base_half_extents_xyz[1]) : 1.0;
-        const double sz = object.base_half_extents_xyz[2] > 1.0e-8 ? (object.half_extents_xyz[2] / object.base_half_extents_xyz[2]) : 1.0;
         float outline_color[4] = {};
-        HighlightColorForMode(object.highlight_mode, &outline_color[0], &outline_color[1], &outline_color[2], &outline_color[3]);
-        const float outline_scale = HighlightScaleForMode(object.highlight_mode);
-
-        for (const GaussSplat& local : object.local_splats) {
-            const double local_x = static_cast<double>(local.position[0]) * sx;
-            const double local_y = static_cast<double>(local.position[1]) * sy;
-            const double local_z = static_cast<double>(local.position[2]) * sz;
-            const float world_center[3] = {
-                static_cast<float>(object.center_xyz[0] + (object.axes_xyz[0] * local_x) + (object.axes_xyz[3] * local_y) + (object.axes_xyz[6] * local_z)),
-                static_cast<float>(object.center_xyz[1] + (object.axes_xyz[1] * local_x) + (object.axes_xyz[4] * local_y) + (object.axes_xyz[7] * local_z)),
-                static_cast<float>(object.center_xyz[2] + (object.axes_xyz[2] * local_x) + (object.axes_xyz[5] * local_y) + (object.axes_xyz[8] * local_z))
-            };
-            if (!IsPointInsideClipBox(clip_box_state, world_center[0], world_center[1], world_center[2])) {
-                continue;
-            }
-
-            float local_basis_x[3] = {};
-            float local_basis_y[3] = {};
-            float world_basis_x[3] = {};
-            float world_basis_y[3] = {};
-            ComputeBasisVectors(local, local_basis_x, local_basis_y);
-            TransformVectorByObject(object, sx, sy, sz, local_basis_x, world_basis_x);
-            TransformVectorByObject(object, sx, sy, sz, local_basis_y, world_basis_y);
-            for (int axis = 0; axis < 3; ++axis) {
-                world_basis_x[axis] *= outline_scale;
-                world_basis_y[axis] *= outline_scale;
-            }
-
-            RenderSingleSplatIMWithBasis(world_center, world_basis_x, world_basis_y, outline_color);
+        HighlightColorForMode(splat.highlight_mode, &outline_color[0], &outline_color[1], &outline_color[2], &outline_color[3]);
+        if (!IsPointInsideClipBox(clip_box_state, splat.position[0], splat.position[1], splat.position[2])) {
+            continue;
         }
     }
 }
 extern "C" EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     // Bounds are consumed by the SketchUp-side proxy to keep clip planes stable.
     if (!out_min_xyz || !out_max_xyz || g_splats.empty()) {
         return 0;
@@ -1147,7 +1559,10 @@ extern "C" EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz) {
 static bool CheckGLCapabilities() { GLenum e = glewInit(); if (e != GLEW_OK) { LogRenderer("GLEW failed:%s", glewGetErrorString(e));return false; } if (!GLEW_VERSION_2_0 || !GLEW_ARB_vertex_buffer_object) { LogRenderer("WARN No VBO/Shader support");return false; } LogRenderer("OpenGL VBO/Shader support detected."); return true; }
 
 extern "C" EXPORT void renderPointCloud() {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    LogRenderer("CHK: renderPointCloud enter");
     LoadHookFunctions(); if (!GetMatrixByLocation) { LogRenderer("ERROR: GetMatrixByLocation is NULL, cannot proceed."); return; } if (!GetCameraState) { LogRenderer("ERROR: GetCameraState is NULL, cannot proceed."); return; }
+    LogRenderer("CHK: hook functions ready");
 
     static bool firstCall = true; static bool useVBO = false;
     if (firstCall) {
@@ -1165,12 +1580,7 @@ extern "C" EXPORT void renderPointCloud() {
     }
 
     if (g_splats.empty()) { return; }
-
-    if (g_splatVBO.needsUpdate) {
-        LogRenderer("DEBUG: renderPointCloud - needsUpdate=true, calling UpdateSplatVBOVertices()");
-        UpdateSplatVBOVertices();
-        if (!g_splats.empty()) { LogRenderer("DEBUG: renderPointCloud - VBO updated, calling UpdateSplatEBO() for initial order."); UpdateSplatEBO(); }
-    }
+    LogRenderer("CHK: non-empty splat set (%zu splats)", g_splats.size());
 
     float viewMatrix[16] = { 0 };
     float mvpMatrix[16] = { 0 };
@@ -1182,9 +1592,15 @@ extern "C" EXPORT void renderPointCloud() {
     int isPerspective = 1;
     int viewLoc = 14;
     int projLoc = 15;
+    LogRenderer("CHK: before GetMatrixByLocation(view)");
     bool hasView = GetMatrixByLocation(viewLoc, viewMatrix);
+    LogRenderer("CHK: after GetMatrixByLocation(view) => %d", hasView ? 1 : 0);
+    LogRenderer("CHK: before GetMatrixByLocation(proj)");
     bool hasProj = GetMatrixByLocation(projLoc, projectionMatrix);
+    LogRenderer("CHK: after GetMatrixByLocation(proj) => %d", hasProj ? 1 : 0);
+    LogRenderer("CHK: before GetCameraState");
     bool hasCamera = GetCameraState(camPos, camTarget, camUp, &isPerspective);
+    LogRenderer("CHK: after GetCameraState => %d", hasCamera ? 1 : 0);
 
     if (!hasView || !hasProj) {
         LogRenderer("WARN: Missing View(loc%d)=%d or Projection(loc%d)=%d matrix. Skipping render.", viewLoc, hasView, projLoc, hasProj);
@@ -1202,6 +1618,57 @@ extern "C" EXPORT void renderPointCloud() {
     Normalize3(camUp);
 
     MultiplyMat4(projectionMatrix, viewMatrix, mvpMatrix);
+    GLint viewport[4] = { 0, 0, 1, 1 };
+    glGetIntegerv(GL_VIEWPORT, viewport);
+
+    if (g_renderBisectStage == 1) {
+        LogRenderer("BISect stage 1: stopping after camera/view/projection fetch.");
+        return;
+    }
+
+    const float geometryPosDistSq =
+        (camPos[0] - g_lastGeometryCamPos[0]) * (camPos[0] - g_lastGeometryCamPos[0]) +
+        (camPos[1] - g_lastGeometryCamPos[1]) * (camPos[1] - g_lastGeometryCamPos[1]) +
+        (camPos[2] - g_lastGeometryCamPos[2]) * (camPos[2] - g_lastGeometryCamPos[2]);
+    const float geometryDirDiff =
+        (viewDir[0] - g_lastGeometryViewDir[0]) * (viewDir[0] - g_lastGeometryViewDir[0]) +
+        (viewDir[1] - g_lastGeometryViewDir[1]) * (viewDir[1] - g_lastGeometryViewDir[1]) +
+        (viewDir[2] - g_lastGeometryViewDir[2]) * (viewDir[2] - g_lastGeometryViewDir[2]);
+    const bool geometryStateChanged =
+        !g_hasGeometryState ||
+        geometryPosDistSq > 0.0001f ||
+        geometryDirDiff > 0.000001f ||
+        g_lastGeometryViewportWidth != viewport[2] ||
+        g_lastGeometryViewportHeight != viewport[3] ||
+        g_lastGeometryPerspective != isPerspective;
+    bool geometryUpdated = false;
+
+    if (useVBO) {
+        g_framesSinceLastGeometryUpdate++;
+        bool needGeometryUpdate = g_splatVBO.needsUpdate || geometryStateChanged;
+        if (geometryStateChanged && !g_splatVBO.needsUpdate && g_framesSinceLastGeometryUpdate < GEOMETRY_UPDATE_EVERY_N_FRAMES) {
+            needGeometryUpdate = false;
+        }
+        if (needGeometryUpdate) {
+            LogRenderer("DEBUG: Rebuilding projected splat vertices for current camera.");
+            UpdateSplatVBOVertices(viewMatrix, projectionMatrix, camPos, isPerspective, viewport[2], viewport[3]);
+            UpdateSplatEBO();
+            memcpy(g_lastGeometryCamPos, camPos, 3 * sizeof(float));
+            memcpy(g_lastGeometryViewDir, viewDir, 3 * sizeof(float));
+            g_lastGeometryViewportWidth = viewport[2];
+            g_lastGeometryViewportHeight = viewport[3];
+            g_lastGeometryPerspective = isPerspective;
+            g_framesSinceLastGeometryUpdate = 0;
+            g_hasGeometryState = true;
+            geometryUpdated = true;
+        }
+    }
+
+    if (g_renderBisectStage == 2) {
+        LogRenderer("BISect stage 2: stopping after geometry update.");
+        return;
+    }
+
     const NativeClipBoxState clipBoxState = FetchClipBoxStateSnapshot();
     const bool clipStateChanged = !g_hasLastClipBoxState || !ClipStatesEqual(clipBoxState, g_lastClipBoxState);
     if (clipStateChanged) {
@@ -1210,13 +1677,17 @@ extern "C" EXPORT void renderPointCloud() {
         g_outlineVBO.needsUpdate = true;
     }
 
-    if (useVBO && g_highlightMaskVBO.initialized && g_outlineVBO.initialized &&
-        (g_highlightMaskVBO.needsUpdate || g_outlineVBO.needsUpdate)) {
-        UpdateHighlightVBOVertices(clipBoxState);
+    if (g_enableHighlightRendering && useVBO && g_highlightMaskVBO.initialized && g_outlineVBO.initialized) {
+        UpdateHighlightVBOVertices(clipBoxState, viewMatrix, projectionMatrix, camPos, isPerspective, viewport[2], viewport[3], geometryUpdated);
+    }
+
+    if (g_renderBisectStage == 3) {
+        LogRenderer("BISect stage 3: stopping after clip-box snapshot.");
+        return;
     }
 
     bool sorting_done = false;
-    if (hasCamera) {
+    if (g_enableDynamicSorting && hasCamera) {
         bool needSorting = false;
 
         float posDistSq =
@@ -1255,7 +1726,7 @@ extern "C" EXPORT void renderPointCloud() {
 
                 SplatSortData sortData = {};
 
-                sortData.index = i;
+                sortData.index = static_cast<GLuint>(i);
 
                 float vec[3] = {
                     splat.position[0] - camPos[0],
@@ -1307,7 +1778,7 @@ extern "C" EXPORT void renderPointCloud() {
 
     if (sorting_done) { /* LogRenderer("DEBUG: Calling UpdateSplatEBO() after sort.");*/ UpdateSplatEBO(); }
 
-    GLint oldProg = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg); GLboolean blendEn = glIsEnabled(GL_BLEND); GLint oldBlendSrcRGB, oldBlendDstRGB, oldBlendSrcAlpha, oldBlendDstAlpha; glGetIntegerv(GL_BLEND_SRC_RGB, &oldBlendSrcRGB); glGetIntegerv(GL_BLEND_DST_RGB, &oldBlendDstRGB); glGetIntegerv(GL_BLEND_SRC_ALPHA, &oldBlendSrcAlpha); glGetIntegerv(GL_BLEND_DST_ALPHA, &oldBlendDstAlpha); GLboolean depthEn = glIsEnabled(GL_DEPTH_TEST); GLboolean depthMask; glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask); GLint oldDepthFunc; glGetIntegerv(GL_DEPTH_FUNC, &oldDepthFunc); GLboolean cullEn = glIsEnabled(GL_CULL_FACE); GLint oldCullMode; glGetIntegerv(GL_CULL_FACE_MODE, &oldCullMode); GLboolean texEn = glIsEnabled(GL_TEXTURE_2D); GLint oldActiveTex = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTex); GLint oldTexBind = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexBind); GLint stencilBits = 0; glGetIntegerv(GL_STENCIL_BITS, &stencilBits); GLboolean stencilEn = glIsEnabled(GL_STENCIL_TEST); GLint oldStencilFunc = GL_ALWAYS; GLint oldStencilRef = 0; GLint oldStencilValueMask = ~0; GLint oldStencilWriteMask = ~0; GLint oldStencilFail = GL_KEEP; GLint oldStencilZFail = GL_KEEP; GLint oldStencilZPass = GL_KEEP; glGetIntegerv(GL_STENCIL_FUNC, &oldStencilFunc); glGetIntegerv(GL_STENCIL_REF, &oldStencilRef); glGetIntegerv(GL_STENCIL_VALUE_MASK, &oldStencilValueMask); glGetIntegerv(GL_STENCIL_WRITEMASK, &oldStencilWriteMask); glGetIntegerv(GL_STENCIL_FAIL, &oldStencilFail); glGetIntegerv(GL_STENCIL_PASS_DEPTH_FAIL, &oldStencilZFail); glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &oldStencilZPass); GLboolean colorMask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE }; glGetBooleanv(GL_COLOR_WRITEMASK, colorMask); GLint viewport[4] = { 0, 0, 1, 1 }; glGetIntegerv(GL_VIEWPORT, viewport);
+    GLint oldProg = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg); GLboolean blendEn = glIsEnabled(GL_BLEND); GLint oldBlendSrcRGB, oldBlendDstRGB, oldBlendSrcAlpha, oldBlendDstAlpha; glGetIntegerv(GL_BLEND_SRC_RGB, &oldBlendSrcRGB); glGetIntegerv(GL_BLEND_DST_RGB, &oldBlendDstRGB); glGetIntegerv(GL_BLEND_SRC_ALPHA, &oldBlendSrcAlpha); glGetIntegerv(GL_BLEND_DST_ALPHA, &oldBlendDstAlpha); GLboolean depthEn = glIsEnabled(GL_DEPTH_TEST); GLboolean depthMask; glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask); GLint oldDepthFunc; glGetIntegerv(GL_DEPTH_FUNC, &oldDepthFunc); GLboolean cullEn = glIsEnabled(GL_CULL_FACE); GLint oldCullMode; glGetIntegerv(GL_CULL_FACE_MODE, &oldCullMode); GLboolean texEn = glIsEnabled(GL_TEXTURE_2D); GLint oldActiveTex = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTex); GLint oldTexBind = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexBind); GLint stencilBits = 0; glGetIntegerv(GL_STENCIL_BITS, &stencilBits); GLboolean stencilEn = glIsEnabled(GL_STENCIL_TEST); GLint oldStencilFunc = GL_ALWAYS; GLint oldStencilRef = 0; GLint oldStencilValueMask = ~0; GLint oldStencilWriteMask = ~0; GLint oldStencilFail = GL_KEEP; GLint oldStencilZFail = GL_KEEP; GLint oldStencilZPass = GL_KEEP; glGetIntegerv(GL_STENCIL_FUNC, &oldStencilFunc); glGetIntegerv(GL_STENCIL_REF, &oldStencilRef); glGetIntegerv(GL_STENCIL_VALUE_MASK, &oldStencilValueMask); glGetIntegerv(GL_STENCIL_WRITEMASK, &oldStencilWriteMask); glGetIntegerv(GL_STENCIL_FAIL, &oldStencilFail); glGetIntegerv(GL_STENCIL_PASS_DEPTH_FAIL, &oldStencilZFail); glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &oldStencilZPass); GLboolean colorMask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE }; glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
 
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_FALSE);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1320,7 +1791,7 @@ extern "C" EXPORT void renderPointCloud() {
             if (eboSizeCheck == 0 && g_splatSortIndices.size() > 0) { LogRenderer("WARN: EBO size is 0 but we have sort indices! Skipping draw."); }
             else if (eboSizeCheck > 0) {
                 DrawSplatBuffer(g_splatVBO, mvpMatrix, 0.0f, 0.0f, (float)viewport[2], (float)viewport[3]);
-                if (!g_highlightMaskVBO.indices.empty()) {
+                if (g_enableHighlightRendering && !g_highlightMaskVBO.indices.empty()) {
                     int activeHighlightMode = HIGHLIGHT_NONE;
                     for (const SplatObject& object : g_splatObjects) {
                         if (object.visible && object.highlight_mode != HIGHLIGHT_NONE) {
@@ -1429,20 +1900,6 @@ extern "C" EXPORT void renderPointCloud() {
             }
         }
     }
-    else if (!useVBO && hasView && hasProj) {
-        LogRenderer("DEBUG: Using Immediate Mode fallback for %zu splats.", g_splatSortIndices.size());
-        glUseProgram(0);
-        float projectionMatrixGL[16]; float viewMatrixGL[16];
-        TransposeMat4(projectionMatrix, projectionMatrixGL);
-        TransposeMat4(viewMatrix, viewMatrixGL);
-        glEnable(GL_TEXTURE_2D); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_gaussTexture);
-        glMatrixMode(GL_PROJECTION); glLoadMatrixf(projectionMatrixGL);
-        glMatrixMode(GL_MODELVIEW); glLoadMatrixf(viewMatrixGL);
-        RenderHighlightedSplatsIM(clipBoxState);
-        for (GLuint splatIndex : g_splatSortIndices) { if (splatIndex < g_splats.size()) RenderSingleSplatIM(g_splats[splatIndex], viewMatrix, projectionMatrix); }
-        glBindTexture(GL_TEXTURE_2D, 0);
-        if (!texEn) glDisable(GL_TEXTURE_2D);
-    }
     else {
         if (!useVBO) LogRenderer("DEBUG: Skipping render (VBO disabled or IM requirements not met [view:%d, proj:%d]).", hasView, hasProj);
         else if (!g_splatVBO.initialized) LogRenderer("DEBUG: Skipping render (VBO not initialized).");
@@ -1458,8 +1915,17 @@ extern "C" EXPORT void renderPointCloud() {
 }
 
 
-void ConvertColor(float dc0, float dc1, float dc2, float& r, float& g, float& b) { auto sig = [](float x) {return 1.f / (1.f + exp(-x));}; r = sig(dc0); g = sig(dc1); b = sig(dc2); }
-void ConvertScale(float s0, float s1, float& sx, float& sy) { float rx = exp(s0); float ry = exp(s1); float sf = 45.f; sx = rx * sf; sy = ry * sf; }
+void ConvertColor(float dc0, float dc1, float dc2, float& r, float& g, float& b) {
+    r = (dc0 * SH_C0) + 0.5f;
+    g = (dc1 * SH_C0) + 0.5f;
+    b = (dc2 * SH_C0) + 0.5f;
+}
+
+void ConvertScale(float s0, float s1, float s2, float scale_distance, float& sx, float& sy, float& sz) {
+    sx = exp(s0) * scale_distance;
+    sy = exp(s1) * scale_distance;
+    sz = exp(s2) * scale_distance;
+}
 static int NormalizeImportUpAxis(int up_axis_mode) {
     switch (up_axis_mode) {
     case IMPORT_ORIENTATION_SWAP_A:
@@ -1532,26 +1998,33 @@ static void MapImportVector(const float* source_xyz, int up_axis_mode, float* ou
     }
 }
 
-static void BuildMappedBasisVectors(const PLYGaussianPoint& point, float scale_x, float scale_y, int up_axis_mode, float* out_basis_x, float* out_basis_y) {
-    GaussSplat source_splat = {};
-    source_splat.scale[0] = scale_x;
-    source_splat.scale[1] = scale_y;
-    source_splat.rotation[0] = point.rotation[0];
-    source_splat.rotation[1] = point.rotation[1];
-    source_splat.rotation[2] = point.rotation[2];
-    source_splat.rotation[3] = point.rotation[3];
-
+static void BuildMappedBasisVectors(
+    const PLYGaussianPoint& point,
+    float scale_x,
+    float scale_y,
+    float scale_z,
+    int up_axis_mode,
+    float* out_basis_x,
+    float* out_basis_y,
+    float* out_basis_z) {
     float source_basis_x[3] = {};
     float source_basis_y[3] = {};
-    ComputeBasisVectors(source_splat, source_basis_x, source_basis_y);
+    float source_basis_z[3] = {};
+    ComputeThreeBasisVectorsFromQuaternion(
+        point.rotation[0], point.rotation[1], point.rotation[2], point.rotation[3],
+        scale_x, scale_y, scale_z,
+        source_basis_x, source_basis_y, source_basis_z);
     MapImportVector(source_basis_x, up_axis_mode, out_basis_x);
     MapImportVector(source_basis_y, up_axis_mode, out_basis_y);
+    MapImportVector(source_basis_z, up_axis_mode, out_basis_z);
 }
 
 static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* points, int count, double* out_center_xyz, double* out_half_extents_xyz, int up_axis_mode) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     if (!object_id || !points || count <= 0) {
         return 0;
     }
+    LogRenderer("CHK: BuildSplatObjectFromPLYData start object=%s count=%d", object_id, count);
 
     SplatObject* existing = FindSplatObject(object_id);
     if (!existing) {
@@ -1570,8 +2043,7 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     object.axes_xyz[3] = 0.0; object.axes_xyz[4] = 1.0; object.axes_xyz[5] = 0.0;
     object.axes_xyz[6] = 0.0; object.axes_xyz[7] = 0.0; object.axes_xyz[8] = 1.0;
 
-    float scaleDistance = 20.0f;
-    float opacityMultiplier = 3.0f;
+    const float scaleDistance = 20.0f;
     bool haveBounds = false;
     double minX = 0.0, minY = 0.0, minZ = 0.0, maxX = 0.0, maxY = 0.0, maxZ = 0.0;
 
@@ -1598,9 +2070,10 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
 
         float r, g, b;
         ConvertColor(points[i].color[0], points[i].color[1], points[i].color[2], r, g, b);
-        float scaleX, scaleY;
-        ConvertScale(points[i].scale[0], points[i].scale[1], scaleX, scaleY);
-        if (scaleX <= 0 || scaleY <= 0 || !std::isfinite(scaleX) || !std::isfinite(scaleY)) {
+        float scaleX, scaleY, scaleZ;
+        ConvertScale(points[i].scale[0], points[i].scale[1], points[i].scale[2], scaleDistance, scaleX, scaleY, scaleZ);
+        if (scaleX <= 0 || scaleY <= 0 || scaleZ <= 0 ||
+            !std::isfinite(scaleX) || !std::isfinite(scaleY) || !std::isfinite(scaleZ)) {
             continue;
         }
 
@@ -1611,16 +2084,32 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
         splat.color[0] = r;
         splat.color[1] = g;
         splat.color[2] = b;
-        splat.color[3] = std::max(0.01f, std::min((1.0f / (1.0f + exp(-points[i].opacity))) * opacityMultiplier, 1.0f));
+        splat.color[3] = std::max(0.0f, std::min(1.0f / (1.0f + exp(-points[i].opacity)), 1.0f));
         splat.scale[0] = 1.0f;
         splat.scale[1] = 1.0f;
         splat.rotation[0] = 1.0f;
         splat.rotation[1] = 0.0f;
         splat.rotation[2] = 0.0f;
         splat.rotation[3] = 0.0f;
+        CopyIdentity3x3(splat.world_to_local_dir);
+        splat.sh_degree = std::max(0, std::min(points[i].sh_degree, 3));
+        splat.use_sh = splat.sh_degree > 0 ? 1 : 0;
+        splat.sh_coeffs[0] = points[i].color[0];
+        splat.sh_coeffs[16] = points[i].color[1];
+        splat.sh_coeffs[32] = points[i].color[2];
+        const int sh_coeff_count = (splat.sh_degree + 1) * (splat.sh_degree + 1);
+        const int rest_coeff_count = std::max(0, sh_coeff_count - 1);
+        for (int coeff = 0; coeff < rest_coeff_count; ++coeff) {
+            splat.sh_coeffs[coeff + 1] = points[i].f_rest[coeff];
+            splat.sh_coeffs[16 + coeff + 1] = points[i].f_rest[rest_coeff_count + coeff];
+            splat.sh_coeffs[32 + coeff + 1] = points[i].f_rest[2 * rest_coeff_count + coeff];
+        }
         splat.use_custom_basis = 1;
-        BuildMappedBasisVectors(points[i], scaleX, scaleY, up_axis_mode, splat.basis_x, splat.basis_y);
+        BuildMappedBasisVectors(points[i], scaleX, scaleY, scaleZ, up_axis_mode, splat.basis_x, splat.basis_y, splat.basis_z);
         object.local_splats.push_back(splat);
+        if (((i + 1) % 100000) == 0) {
+            LogRenderer("CHK: BuildSplatObjectFromPLYData pushed %d splats", i + 1);
+        }
     }
 
     if (!haveBounds || object.local_splats.empty()) {
@@ -1654,11 +2143,13 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
         out_half_extents_xyz[2] = object.half_extents_xyz[2];
     }
 
+    LogRenderer("CHK: BuildSplatObjectFromPLYData finished local_splats=%zu", object.local_splats.size());
     RefreshWorldSplatsFromObjects();
+    LogRenderer("CHK: RefreshWorldSplatsFromObjects finished");
     return 1;
 }
 
-extern "C" EXPORT void LoadSplatsFromPLYWithUpAxis(const char* filename, int up_axis_mode) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); ResetSplatObjects(); BuildSplatObjectFromPLYData("__legacy__", pts, cnt, nullptr, nullptr, up_axis_mode); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); LogRenderer("PLY load finished."); }
+extern "C" EXPORT void LoadSplatsFromPLYWithUpAxis(const char* filename, int up_axis_mode) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } char plyPath[MAX_PATH] = {}; if (GetModuleFileNameA(plyDLL, plyPath, MAX_PATH) > 0) { LogRenderer("CHK: Loaded PlyImporter from %s", plyPath); } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); typedef int(*GPS)(); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); GPS getSize = (GPS)GetProcAddress(plyDLL, "GetPLYGaussianPointSize"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } if (getSize) { const int importerPointSize = getSize(); const int rendererPointSize = static_cast<int>(sizeof(PLYGaussianPoint)); LogRenderer("CHK: PLYGaussianPoint size importer=%d renderer=%d", importerPointSize, rendererPointSize); if (importerPointSize != rendererPointSize) { LogRenderer("ERR: PLYGaussianPoint ABI mismatch, aborting load."); FreeLibrary(plyDLL); return; } } else { LogRenderer("WARN: GetPLYGaussianPointSize not found in PlyImporter.dll"); } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); ResetSplatObjects(); BuildSplatObjectFromPLYData("__legacy__", pts, cnt, nullptr, nullptr, up_axis_mode); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); LogRenderer("PLY load finished."); }
 extern "C" EXPORT void LoadSplatsFromPLY(const char* filename) { LoadSplatsFromPLYWithUpAxis(filename, IMPORT_ORIENTATION_SWAP_B); }
 extern "C" EXPORT void AddSplatsFromPLYData(PLYGaussianPoint* points, int count) {
     LogRenderer("Adding %d splats from PLY data...", count);
@@ -1677,14 +2168,33 @@ extern "C" EXPORT int LoadSplatObjectFromPLYWithUpAxis(const char* object_id, co
         LogRenderer("ERR Load PlyImporter %d", GetLastError());
         return 0;
     }
+    char plyPath[MAX_PATH] = {};
+    if (GetModuleFileNameA(plyDLL, plyPath, MAX_PATH) > 0) {
+        LogRenderer("CHK: Loaded PlyImporter from %s", plyPath);
+    }
 
     typedef int(*LPD)(const char*, PLYGaussianPoint**);
     typedef void(*FPD)(PLYGaussianPoint*);
+    typedef int(*GPS)();
     LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData");
     FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData");
+    GPS getSize = (GPS)GetProcAddress(plyDLL, "GetPLYGaussianPointSize");
     if (!load || !free) {
         FreeLibrary(plyDLL);
         return 0;
+    }
+    if (getSize) {
+        const int importerPointSize = getSize();
+        const int rendererPointSize = static_cast<int>(sizeof(PLYGaussianPoint));
+        LogRenderer("CHK: PLYGaussianPoint size importer=%d renderer=%d", importerPointSize, rendererPointSize);
+        if (importerPointSize != rendererPointSize) {
+            LogRenderer("ERR: PLYGaussianPoint ABI mismatch, aborting object load.");
+            FreeLibrary(plyDLL);
+            return 0;
+        }
+    }
+    else {
+        LogRenderer("WARN: GetPLYGaussianPointSize not found in PlyImporter.dll");
     }
 
     PLYGaussianPoint* pts = nullptr;
@@ -1706,6 +2216,7 @@ extern "C" EXPORT int LoadSplatObjectFromPLY(const char* object_id, const char* 
 }
 
 extern "C" EXPORT int SetSplatObjectTransform(const char* object_id, const double* center_xyz, const double* half_extents_xyz, const double* axes_xyz, int visible) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     SplatObject* object = FindSplatObject(object_id);
     if (!object) {
         return 0;
@@ -1726,6 +2237,7 @@ extern "C" EXPORT int SetSplatObjectTransform(const char* object_id, const doubl
 }
 
 extern "C" EXPORT int SetSplatObjectHighlight(const char* object_id, int highlight_mode) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     SplatObject* object = FindSplatObject(object_id);
     if (!object) {
         return 0;
@@ -1739,6 +2251,7 @@ extern "C" EXPORT int SetSplatObjectHighlight(const char* object_id, int highlig
 }
 
 extern "C" EXPORT int RemoveSplatObject(const char* object_id) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     if (!object_id) {
         return 0;
     }

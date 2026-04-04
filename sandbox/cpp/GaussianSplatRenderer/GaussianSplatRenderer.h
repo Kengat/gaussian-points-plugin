@@ -16,6 +16,7 @@ struct PLYGaussianPoint {
     float rotation[4];    // rot_0, rot_1, rot_2, rot_3 (quaternion)
     float opacity;        // opacity
     float f_rest[45];     // f_rest_0, f_rest_1, ... f_rest_44
+    int sh_degree;        // inferred SH degree: 0, 1, 2, or 3
 };
 
 #ifdef __cplusplus

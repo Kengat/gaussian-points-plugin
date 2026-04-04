@@ -21,6 +21,14 @@ module GaussianPoints
       File.join(GaussianPoints::PLUGIN_DIR, 'sandbox')
     end
 
+    def self.valid_dll_path?(path)
+      path && File.file?(path) && File.size?(path)
+    end
+
+    def self.first_valid_dll(*paths)
+      paths.flatten.compact.find { |path| valid_dll_path?(path) }
+    end
+
     def self.normalize_up_axis_mode(value)
       normalized = value.to_s.downcase
       return ORIENTATION_LEGACY if normalized == 'z'
@@ -69,32 +77,24 @@ module GaussianPoints
     end
 
     def self.hook_dll_path
-      candidates = [
-        File.join(plugin_dir, 'cpp', 'build', 'SketchUpOverlayBridge', 'SketchUpOverlayBridge', 'x64', 'Release', 'SketchUpOverlayBridge.dll'),
-        File.join(plugin_dir, 'SketchUpOverlayBridge.dll')
-      ]
-
-      candidates.find { |path| File.exist?(path) }
+      GaussianPoints::NativePaths.bridge_dll
     end
 
     def self.renderer_dll_path
-      candidates = [
+      first_valid_dll(
         File.join(plugin_dir, 'runtime', 'GaussianSplatRenderer.dll'),
         File.join(plugin_dir, 'GaussianSplatRenderer.dll'),
         File.join(plugin_dir, 'cpp', 'build', 'GaussianSplatRenderer', 'GaussianSplatRenderer', 'x64', 'Release', 'GaussianSplatRenderer.dll'),
         File.join(plugin_dir, 'build', 'gaussian', 'GaussianSplatRenderer.dll')
-      ]
-
-      candidates.find { |path| File.exist?(path) }
+      )
     end
 
     def self.ply_importer_path
-      candidates = [
-        File.join(plugin_dir, 'cpp', 'build', 'PlyImporter', 'PlyImporter', 'x64', 'Release', 'PlyImporter.dll'),
-        File.join(plugin_dir, 'PlyImporter.dll')
-      ]
-
-      candidates.find { |path| File.exist?(path) }
+      first_valid_dll(
+        File.join(plugin_dir, 'runtime', 'PlyImporter.dll'),
+        File.join(plugin_dir, 'PlyImporter.dll'),
+        File.join(plugin_dir, 'cpp', 'build', 'PlyImporter', 'PlyImporter', 'x64', 'Release', 'PlyImporter.dll')
+      )
     end
 
     def self.to_c_string(value)
@@ -104,7 +104,7 @@ module GaussianPoints
     def self.available?
       hook_path = hook_dll_path
       renderer_path = renderer_dll_path
-      !hook_path.nil? && !renderer_path.nil? && File.exist?(hook_path) && File.exist?(renderer_path) && !ply_importer_path.nil?
+      !hook_path.nil? && !renderer_path.nil? && valid_dll_path?(hook_path) && valid_dll_path?(renderer_path) && !ply_importer_path.nil?
     end
 
     def self.initialized?
@@ -139,6 +139,7 @@ module GaussianPoints
       ply_dll_path = ply_importer_path
       extra_paths = [
         plugin_dir,
+        File.join(plugin_dir, 'runtime'),
         hook_path && File.dirname(hook_path),
         renderer_path && File.dirname(renderer_path),
         ply_dll_path && File.dirname(ply_dll_path)
@@ -147,8 +148,17 @@ module GaussianPoints
       ENV['PATH'] = (extra_paths + path_entries.reject { |entry| extra_paths.include?(entry) }).join(File::PATH_SEPARATOR)
       @support_dlls = []
 
+      GaussianPoints::NativePaths.pointcloud_hook_support_dirs.each do |support_dir|
+        next unless Dir.exist?(support_dir)
+
+        ENV['PATH'] = ([support_dir] + ENV.fetch('PATH', '').split(File::PATH_SEPARATOR).reject { |entry| entry == support_dir }).join(File::PATH_SEPARATOR)
+      end
+
       %w[glew32.dll minhook.x64.dll].each do |dll_name|
-        dll_path = File.join(plugin_dir, dll_name)
+        dll_path = first_valid_dll(
+          File.join(plugin_dir, dll_name),
+          File.join(plugin_dir, 'runtime', dll_name)
+        )
         next unless File.exist?(dll_path)
 
         @support_dlls << Fiddle.dlopen(dll_path)
@@ -279,7 +289,7 @@ module GaussianPoints
       @setup_complete = true
       true
     rescue StandardError => e
-      puts "[GaussianSplats] setup error: #{e.message}"
+      puts "[GaussianSplats] setup error: #{e.class}: #{e.message}"
       @setup_complete = false
       @hook_dll_loaded = false
       @renderer_dll_loaded = false

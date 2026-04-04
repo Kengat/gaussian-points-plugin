@@ -7,7 +7,7 @@
 #include <map>
 #include <cstring>
 
-// Функция логирования
+// Р¤СѓРЅРєС†РёСЏ Р»РѕРіРёСЂРѕРІР°РЅРёСЏ
 static void LogMessage(const char* format, ...) {
     char buffer[1024];
     va_list args;
@@ -17,7 +17,7 @@ static void LogMessage(const char* format, ...) {
     OutputDebugStringA(buffer);
 }
 
-// Структура для хранения заголовка PLY
+// РЎС‚СЂСѓРєС‚СѓСЂР° РґР»СЏ С…СЂР°РЅРµРЅРёСЏ Р·Р°РіРѕР»РѕРІРєР° PLY
 struct PLYHeader {
     bool isBinary;
     bool isLittleEndian;
@@ -68,18 +68,18 @@ static std::ifstream OpenPLYStream(const char* filename) {
     return file;
 }
 
-// Функция для чтения заголовка PLY
+// Р¤СѓРЅРєС†РёСЏ РґР»СЏ С‡С‚РµРЅРёСЏ Р·Р°РіРѕР»РѕРІРєР° PLY
 bool ReadPLYHeader(std::ifstream& file, PLYHeader& header) {
     std::string line;
 
-    // Проверяем первую строку - должна быть "ply"
+    // РџСЂРѕРІРµСЂСЏРµРј РїРµСЂРІСѓСЋ СЃС‚СЂРѕРєСѓ - РґРѕР»Р¶РЅР° Р±С‹С‚СЊ "ply"
     std::getline(file, line);
     if (line != "ply") {
         LogMessage("[PlyImporter] Not a valid PLY file, missing 'ply' header\n");
         return false;
     }
 
-    // Читаем формат
+    // Р§РёС‚Р°РµРј С„РѕСЂРјР°С‚
     std::getline(file, line);
     if (line.find("format binary_little_endian") != std::string::npos) {
         header.isBinary = true;
@@ -102,15 +102,15 @@ bool ReadPLYHeader(std::ifstream& file, PLYHeader& header) {
 
     header.vertexCount = 0;
 
-    // Читаем остальной заголовок
+    // Р§РёС‚Р°РµРј РѕСЃС‚Р°Р»СЊРЅРѕР№ Р·Р°РіРѕР»РѕРІРѕРє
     while (std::getline(file, line)) {
         if (line.find("element vertex") != std::string::npos) {
-            // Получаем количество вершин
+            // РџРѕР»СѓС‡Р°РµРј РєРѕР»РёС‡РµСЃС‚РІРѕ РІРµСЂС€РёРЅ
             sscanf(line.c_str(), "element vertex %d", &header.vertexCount);
             LogMessage("[PlyImporter] Vertex count: %d\n", header.vertexCount);
         }
         else if (line.find("property float") != std::string::npos) {
-            // Получаем имя свойства
+            // РџРѕР»СѓС‡Р°РµРј РёРјСЏ СЃРІРѕР№СЃС‚РІР°
             std::string propertyName = line.substr(line.rfind(' ') + 1);
             header.propertyNames.push_back(propertyName);
             header.propertyOffsets[propertyName] = header.propertyNames.size() - 1;
@@ -118,7 +118,7 @@ bool ReadPLYHeader(std::ifstream& file, PLYHeader& header) {
                 propertyName.c_str(), header.propertyOffsets[propertyName]);
         }
         else if (line == "end_header") {
-            // Конец заголовка
+            // РљРѕРЅРµС† Р·Р°РіРѕР»РѕРІРєР°
             LogMessage("[PlyImporter] End of header, found %zu properties\n", header.propertyNames.size());
             return true;
         }
@@ -128,14 +128,14 @@ bool ReadPLYHeader(std::ifstream& file, PLYHeader& header) {
     return false;
 }
 
-// Функция для чтения float из бинарного файла с учетом endianness
+// Р¤СѓРЅРєС†РёСЏ РґР»СЏ С‡С‚РµРЅРёСЏ float РёР· Р±РёРЅР°СЂРЅРѕРіРѕ С„Р°Р№Р»Р° СЃ СѓС‡РµС‚РѕРј endianness
 float ReadFloat(std::ifstream& file, bool isLittleEndian) {
     float value;
     file.read(reinterpret_cast<char*>(&value), sizeof(float));
 
-    // Если наша система little endian, а файл big endian (или наоборот),
-    // нужно преобразовать порядок байтов
-    bool systemIsLittleEndian = true;  // Большинство современных систем little endian
+    // Р•СЃР»Рё РЅР°С€Р° СЃРёСЃС‚РµРјР° little endian, Р° С„Р°Р№Р» big endian (РёР»Рё РЅР°РѕР±РѕСЂРѕС‚),
+    // РЅСѓР¶РЅРѕ РїСЂРµРѕР±СЂР°Р·РѕРІР°С‚СЊ РїРѕСЂСЏРґРѕРє Р±Р°Р№С‚РѕРІ
+    bool systemIsLittleEndian = true;  // Р‘РѕР»СЊС€РёРЅСЃС‚РІРѕ СЃРѕРІСЂРµРјРµРЅРЅС‹С… СЃРёСЃС‚РµРј little endian
 
     if (systemIsLittleEndian != isLittleEndian) {
         char* bytes = reinterpret_cast<char*>(&value);
@@ -146,7 +146,7 @@ float ReadFloat(std::ifstream& file, bool isLittleEndian) {
     return value;
 }
 
-// Функция для чтения данных вершины
+// Р¤СѓРЅРєС†РёСЏ РґР»СЏ С‡С‚РµРЅРёСЏ РґР°РЅРЅС‹С… РІРµСЂС€РёРЅС‹
 std::vector<float> ReadVertex(std::ifstream& file, const PLYHeader& header) {
     std::vector<float> vertexData(header.propertyNames.size());
 
@@ -157,11 +157,12 @@ std::vector<float> ReadVertex(std::ifstream& file, const PLYHeader& header) {
     return vertexData;
 }
 
-// Преобразование данных вершины в точку с гауссовыми параметрами
+// РџСЂРµРѕР±СЂР°Р·РѕРІР°РЅРёРµ РґР°РЅРЅС‹С… РІРµСЂС€РёРЅС‹ РІ С‚РѕС‡РєСѓ СЃ РіР°СѓСЃСЃРѕРІС‹РјРё РїР°СЂР°РјРµС‚СЂР°РјРё
 PLYGaussianPoint ConvertToPLYGaussianPoint(const std::vector<float>& vertexData, const PLYHeader& header) {
     PLYGaussianPoint point = { 0 };
+    int f_rest_count = 0;
 
-    // Позиция
+    // РџРѕР·РёС†РёСЏ
     if (header.propertyOffsets.count("x") > 0 &&
         header.propertyOffsets.count("y") > 0 &&
         header.propertyOffsets.count("z") > 0) {
@@ -170,7 +171,7 @@ PLYGaussianPoint ConvertToPLYGaussianPoint(const std::vector<float>& vertexData,
         point.position[2] = vertexData[header.propertyOffsets.at("z")];
     }
 
-    // Нормаль
+    // РќРѕСЂРјР°Р»СЊ
     if (header.propertyOffsets.count("nx") > 0 &&
         header.propertyOffsets.count("ny") > 0 &&
         header.propertyOffsets.count("nz") > 0) {
@@ -179,7 +180,7 @@ PLYGaussianPoint ConvertToPLYGaussianPoint(const std::vector<float>& vertexData,
         point.normal[2] = vertexData[header.propertyOffsets.at("nz")];
     }
 
-    // Цвет
+    // Р¦РІРµС‚
     if (header.propertyOffsets.count("f_dc_0") > 0 &&
         header.propertyOffsets.count("f_dc_1") > 0 &&
         header.propertyOffsets.count("f_dc_2") > 0) {
@@ -188,7 +189,7 @@ PLYGaussianPoint ConvertToPLYGaussianPoint(const std::vector<float>& vertexData,
         point.color[2] = vertexData[header.propertyOffsets.at("f_dc_2")];
     }
 
-    // Масштаб
+    // РњР°СЃС€С‚Р°Р±
     if (header.propertyOffsets.count("scale_0") > 0 &&
         header.propertyOffsets.count("scale_1") > 0 &&
         header.propertyOffsets.count("scale_2") > 0) {
@@ -197,7 +198,7 @@ PLYGaussianPoint ConvertToPLYGaussianPoint(const std::vector<float>& vertexData,
         point.scale[2] = vertexData[header.propertyOffsets.at("scale_2")];
     }
 
-    // Поворот
+    // РџРѕРІРѕСЂРѕС‚
     if (header.propertyOffsets.count("rot_0") > 0 &&
         header.propertyOffsets.count("rot_1") > 0 &&
         header.propertyOffsets.count("rot_2") > 0 &&
@@ -208,17 +209,31 @@ PLYGaussianPoint ConvertToPLYGaussianPoint(const std::vector<float>& vertexData,
         point.rotation[3] = vertexData[header.propertyOffsets.at("rot_3")];
     }
 
-    // Прозрачность
+    // РџСЂРѕР·СЂР°С‡РЅРѕСЃС‚СЊ
     if (header.propertyOffsets.count("opacity") > 0) {
         point.opacity = vertexData[header.propertyOffsets.at("opacity")];
     }
 
-    // f_rest параметры
+    // f_rest РїР°СЂР°РјРµС‚СЂС‹
     for (int i = 0; i < 45; i++) {
         std::string propName = "f_rest_" + std::to_string(i);
         if (header.propertyOffsets.count(propName) > 0) {
             point.f_rest[i] = vertexData[header.propertyOffsets.at(propName)];
+            ++f_rest_count;
         }
+    }
+
+    if (f_rest_count >= 45) {
+        point.sh_degree = 3;
+    }
+    else if (f_rest_count >= 24) {
+        point.sh_degree = 2;
+    }
+    else if (f_rest_count >= 9) {
+        point.sh_degree = 1;
+    }
+    else {
+        point.sh_degree = 0;
     }
 
     return point;
@@ -244,7 +259,7 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
         return false;
     }
 
-    // Читаем первую вершину и выводим ее свойства
+    // Р§РёС‚Р°РµРј РїРµСЂРІСѓСЋ РІРµСЂС€РёРЅСѓ Рё РІС‹РІРѕРґРёРј РµРµ СЃРІРѕР№СЃС‚РІР°
     std::vector<float> firstVertex = ReadVertex(file, header);
 
     if (firstVertex.size() != header.propertyNames.size()) {
@@ -254,7 +269,7 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
 
     LogMessage("[PlyImporter] First vertex properties:\n");
 
-    // Позиция (x, y, z)
+    // РџРѕР·РёС†РёСЏ (x, y, z)
     if (header.propertyOffsets.count("x") > 0 &&
         header.propertyOffsets.count("y") > 0 &&
         header.propertyOffsets.count("z") > 0) {
@@ -265,7 +280,7 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
         LogMessage("  Position: (%.6f, %.6f, %.6f)\n", x, y, z);
     }
 
-    // Нормаль (nx, ny, nz)
+    // РќРѕСЂРјР°Р»СЊ (nx, ny, nz)
     if (header.propertyOffsets.count("nx") > 0 &&
         header.propertyOffsets.count("ny") > 0 &&
         header.propertyOffsets.count("nz") > 0) {
@@ -276,7 +291,7 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
         LogMessage("  Normal: (%.6f, %.6f, %.6f)\n", nx, ny, nz);
     }
 
-    // Цвет (f_dc_0, f_dc_1, f_dc_2)
+    // Р¦РІРµС‚ (f_dc_0, f_dc_1, f_dc_2)
     if (header.propertyOffsets.count("f_dc_0") > 0 &&
         header.propertyOffsets.count("f_dc_1") > 0 &&
         header.propertyOffsets.count("f_dc_2") > 0) {
@@ -287,7 +302,7 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
         LogMessage("  Color (f_dc): (%.6f, %.6f, %.6f)\n", r, g, b);
     }
 
-    // Масштаб (scale_0, scale_1, scale_2)
+    // РњР°СЃС€С‚Р°Р± (scale_0, scale_1, scale_2)
     if (header.propertyOffsets.count("scale_0") > 0 &&
         header.propertyOffsets.count("scale_1") > 0 &&
         header.propertyOffsets.count("scale_2") > 0) {
@@ -298,7 +313,7 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
         LogMessage("  Scale: (%.6f, %.6f, %.6f)\n", sx, sy, sz);
     }
 
-    // Вращение (rot_0, rot_1, rot_2, rot_3)
+    // Р’СЂР°С‰РµРЅРёРµ (rot_0, rot_1, rot_2, rot_3)
     if (header.propertyOffsets.count("rot_0") > 0 &&
         header.propertyOffsets.count("rot_1") > 0 &&
         header.propertyOffsets.count("rot_2") > 0 &&
@@ -311,13 +326,13 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
         LogMessage("  Rotation (quaternion): (%.6f, %.6f, %.6f, %.6f)\n", r0, r1, r2, r3);
     }
 
-    // Прозрачность
+    // РџСЂРѕР·СЂР°С‡РЅРѕСЃС‚СЊ
     if (header.propertyOffsets.count("opacity") > 0) {
         float opacity = firstVertex[header.propertyOffsets["opacity"]];
         LogMessage("  Opacity: %.6f\n", opacity);
     }
 
-    // Выводим первые несколько f_rest параметров
+    // Р’С‹РІРѕРґРёРј РїРµСЂРІС‹Рµ РЅРµСЃРєРѕР»СЊРєРѕ f_rest РїР°СЂР°РјРµС‚СЂРѕРІ
     for (int i = 0; i < 5; i++) {
         std::string propName = "f_rest_" + std::to_string(i);
         if (header.propertyOffsets.count(propName) > 0) {
@@ -330,7 +345,7 @@ extern "C" EXPORT bool LoadPLYFile(const char* filename) {
     return true;
 }
 
-// Новая функция для загрузки всех данных
+// РќРѕРІР°СЏ С„СѓРЅРєС†РёСЏ РґР»СЏ Р·Р°РіСЂСѓР·РєРё РІСЃРµС… РґР°РЅРЅС‹С…
 extern "C" EXPORT int LoadPLYData(const char* filename, PLYGaussianPoint** points) {
     LogMessage("[PlyImporter] Loading PLY data from: %s\n", filename);
 
@@ -346,14 +361,14 @@ extern "C" EXPORT int LoadPLYData(const char* filename, PLYGaussianPoint** point
         return 0;
     }
 
-    // Выделяем память для массива точек
+    // Р’С‹РґРµР»СЏРµРј РїР°РјСЏС‚СЊ РґР»СЏ РјР°СЃСЃРёРІР° С‚РѕС‡РµРє
     *points = new PLYGaussianPoint[header.vertexCount];
     if (!(*points)) {
         LogMessage("[PlyImporter] Error: Memory allocation failed\n");
         return 0;
     }
 
-    // Читаем все вершины
+    // Р§РёС‚Р°РµРј РІСЃРµ РІРµСЂС€РёРЅС‹
     for (int i = 0; i < header.vertexCount; i++) {
         std::vector<float> vertexData = ReadVertex(file, header);
         (*points)[i] = ConvertToPLYGaussianPoint(vertexData, header);
@@ -363,12 +378,16 @@ extern "C" EXPORT int LoadPLYData(const char* filename, PLYGaussianPoint** point
     return header.vertexCount;
 }
 
-// Освобождение памяти
+// РћСЃРІРѕР±РѕР¶РґРµРЅРёРµ РїР°РјСЏС‚Рё
 extern "C" EXPORT void FreePLYData(PLYGaussianPoint* points) {
     if (points) {
         delete[] points;
         LogMessage("[PlyImporter] PLY data memory freed\n");
     }
+}
+
+extern "C" EXPORT int GetPLYGaussianPointSize() {
+    return static_cast<int>(sizeof(PLYGaussianPoint));
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
