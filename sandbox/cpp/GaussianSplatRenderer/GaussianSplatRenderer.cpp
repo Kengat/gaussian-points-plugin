@@ -63,6 +63,7 @@ struct GaussSplat {
     int highlight_mode = 0;
 };
 static std::vector<GaussSplat> g_splats;
+static int g_shRenderDegreeOverride = 3;
 
 static constexpr float SH_C0 = 0.28209479177387814f;
 static constexpr float SH_C1 = 0.4886025119029199f;
@@ -160,12 +161,14 @@ static GLuint g_outlineCompositeShader = 0;
 static GLuint g_outlineMaskFBO = 0;
 static GLuint g_outlineMaskColorTex = 0;
 static GLuint g_outlineMaskDepthTex = 0;
+static GLuint g_outlineDepthStencilRBO = 0;
 static GLuint g_sceneDepthTex = 0;
 static GLuint g_outlineQuadVAO = 0;
 static GLuint g_outlineQuadVBO = 0;
 static int g_outlineViewportWidth = 0;
 static int g_outlineViewportHeight = 0;
-static const bool g_enableHighlightRendering = false;
+static const bool g_enableHighlightRendering = true;
+static const float kOutlineMaskResolutionScale = 1.0f;
 // Render bisection stage:
 // 0 = normal path
 // 1 = stop after camera/view/projection fetch
@@ -369,27 +372,30 @@ static void ComputeCovarianceFromBasisVectors(const GaussSplat& splat, float* ou
     }
 }
 
-static void BuildWorldToLocalDirMatrix(const SplatObject& object, double sx, double sy, double sz, float* out_matrix) {
-    const double inv_sx = fabs(sx) > 1.0e-8 ? (1.0 / sx) : 1.0;
-    const double inv_sy = fabs(sy) > 1.0e-8 ? (1.0 / sy) : 1.0;
-    const double inv_sz = fabs(sz) > 1.0e-8 ? (1.0 / sz) : 1.0;
+static void BuildWorldToLocalDirMatrix(const float* basis_x, const float* basis_y, const float* basis_z, float* out_matrix) {
+    float axis_x[3] = { basis_x[0], basis_x[1], basis_x[2] };
+    float axis_y[3] = { basis_y[0], basis_y[1], basis_y[2] };
+    float axis_z[3] = { basis_z[0], basis_z[1], basis_z[2] };
+    Normalize3(axis_x);
+    Normalize3(axis_y);
+    Normalize3(axis_z);
 
-    out_matrix[0] = static_cast<float>(object.axes_xyz[0] * inv_sx);
-    out_matrix[1] = static_cast<float>(object.axes_xyz[1] * inv_sx);
-    out_matrix[2] = static_cast<float>(object.axes_xyz[2] * inv_sx);
-    out_matrix[3] = static_cast<float>(object.axes_xyz[3] * inv_sy);
-    out_matrix[4] = static_cast<float>(object.axes_xyz[4] * inv_sy);
-    out_matrix[5] = static_cast<float>(object.axes_xyz[5] * inv_sy);
-    out_matrix[6] = static_cast<float>(object.axes_xyz[6] * inv_sz);
-    out_matrix[7] = static_cast<float>(object.axes_xyz[7] * inv_sz);
-    out_matrix[8] = static_cast<float>(object.axes_xyz[8] * inv_sz);
+    out_matrix[0] = axis_x[0];
+    out_matrix[1] = axis_x[1];
+    out_matrix[2] = axis_x[2];
+    out_matrix[3] = axis_y[0];
+    out_matrix[4] = axis_y[1];
+    out_matrix[5] = axis_y[2];
+    out_matrix[6] = axis_z[0];
+    out_matrix[7] = axis_z[1];
+    out_matrix[8] = axis_z[2];
 }
 
 static void EvaluateSHColor(const GaussSplat& splat, const float* camera_position, float* out_rgb) {
     const float world_dir[3] = {
-        camera_position[0] - splat.position[0],
-        camera_position[1] - splat.position[1],
-        camera_position[2] - splat.position[2]
+        splat.position[0] - camera_position[0],
+        splat.position[1] - camera_position[1],
+        splat.position[2] - camera_position[2]
     };
     float local_dir[3] = {};
     MultiplyMat3Vec(splat.world_to_local_dir, world_dir, local_dir);
@@ -408,16 +414,17 @@ static void EvaluateSHColor(const GaussSplat& splat, const float* camera_positio
     for (int channel = 0; channel < 3; ++channel) {
         const float* sh = &splat.sh_coeffs[channel * 16];
         float result = SH_C0 * sh[0];
-        if (splat.sh_degree > 0) {
+        const int effective_degree = std::max(0, std::min(splat.sh_degree, g_shRenderDegreeOverride));
+        if (effective_degree > 0) {
             result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
-            if (splat.sh_degree > 1) {
+            if (effective_degree > 1) {
                 result = result +
                     SH_C2[0] * xy * sh[4] +
                     SH_C2[1] * yz * sh[5] +
                     SH_C2[2] * (2.0f * zz - xx - yy) * sh[6] +
                     SH_C2[3] * xz * sh[7] +
                     SH_C2[4] * (xx - yy) * sh[8];
-                if (splat.sh_degree > 2) {
+                if (effective_degree > 2) {
                     result = result +
                         SH_C3[0] * y * (3.0f * xx - yy) * sh[9] +
                         SH_C3[1] * xy * z * sh[10] +
@@ -591,7 +598,7 @@ static bool ComputeProjectedBasis(
     MultiplyMat3Vec(world_rotation_t, camera_basis_minor, out_basis_y);
 
     if (out_color) {
-        if (splat.use_sh != 0 && splat.sh_degree > 0) {
+        if (splat.use_sh != 0 && splat.sh_degree > 0 && g_shRenderDegreeOverride > 0) {
             EvaluateSHColor(splat, camera_position, out_color);
         }
         else {
@@ -616,10 +623,26 @@ static void TransformVectorByObject(const SplatObject& object, double sx, double
     out_vec[2] = static_cast<float>((object.axes_xyz[2] * scaled_x) + (object.axes_xyz[5] * scaled_y) + (object.axes_xyz[8] * scaled_z));
 }
 
+static void BuildWorldSplatForObject(const SplatObject& object, double sx, double sy, double sz, const GaussSplat& local, GaussSplat& world) {
+    world = local;
+
+    const double local_x = static_cast<double>(local.position[0]) * sx;
+    const double local_y = static_cast<double>(local.position[1]) * sy;
+    const double local_z = static_cast<double>(local.position[2]) * sz;
+    world.position[0] = static_cast<float>(object.center_xyz[0] + (object.axes_xyz[0] * local_x) + (object.axes_xyz[3] * local_y) + (object.axes_xyz[6] * local_z));
+    world.position[1] = static_cast<float>(object.center_xyz[1] + (object.axes_xyz[1] * local_x) + (object.axes_xyz[4] * local_y) + (object.axes_xyz[7] * local_z));
+    world.position[2] = static_cast<float>(object.center_xyz[2] + (object.axes_xyz[2] * local_x) + (object.axes_xyz[5] * local_y) + (object.axes_xyz[8] * local_z));
+    TransformVectorByObject(object, sx, sy, sz, local.basis_x, world.basis_x);
+    TransformVectorByObject(object, sx, sy, sz, local.basis_y, world.basis_y);
+    TransformVectorByObject(object, sx, sy, sz, local.basis_z, world.basis_z);
+    BuildWorldToLocalDirMatrix(world.basis_x, world.basis_y, world.basis_z, world.world_to_local_dir);
+    world.use_custom_basis = 1;
+    world.highlight_mode = object.highlight_mode;
+}
+
 static void MarkSplatBuffersDirty() {
     g_splatVBO.needsUpdate = true;
     g_highlightMaskVBO.needsUpdate = true;
-    g_outlineVBO.needsUpdate = true;
     g_gpuSplatDataDirty = true;
     g_gpuObjectDataDirty = true;
 }
@@ -802,44 +825,35 @@ static GLuint CreateOutlineCompositeShader() {
         uniform sampler2D uMaskTex;
         uniform vec2 uTexelSize;
         uniform float uThicknessPx;
-        uniform float uMergePx;
-        uniform float uGapPx;
-        uniform float uInnerThreshold;
-        uniform float uOuterThreshold;
         uniform vec4 uOutlineColor;
         varying vec2 vTexCoord;
 
-        float sampleCoverageDisk(float radiusPx) {
-            float weightedAlpha = texture2D(uMaskTex, vTexCoord).a * 2.0;
-            float totalWeight = 2.0;
-            const int kMaxRadius = 18;
-            const int kDirectionCount = 40;
+        float sampleOuterMask(float radiusPx) {
+            float outerMask = 0.0;
+            const int kMaxRadius = 12;
+            const int kDirectionCount = 8;
             for (int i = 1; i <= kMaxRadius; ++i) {
                 if (float(i) > radiusPx) {
                     break;
                 }
                 float sampleRadius = float(i);
-                float radialWeight = 1.0 - (sampleRadius / (radiusPx + 1.0));
+                float phase = mod(sampleRadius, 2.0) * 0.5;
                 for (int dir = 0; dir < kDirectionCount; ++dir) {
-                    float angle = 6.28318530718 * (float(dir) / float(kDirectionCount));
+                    float angle = 6.28318530718 * ((float(dir) + phase) / float(kDirectionCount));
                     vec2 offset = vec2(cos(angle), sin(angle)) * uTexelSize * sampleRadius;
-                    float sampleAlpha = texture2D(uMaskTex, vTexCoord + offset).a;
-                    weightedAlpha += sampleAlpha * radialWeight;
-                    totalWeight += radialWeight;
+                    outerMask = max(outerMask, texture2D(uMaskTex, vTexCoord + offset).a);
                 }
             }
-            return totalWeight > 0.0 ? (weightedAlpha / totalWeight) : 0.0;
+            return outerMask;
         }
 
         void main() {
-            float outerAlpha = sampleCoverageDisk(uMergePx + uGapPx + uThicknessPx);
-            float innerAlpha = sampleCoverageDisk(uMergePx + uGapPx);
-
-            if (outerAlpha < uOuterThreshold || innerAlpha >= uInnerThreshold) {
+            float centerMask = texture2D(uMaskTex, vTexCoord).a;
+            float outerMask = sampleOuterMask(uThicknessPx);
+            if (centerMask > 0.001 || outerMask <= 0.001) {
                 discard;
             }
-
-            gl_FragColor = vec4(uOutlineColor.rgb, uOutlineColor.a);
+            gl_FragColor = uOutlineColor;
         })";
 
     GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
@@ -924,6 +938,9 @@ static bool EnsureOutlineTextures(int viewport_width, int viewport_height) {
         return false;
     }
 
+    const int texture_width = std::max(1, static_cast<int>(std::ceil(static_cast<float>(viewport_width) * kOutlineMaskResolutionScale)));
+    const int texture_height = std::max(1, static_cast<int>(std::ceil(static_cast<float>(viewport_height) * kOutlineMaskResolutionScale)));
+
     if (g_outlineCompositeShader == 0) {
         g_outlineCompositeShader = CreateOutlineCompositeShader();
         if (g_outlineCompositeShader == 0) {
@@ -937,42 +954,28 @@ static bool EnsureOutlineTextures(int viewport_width, int viewport_height) {
     if (g_outlineMaskColorTex == 0) {
         glGenTextures(1, &g_outlineMaskColorTex);
     }
-    if (g_outlineMaskDepthTex == 0) {
-        glGenTextures(1, &g_outlineMaskDepthTex);
+    if (g_outlineDepthStencilRBO == 0) {
+        glGenRenderbuffers(1, &g_outlineDepthStencilRBO);
     }
-    if (g_sceneDepthTex == 0) {
-        glGenTextures(1, &g_sceneDepthTex);
-    }
-
-    if (g_outlineViewportWidth != viewport_width || g_outlineViewportHeight != viewport_height) {
-        g_outlineViewportWidth = viewport_width;
-        g_outlineViewportHeight = viewport_height;
+    if (g_outlineViewportWidth != texture_width || g_outlineViewportHeight != texture_height) {
+        g_outlineViewportWidth = texture_width;
+        g_outlineViewportHeight = texture_height;
 
         glBindTexture(GL_TEXTURE_2D, g_outlineMaskColorTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, viewport_width, viewport_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texture_width, texture_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        glBindTexture(GL_TEXTURE_2D, g_outlineMaskDepthTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, viewport_width, viewport_height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        glBindTexture(GL_TEXTURE_2D, g_sceneDepthTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, viewport_width, viewport_height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindRenderbuffer(GL_RENDERBUFFER, g_outlineDepthStencilRBO);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, texture_width, texture_height);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, g_outlineMaskFBO);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_outlineMaskColorTex, 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, g_outlineMaskDepthTex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_outlineDepthStencilRBO);
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return status == GL_FRAMEBUFFER_COMPLETE;
@@ -987,71 +990,59 @@ static void UpdateHighlightVBOVertices(
     int viewport_width,
     int viewport_height,
     bool force_update) {
-    if (!g_highlightMaskVBO.initialized || !g_outlineVBO.initialized) {
+    if (!g_highlightMaskVBO.initialized) {
         return;
     }
-    if (!force_update && !g_highlightMaskVBO.needsUpdate && !g_outlineVBO.needsUpdate) {
+    if (!force_update && !g_highlightMaskVBO.needsUpdate) {
         return;
     }
-    if (!HasHighlightedObjects() && g_outlineVBO.vertices.empty() && g_highlightMaskVBO.vertices.empty()) {
+    if (!HasHighlightedObjects() && g_highlightMaskVBO.vertices.empty()) {
         g_highlightMaskVBO.needsUpdate = false;
-        g_outlineVBO.needsUpdate = false;
         return;
     }
 
     g_highlightMaskVBO.vertices.clear();
     g_highlightMaskVBO.indices.clear();
-    g_outlineVBO.vertices.clear();
-    g_outlineVBO.indices.clear();
 
-    for (const GaussSplat& splat : g_splats) {
-        if (splat.highlight_mode == HIGHLIGHT_NONE) {
+    for (const SplatObject& object : g_splatObjects) {
+        if (!object.visible || object.highlight_mode == HIGHLIGHT_NONE || object.local_splats.empty()) {
             continue;
         }
 
-        float outline_color[4] = {};
-        HighlightColorForMode(splat.highlight_mode, &outline_color[0], &outline_color[1], &outline_color[2], &outline_color[3]);
-        const float mask_scale = HighlightMaskScaleForMode(splat.highlight_mode);
-        const float outline_scale = HighlightScaleForMode(splat.highlight_mode);
-        if (!IsPointInsideClipBox(clip_box_state, splat.position[0], splat.position[1], splat.position[2])) {
-            continue;
-        }
+        const double sx = object.base_half_extents_xyz[0] > 1.0e-8 ? (object.half_extents_xyz[0] / object.base_half_extents_xyz[0]) : 1.0;
+        const double sy = object.base_half_extents_xyz[1] > 1.0e-8 ? (object.half_extents_xyz[1] / object.base_half_extents_xyz[1]) : 1.0;
+        const double sz = object.base_half_extents_xyz[2] > 1.0e-8 ? (object.half_extents_xyz[2] / object.base_half_extents_xyz[2]) : 1.0;
 
-        float mask_basis_x[3] = {};
-        float mask_basis_y[3] = {};
-        float outline_basis_x[3] = {};
-        float outline_basis_y[3] = {};
-        if (!ComputeProjectedBasis(
-            splat,
-            view_matrix,
-            projection_matrix,
-            camera_position,
-            is_perspective,
-            viewport_width,
-            viewport_height,
-            3.0f * mask_scale,
-            mask_basis_x,
-            mask_basis_y,
-            nullptr)) {
-            continue;
-        }
-        if (!ComputeProjectedBasis(
-            splat,
-            view_matrix,
-            projection_matrix,
-            camera_position,
-            is_perspective,
-            viewport_width,
-            viewport_height,
-            3.0f * outline_scale,
-            outline_basis_x,
-            outline_basis_y,
-            nullptr)) {
-            continue;
-        }
+        for (const GaussSplat& local_splat : object.local_splats) {
+            GaussSplat world_splat = {};
+            BuildWorldSplatForObject(object, sx, sy, sz, local_splat, world_splat);
 
-        AppendQuadVertices(&g_highlightMaskVBO, splat.position, mask_basis_x, mask_basis_y, outline_color);
-        AppendQuadVertices(&g_outlineVBO, splat.position, outline_basis_x, outline_basis_y, outline_color);
+            float outline_color[4] = {};
+            HighlightColorForMode(object.highlight_mode, &outline_color[0], &outline_color[1], &outline_color[2], &outline_color[3]);
+            const float mask_scale = HighlightMaskScaleForMode(object.highlight_mode);
+            if (!IsPointInsideClipBox(clip_box_state, world_splat.position[0], world_splat.position[1], world_splat.position[2])) {
+                continue;
+            }
+
+            float mask_basis_x[3] = {};
+            float mask_basis_y[3] = {};
+            if (!ComputeProjectedBasis(
+                world_splat,
+                view_matrix,
+                projection_matrix,
+                camera_position,
+                is_perspective,
+                viewport_width,
+                viewport_height,
+                3.0f * mask_scale,
+                mask_basis_x,
+                mask_basis_y,
+                nullptr)) {
+                continue;
+            }
+
+            AppendQuadVertices(&g_highlightMaskVBO, world_splat.position, mask_basis_x, mask_basis_y, outline_color);
+        }
     }
 
     if (g_highlightMaskVBO.vertices.empty()) {
@@ -1061,15 +1052,7 @@ static void UpdateHighlightVBOVertices(
         UploadBufferData(&g_highlightMaskVBO, GL_DYNAMIC_DRAW);
     }
 
-    if (g_outlineVBO.vertices.empty()) {
-        ClearUploadedBuffer(&g_outlineVBO);
-    }
-    else {
-        UploadBufferData(&g_outlineVBO, GL_DYNAMIC_DRAW);
-    }
-
     g_highlightMaskVBO.needsUpdate = false;
-    g_outlineVBO.needsUpdate = false;
 }
 
 static void DrawSplatBuffer(
@@ -1123,6 +1106,137 @@ static void DrawSplatBuffer(
     }
 }
 
+static int GetActiveHighlightMode() {
+    for (const SplatObject& object : g_splatObjects) {
+        if (object.visible && object.highlight_mode != HIGHLIGHT_NONE && !object.local_splats.empty()) {
+            return object.highlight_mode;
+        }
+    }
+    return HIGHLIGHT_NONE;
+}
+
+static bool CanUseGPUHighlightOverlay();
+static void DrawGPUHighlightSplats(float alpha_cutoff, float screen_expand_px, float viewport_width, float viewport_height, bool binary_mask);
+
+static void RenderHighlightOverlay(
+    const float* mvp_matrix,
+    int viewport_x,
+    int viewport_y,
+    int viewport_width,
+    int viewport_height,
+    int stencil_bits,
+    bool gpu_path_active) {
+    if (!g_enableHighlightRendering ||
+        viewport_width <= 0 ||
+        viewport_height <= 0) {
+        return;
+    }
+
+    const int active_highlight_mode = GetActiveHighlightMode();
+    if (active_highlight_mode == HIGHLIGHT_NONE) {
+        return;
+    }
+
+    const bool use_gpu_highlight = gpu_path_active && CanUseGPUHighlightOverlay();
+    if (!use_gpu_highlight &&
+        (!g_highlightMaskVBO.initialized || g_highlightMaskVBO.indices.empty())) {
+        return;
+    }
+
+    if (EnsureOutlineTextures(viewport_width, viewport_height) && EnsureOutlineQuad()) {
+        const int outline_width = g_outlineViewportWidth > 0 ? g_outlineViewportWidth : viewport_width;
+        const int outline_height = g_outlineViewportHeight > 0 ? g_outlineViewportHeight : viewport_height;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_outlineMaskFBO);
+        glBlitFramebuffer(
+            viewport_x,
+            viewport_y,
+            viewport_x + viewport_width,
+            viewport_y + viewport_height,
+            0,
+            0,
+            outline_width,
+            outline_height,
+            GL_DEPTH_BUFFER_BIT,
+            GL_NEAREST);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, g_outlineMaskFBO);
+        glViewport(0, 0, outline_width, outline_height);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_STENCIL_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+        if (use_gpu_highlight) {
+            DrawGPUHighlightSplats(
+                HighlightMaskAlphaCutoffForMode(active_highlight_mode),
+                0.0f,
+                (float)outline_width,
+                (float)outline_height,
+                true);
+        }
+        else {
+            DrawSplatBuffer(
+                g_highlightMaskVBO,
+                mvp_matrix,
+                HighlightMaskAlphaCutoffForMode(active_highlight_mode),
+                0.0f,
+                (float)outline_width,
+                (float)outline_height,
+                true);
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(viewport_x, viewport_y, viewport_width, viewport_height);
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(g_outlineCompositeShader);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_outlineMaskColorTex);
+        glUniform1i(glGetUniformLocation(g_outlineCompositeShader, "uMaskTex"), 0);
+        glUniform2f(glGetUniformLocation(g_outlineCompositeShader, "uTexelSize"), 1.0f / (float)outline_width, 1.0f / (float)outline_height);
+        glUniform1f(glGetUniformLocation(g_outlineCompositeShader, "uThicknessPx"), HighlightOutlineThicknessPxForMode(active_highlight_mode));
+        float outline_r = 0.0f;
+        float outline_g = 0.0f;
+        float outline_b = 0.0f;
+        float outline_a = 1.0f;
+        HighlightColorForMode(active_highlight_mode, &outline_r, &outline_g, &outline_b, &outline_a);
+        glUniform4f(glGetUniformLocation(g_outlineCompositeShader, "uOutlineColor"), outline_r, outline_g, outline_b, outline_a);
+        glBindVertexArray(g_outlineQuadVAO);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindVertexArray(0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return;
+    }
+
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (use_gpu_highlight) {
+        DrawGPUHighlightSplats(
+            0.5f,
+            HighlightOutlineExpandPxForMode(active_highlight_mode),
+            (float)viewport_width,
+            (float)viewport_height,
+            true);
+    }
+    else {
+        DrawSplatBuffer(
+            g_highlightMaskVBO,
+            mvp_matrix,
+            0.5f,
+            HighlightOutlineExpandPxForMode(active_highlight_mode),
+            (float)viewport_width,
+            (float)viewport_height,
+            true);
+    }
+}
+
 static SplatObject* FindSplatObject(const char* object_id) {
     if (object_id == nullptr) {
         return nullptr;
@@ -1159,20 +1273,8 @@ static void RefreshWorldSplatsFromObjects() {
         const double sy = object.base_half_extents_xyz[1] > 1.0e-8 ? (object.half_extents_xyz[1] / object.base_half_extents_xyz[1]) : 1.0;
         const double sz = object.base_half_extents_xyz[2] > 1.0e-8 ? (object.half_extents_xyz[2] / object.base_half_extents_xyz[2]) : 1.0;
         for (const GaussSplat& local : object.local_splats) {
-            GaussSplat world = local;
-            const double local_x = static_cast<double>(local.position[0]) * sx;
-            const double local_y = static_cast<double>(local.position[1]) * sy;
-            const double local_z = static_cast<double>(local.position[2]) * sz;
-            world.position[0] = static_cast<float>(object.center_xyz[0] + (object.axes_xyz[0] * local_x) + (object.axes_xyz[3] * local_y) + (object.axes_xyz[6] * local_z));
-            world.position[1] = static_cast<float>(object.center_xyz[1] + (object.axes_xyz[1] * local_x) + (object.axes_xyz[4] * local_y) + (object.axes_xyz[7] * local_z));
-            world.position[2] = static_cast<float>(object.center_xyz[2] + (object.axes_xyz[2] * local_x) + (object.axes_xyz[5] * local_y) + (object.axes_xyz[8] * local_z));
-            TransformVectorByObject(object, sx, sy, sz, local.basis_x, world.basis_x);
-            TransformVectorByObject(object, sx, sy, sz, local.basis_y, world.basis_y);
-            TransformVectorByObject(object, sx, sy, sz, local.basis_z, world.basis_z);
-            BuildWorldToLocalDirMatrix(object, sx, sy, sz, world.world_to_local_dir);
-            world.use_custom_basis = 1;
-            world.use_sh = local.use_sh;
-            world.highlight_mode = object.highlight_mode;
+            GaussSplat world = {};
+            BuildWorldSplatForObject(object, sx, sy, sz, local, world);
             g_splats.push_back(world);
         }
     }
@@ -1269,12 +1371,8 @@ static void InitializeSplatVBO() {
         LogRenderer("ERROR: Failed to initialize highlight mask splat VBO.");
         return;
     }
-    if (!InitializeBufferObjects(&g_outlineVBO)) {
-        LogRenderer("ERROR: Failed to initialize outline splat VBO.");
-        return;
-    }
 
-    LogRenderer("Splat VBO initialized successfully (main VAO:%u, mask VAO:%u, outline VAO:%u).", g_splatVBO.vao, g_highlightMaskVBO.vao, g_outlineVBO.vao);
+    LogRenderer("Splat VBO initialized successfully (main VAO:%u, mask VAO:%u).", g_splatVBO.vao, g_highlightMaskVBO.vao);
 }
 
 static void UpdateSplatVBOVertices(
@@ -1454,7 +1552,7 @@ extern "C" EXPORT void AddSplat(float x, float y, float z, float r, float g, flo
         s.rotation[1] = 0.0f; s.rotation[2] = 0.0f; s.rotation[3] = sn;
     }
     ComputeThreeBasisVectorsFromQuaternion(s.rotation[0], s.rotation[1], s.rotation[2], s.rotation[3], scaleX, scaleY, std::min(scaleX, scaleY), s.basis_x, s.basis_y, s.basis_z);
-    CopyIdentity3x3(s.world_to_local_dir);
+    BuildWorldToLocalDirMatrix(s.basis_x, s.basis_y, s.basis_z, s.world_to_local_dir);
     s.highlight_mode = HIGHLIGHT_NONE;
     g_splats.push_back(s);
     MarkSplatBuffersDirty();
@@ -1474,7 +1572,7 @@ extern "C" EXPORT void AddSplatWithQuaternion(float x, float y, float z, float r
         s.rotation[0] = 1.0f; s.rotation[1] = 0.0f; s.rotation[2] = 0.0f; s.rotation[3] = 0.0f;
     }
     ComputeThreeBasisVectorsFromQuaternion(s.rotation[0], s.rotation[1], s.rotation[2], s.rotation[3], scaleX, scaleY, std::min(scaleX, scaleY), s.basis_x, s.basis_y, s.basis_z);
-    CopyIdentity3x3(s.world_to_local_dir);
+    BuildWorldToLocalDirMatrix(s.basis_x, s.basis_y, s.basis_z, s.world_to_local_dir);
     s.highlight_mode = HIGHLIGHT_NONE;
     g_splats.push_back(s);
     MarkSplatBuffersDirty();
@@ -1576,6 +1674,7 @@ struct GPUComputePipeline {
     GLuint addOffsetsCS = 0;
     GLuint scatterCS = 0;
     GLuint renderVS_FS = 0;
+    GLuint highlightVS_FS = 0;
     GLuint emptyVAO = 0;
     GLuint splatDataSSBO = 0;
     GLuint objectDataSSBO = 0;
@@ -1589,6 +1688,11 @@ struct GPUComputePipeline {
     int drawSplatCount = 0;
 };
 static GPUComputePipeline g_gpu;
+struct GPUObjectRange {
+    GLint firstVertex = 0;
+    GLsizei vertexCount = 0;
+};
+static std::vector<GPUObjectRange> g_gpuObjectRanges;
 static const GLuint kGPUSortBinCount = 65536u;
 static const GLuint kGPUSortBlockSize = 256u;
 static const GLuint kGPUSortBlockCount = kGPUSortBinCount / kGPUSortBlockSize;
@@ -1602,6 +1706,8 @@ struct SplatData {
     vec4 basis_x;
     vec4 basis_y;
     vec4 basis_z;
+    vec4 sh_params;
+    vec4 sh_coeffs[12];
 };
 struct ObjectData {
     vec4 center_scale_x;
@@ -1629,10 +1735,82 @@ uniform mat4 uProj;
 uniform ivec2 uViewport;
 uniform int uIsPerspective;
 uniform int uNumSplats;
+uniform vec3 uCameraWorld;
+uniform int uSHDegreeOverride;
 uniform int uClipEnabled;
 uniform vec3 uClipCenter;
 uniform vec3 uClipHalfExtents;
 uniform mat3 uClipAxes;
+
+const float SH_C0 = 0.28209479177387814;
+const float SH_C1 = 0.4886025119029199;
+const float SH_C2[5] = float[5](
+    1.0925484305920792,
+    -1.0925484305920792,
+    0.31539156525252005,
+    -1.0925484305920792,
+    0.5462742152960396
+);
+const float SH_C3[7] = float[7](
+    -0.5900435899266435,
+    2.890611442640554,
+    -0.4570457994644658,
+    0.3731763325901154,
+    -0.4570457994644658,
+    1.445305721320277,
+    -0.5900435899266435
+);
+
+float FetchSHCoeff(in SplatData s, int flatIndex) {
+    int vecIndex = flatIndex / 4;
+    int componentIndex = flatIndex - (vecIndex * 4);
+    return s.sh_coeffs[vecIndex][componentIndex];
+}
+
+vec3 EvaluateSHColor(in SplatData s, in vec3 localDir) {
+    int shDegree = min(int(s.sh_params.x + 0.5), uSHDegreeOverride);
+    float x = localDir.x;
+    float y = localDir.y;
+    float z = localDir.z;
+    float xx = x * x;
+    float yy = y * y;
+    float zz = z * z;
+    float xy = x * y;
+    float yz = y * z;
+    float xz = x * z;
+
+    vec3 result = vec3(0.0);
+    for (int channel = 0; channel < 3; ++channel) {
+        int baseIndex = channel * 16;
+        float value = SH_C0 * FetchSHCoeff(s, baseIndex + 0);
+        if (shDegree > 0) {
+            value = value
+                - SH_C1 * y * FetchSHCoeff(s, baseIndex + 1)
+                + SH_C1 * z * FetchSHCoeff(s, baseIndex + 2)
+                - SH_C1 * x * FetchSHCoeff(s, baseIndex + 3);
+            if (shDegree > 1) {
+                value = value
+                    + SH_C2[0] * xy * FetchSHCoeff(s, baseIndex + 4)
+                    + SH_C2[1] * yz * FetchSHCoeff(s, baseIndex + 5)
+                    + SH_C2[2] * (2.0 * zz - xx - yy) * FetchSHCoeff(s, baseIndex + 6)
+                    + SH_C2[3] * xz * FetchSHCoeff(s, baseIndex + 7)
+                    + SH_C2[4] * (xx - yy) * FetchSHCoeff(s, baseIndex + 8);
+                if (shDegree > 2) {
+                    value = value
+                        + SH_C3[0] * y * (3.0 * xx - yy) * FetchSHCoeff(s, baseIndex + 9)
+                        + SH_C3[1] * xy * z * FetchSHCoeff(s, baseIndex + 10)
+                        + SH_C3[2] * y * (4.0 * zz - xx - yy) * FetchSHCoeff(s, baseIndex + 11)
+                        + SH_C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * FetchSHCoeff(s, baseIndex + 12)
+                        + SH_C3[4] * x * (4.0 * zz - xx - yy) * FetchSHCoeff(s, baseIndex + 13)
+                        + SH_C3[5] * z * (xx - yy) * FetchSHCoeff(s, baseIndex + 14)
+                        + SH_C3[6] * x * (xx - 3.0 * yy) * FetchSHCoeff(s, baseIndex + 15);
+                }
+            }
+        }
+        result[channel] = max(value + 0.5, 0.0);
+    }
+    return result;
+}
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
@@ -1697,6 +1875,22 @@ void main() {
         axisX * (localBz.x * sx) +
         axisY * (localBz.y * sy) +
         axisZ * (localBz.z * sz);
+    vec4 finalColor = vec4(s.color_pad.rgb, s.pos_opacity.w);
+    if (s.sh_params.y > 0.5 && uSHDegreeOverride > 0) {
+        vec3 shAxisX = (length(bx) > 1e-8) ? normalize(bx) : axisX;
+        vec3 shAxisY = (length(by) > 1e-8) ? normalize(by) : axisY;
+        vec3 shAxisZ = (length(bz) > 1e-8) ? normalize(bz) : axisZ;
+        vec3 worldDir = wPos - uCameraWorld;
+        vec3 localDir = vec3(
+            dot(worldDir, shAxisX),
+            dot(worldDir, shAxisY),
+            dot(worldDir, shAxisZ)
+        );
+        float localDirLen = length(localDir);
+        if (localDirLen > 1e-8) {
+            finalColor.rgb = EvaluateSHColor(s, localDir / localDirLen);
+        }
+    }
     mat3 covW = mat3(
         bx.x*bx.x + by.x*by.x + bz.x*bz.x,
         bx.x*bx.y + by.x*by.y + bz.x*bz.y,
@@ -1764,8 +1958,7 @@ void main() {
 
     projected[id].center_depth = vec4(ndc, ndcZ, 1.0);
     projected[id].axes = vec4(ndcMaj, ndcMin);
-    projected[id].color = s.color_pad;
-    projected[id].color.a = s.pos_opacity.w;
+    projected[id].color = finalColor;
 
     uint sortKey = 0xFFFFFFFFu - floatBitsToUint(depth);
     sortEntries[id] = SortEntry(sortKey, uint(id));
@@ -1804,6 +1997,52 @@ void main() {
     float a = g * vColor.a;
     if (a < 0.004) discard;
     fragColor = vec4(vColor.rgb, a);
+}
+)";
+
+static const char* g_gpuHighlightVS_Source = R"(#version 430
+struct SplatOut { vec4 center_depth; vec4 axes; vec4 color; };
+layout(std430, binding = 1) readonly buffer B1 { SplatOut projected[]; };
+uniform vec2 uViewportSize;
+uniform float uScreenExpandPx;
+uniform vec4 uHighlightColor;
+out vec2 vTexCoord;
+out vec4 vColor;
+void main() {
+    int splatIndex = gl_VertexID / 6;
+    int v = gl_VertexID % 6;
+    int corner = (v < 3) ? v : (v == 3 ? 0 : (v == 4 ? 2 : 3));
+    vec2 off[4] = vec2[4](vec2(-1,-1), vec2(1,-1), vec2(1,1), vec2(-1,1));
+    SplatOut sp = projected[splatIndex];
+    if (sp.center_depth.w <= 0.0) {
+        gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
+        vTexCoord = vec2(0.5);
+        vColor = vec4(0.0);
+        return;
+    }
+    vec2 o = off[corner];
+    vec2 p = sp.center_depth.xy + o.x * sp.axes.xy + o.y * sp.axes.zw;
+    if (uScreenExpandPx > 0.0 && uViewportSize.x > 0.0 && uViewportSize.y > 0.0) {
+        p += o * vec2((uScreenExpandPx * 2.0) / uViewportSize.x, (uScreenExpandPx * 2.0) / uViewportSize.y);
+    }
+    vTexCoord = o * 0.5 + 0.5;
+    vColor = uHighlightColor;
+    gl_Position = vec4(p, sp.center_depth.z, 1.0);
+}
+)";
+
+static const char* g_gpuHighlightFS_Source = R"(#version 430
+in vec2 vTexCoord;
+in vec4 vColor;
+uniform float uAlphaCutoff;
+uniform int uBinaryMask;
+out vec4 fragColor;
+void main() {
+    vec2 d = vTexCoord * 2.0 - 1.0;
+    float g = exp(-dot(d, d) / 0.18);
+    float a = g * vColor.a;
+    if (a <= uAlphaCutoff) discard;
+    fragColor = vec4(vColor.rgb, uBinaryMask != 0 ? 1.0 : a);
 }
 )";
 
@@ -1975,6 +2214,8 @@ static bool InitGPUPipeline() {
     }
     g_gpu.renderVS_FS = CompileRenderShader(g_gpuRenderVS_Source, g_gpuRenderFS_Source);
     if (!g_gpu.renderVS_FS) { LogRenderer("GPU pipeline: render shader failed."); return false; }
+    g_gpu.highlightVS_FS = CompileRenderShader(g_gpuHighlightVS_Source, g_gpuHighlightFS_Source);
+    if (!g_gpu.highlightVS_FS) { LogRenderer("GPU pipeline: highlight shader failed."); return false; }
     glGenVertexArrays(1, &g_gpu.emptyVAO);
     glGenBuffers(1, &g_gpu.splatDataSSBO);
     glGenBuffers(1, &g_gpu.objectDataSSBO);
@@ -2005,17 +2246,24 @@ static void UploadSplatsToGPU() {
         float basis_x[4];
         float basis_y[4];
         float basis_z[4];
+        float sh_params[4];
+        float sh_coeffs[48];
     };
 
     std::vector<GPUSplatData> buf;
+    g_gpuObjectRanges.clear();
     if (!g_splatObjects.empty()) {
         size_t total = 0;
         for (const SplatObject& object : g_splatObjects) {
             total += object.local_splats.size();
         }
         buf.reserve(total);
+        g_gpuObjectRanges.reserve(g_splatObjects.size());
         for (size_t objectIndex = 0; objectIndex < g_splatObjects.size(); ++objectIndex) {
             const SplatObject& object = g_splatObjects[objectIndex];
+            GPUObjectRange range = {};
+            range.firstVertex = static_cast<GLint>(buf.size() * 6);
+            range.vertexCount = static_cast<GLsizei>(object.local_splats.size() * 6);
             for (const GaussSplat& s : object.local_splats) {
                 GPUSplatData gpuSplat = {};
                 gpuSplat.pos_opacity[0] = s.position[0];
@@ -2036,11 +2284,16 @@ static void UploadSplatsToGPU() {
                 gpuSplat.basis_z[1] = s.basis_z[1];
                 gpuSplat.basis_z[2] = s.basis_z[2];
                 gpuSplat.basis_z[3] = static_cast<float>(objectIndex);
+                gpuSplat.sh_params[0] = static_cast<float>(s.sh_degree);
+                gpuSplat.sh_params[1] = static_cast<float>(s.use_sh);
+                memcpy(gpuSplat.sh_coeffs, s.sh_coeffs, sizeof(gpuSplat.sh_coeffs));
                 buf.push_back(gpuSplat);
             }
+            g_gpuObjectRanges.push_back(range);
         }
     }
     else {
+        g_gpuObjectRanges.clear();
         buf.resize(g_splats.size());
         for (size_t i = 0; i < g_splats.size(); ++i) {
             const GaussSplat& s = g_splats[i];
@@ -2062,6 +2315,9 @@ static void UploadSplatsToGPU() {
             buf[i].basis_z[1] = s.basis_z[1];
             buf[i].basis_z[2] = s.basis_z[2];
             buf[i].basis_z[3] = 0.0f;
+            buf[i].sh_params[0] = static_cast<float>(s.sh_degree);
+            buf[i].sh_params[1] = static_cast<float>(s.use_sh);
+            memcpy(buf[i].sh_coeffs, s.sh_coeffs, sizeof(buf[i].sh_coeffs));
         }
     }
 
@@ -2152,7 +2408,7 @@ static bool UploadGPUObjectData() {
     return true;
 }
 
-static void DispatchGPUProjection(const float* viewMatrix, const float* projMatrix, int vpW, int vpH, int isPerspective, const NativeClipBoxState& clipBox) {
+static void DispatchGPUProjection(const float* viewMatrix, const float* projMatrix, const float* cameraPosition, int vpW, int vpH, int isPerspective, const NativeClipBoxState& clipBox) {
     if (!g_gpu.supported || g_gpu.uploadedSplatCount == 0) return;
     int n = g_gpu.uploadedSplatCount;
 
@@ -2162,6 +2418,8 @@ static void DispatchGPUProjection(const float* viewMatrix, const float* projMatr
     glUniform2i(glGetUniformLocation(g_gpu.projectCS, "uViewport"), vpW, vpH);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uIsPerspective"), isPerspective);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uNumSplats"), n);
+    glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uCameraWorld"), cameraPosition[0], cameraPosition[1], cameraPosition[2]);
+    glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uSHDegreeOverride"), g_shRenderDegreeOverride);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uClipEnabled"), clipBox.enabled ? 1 : 0);
     if (clipBox.enabled) {
         glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uClipCenter"), (float)clipBox.center_xyz[0], (float)clipBox.center_xyz[1], (float)clipBox.center_xyz[2]);
@@ -2254,6 +2512,48 @@ static void DrawGPUSplats() {
     glUseProgram(0);
 }
 
+static bool CanUseGPUHighlightOverlay() {
+    return g_gpu.supported &&
+        g_gpu.highlightVS_FS != 0 &&
+        g_gpu.projectedSSBO != 0 &&
+        g_gpu.emptyVAO != 0 &&
+        !g_splatObjects.empty() &&
+        g_gpuObjectRanges.size() == g_splatObjects.size();
+}
+
+static void DrawGPUHighlightSplats(float alpha_cutoff, float screen_expand_px, float viewport_width, float viewport_height, bool binary_mask) {
+    if (!CanUseGPUHighlightOverlay()) {
+        return;
+    }
+
+    glUseProgram(g_gpu.highlightVS_FS);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_gpu.projectedSSBO);
+    glUniform2f(glGetUniformLocation(g_gpu.highlightVS_FS, "uViewportSize"), viewport_width, viewport_height);
+    glUniform1f(glGetUniformLocation(g_gpu.highlightVS_FS, "uScreenExpandPx"), screen_expand_px);
+    glUniform1f(glGetUniformLocation(g_gpu.highlightVS_FS, "uAlphaCutoff"), alpha_cutoff);
+    glUniform1i(glGetUniformLocation(g_gpu.highlightVS_FS, "uBinaryMask"), binary_mask ? 1 : 0);
+    glBindVertexArray(g_gpu.emptyVAO);
+
+    for (size_t object_index = 0; object_index < g_splatObjects.size(); ++object_index) {
+        const SplatObject& object = g_splatObjects[object_index];
+        const GPUObjectRange& range = g_gpuObjectRanges[object_index];
+        if (!object.visible || object.highlight_mode == HIGHLIGHT_NONE || range.vertexCount <= 0) {
+            continue;
+        }
+
+        float outline_r = 0.0f;
+        float outline_g = 0.0f;
+        float outline_b = 0.0f;
+        float outline_a = 1.0f;
+        HighlightColorForMode(object.highlight_mode, &outline_r, &outline_g, &outline_b, &outline_a);
+        glUniform4f(glGetUniformLocation(g_gpu.highlightVS_FS, "uHighlightColor"), outline_r, outline_g, outline_b, outline_a);
+        glDrawArrays(GL_TRIANGLES, range.firstVertex, range.vertexCount);
+    }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
 extern "C" EXPORT void renderPointCloud() {
     std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     LogRenderer("CHK: renderPointCloud enter");
@@ -2321,7 +2621,7 @@ extern "C" EXPORT void renderPointCloud() {
     if (clipStateChanged) {
         g_lastClipBoxState = clipBoxState;
         g_hasLastClipBoxState = true;
-        g_outlineVBO.needsUpdate = true;
+        g_highlightMaskVBO.needsUpdate = true;
     }
 
     if (g_renderBisectStage == 1) {
@@ -2352,7 +2652,7 @@ extern "C" EXPORT void renderPointCloud() {
         const bool uploadedObjects = UploadGPUObjectData();
         UploadSplatsToGPU();
         if (g_gpu.uploadedSplatCount > 0 && (uploadedSplats || uploadedObjects || g_splatVBO.needsUpdate || geometryStateChanged || clipStateChanged)) {
-            DispatchGPUProjection(viewMatrix, projectionMatrix, viewport[2], viewport[3], isPerspective, clipBoxState);
+            DispatchGPUProjection(viewMatrix, projectionMatrix, camPos, viewport[2], viewport[3], isPerspective, clipBoxState);
             GPUCountingSort();
             memcpy(g_lastGeometryCamPos, camPos, 3 * sizeof(float));
             memcpy(g_lastGeometryViewDir, viewDir, 3 * sizeof(float));
@@ -2392,7 +2692,7 @@ extern "C" EXPORT void renderPointCloud() {
         return;
     }
 
-    if (g_enableHighlightRendering && useVBO && g_highlightMaskVBO.initialized && g_outlineVBO.initialized) {
+    if (g_enableHighlightRendering && !gpuPathActive && useVBO && g_highlightMaskVBO.initialized && HasHighlightedObjects()) {
         UpdateHighlightVBOVertices(clipBoxState, viewMatrix, projectionMatrix, camPos, isPerspective, viewport[2], viewport[3], geometryUpdated);
     }
 
@@ -2501,6 +2801,7 @@ extern "C" EXPORT void renderPointCloud() {
 
     if (gpuPathActive) {
         DrawGPUSplats();
+        RenderHighlightOverlay(mvpMatrix, viewport[0], viewport[1], viewport[2], viewport[3], stencilBits, true);
     }
     else if (useVBO && g_splatVBO.initialized && g_splatShader != 0) {
         if (g_splatVBO.ebo == 0) { LogRenderer("ERROR: EBO is 0, cannot draw!"); }
@@ -2509,112 +2810,7 @@ extern "C" EXPORT void renderPointCloud() {
             if (eboSizeCheck == 0 && g_splatSortIndices.size() > 0) { LogRenderer("WARN: EBO size is 0 but we have sort indices! Skipping draw."); }
             else if (eboSizeCheck > 0) {
                 DrawSplatBuffer(g_splatVBO, mvpMatrix, 0.0f, 0.0f, (float)viewport[2], (float)viewport[3]);
-                if (g_enableHighlightRendering && !g_highlightMaskVBO.indices.empty()) {
-                    int activeHighlightMode = HIGHLIGHT_NONE;
-                    for (const SplatObject& object : g_splatObjects) {
-                        if (object.visible && object.highlight_mode != HIGHLIGHT_NONE) {
-                            activeHighlightMode = object.highlight_mode;
-                            break;
-                        }
-                    }
-
-                    if (activeHighlightMode != HIGHLIGHT_NONE) {
-                        if (EnsureOutlineTextures(viewport[2], viewport[3]) && EnsureOutlineQuad()) {
-                            glBindFramebuffer(GL_FRAMEBUFFER, g_outlineMaskFBO);
-                            glViewport(0, 0, viewport[2], viewport[3]);
-                            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-                            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-                            glDisable(GL_DEPTH_TEST);
-                            glDepthMask(GL_FALSE);
-                            glDisable(GL_BLEND);
-                            DrawSplatBuffer(
-                                g_highlightMaskVBO,
-                                mvpMatrix,
-                                HighlightMaskAlphaCutoffForMode(activeHighlightMode),
-                                0.0f,
-                                (float)viewport[2],
-                                (float)viewport[3],
-                                true);
-
-                            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                            glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-                            glDisable(GL_DEPTH_TEST);
-                            glEnable(GL_BLEND);
-                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                            glUseProgram(g_outlineCompositeShader);
-                            glActiveTexture(GL_TEXTURE0);
-                            glBindTexture(GL_TEXTURE_2D, g_outlineMaskColorTex);
-                            glUniform1i(glGetUniformLocation(g_outlineCompositeShader, "uMaskTex"), 0);
-                            glUniform2f(glGetUniformLocation(g_outlineCompositeShader, "uTexelSize"), 1.0f / (float)viewport[2], 1.0f / (float)viewport[3]);
-                            glUniform1f(glGetUniformLocation(g_outlineCompositeShader, "uThicknessPx"), HighlightOutlineThicknessPxForMode(activeHighlightMode));
-                            glUniform1f(glGetUniformLocation(g_outlineCompositeShader, "uMergePx"), HighlightOutlineMergePxForMode(activeHighlightMode));
-                            glUniform1f(glGetUniformLocation(g_outlineCompositeShader, "uGapPx"), HighlightOutlineGapPxForMode(activeHighlightMode));
-                            glUniform1f(glGetUniformLocation(g_outlineCompositeShader, "uInnerThreshold"), 0.45f);
-                            glUniform1f(glGetUniformLocation(g_outlineCompositeShader, "uOuterThreshold"), 0.12f);
-                            float outline_r = 0.0f;
-                            float outline_g = 0.0f;
-                            float outline_b = 0.0f;
-                            float outline_a = 1.0f;
-                            HighlightColorForMode(activeHighlightMode, &outline_r, &outline_g, &outline_b, &outline_a);
-                            glUniform4f(glGetUniformLocation(g_outlineCompositeShader, "uOutlineColor"), outline_r, outline_g, outline_b, 1.0f);
-                            glBindVertexArray(g_outlineQuadVAO);
-                            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                            glBindVertexArray(0);
-                            glActiveTexture(GL_TEXTURE0);
-                            glBindTexture(GL_TEXTURE_2D, 0);
-                        }
-                        else if (stencilBits > 0) {
-                            glClearStencil(0);
-                            glClear(GL_STENCIL_BUFFER_BIT);
-                            glEnable(GL_STENCIL_TEST);
-                            glStencilMask(0xFF);
-                            glStencilFunc(GL_ALWAYS, 1, 0xFF);
-                            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-                            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-                            glEnable(GL_DEPTH_TEST);
-                            glDepthFunc(GL_LEQUAL);
-                            glDepthMask(GL_FALSE);
-                            glDisable(GL_BLEND);
-                            DrawSplatBuffer(
-                                g_highlightMaskVBO,
-                                mvpMatrix,
-                                HighlightMaskAlphaCutoffForMode(activeHighlightMode),
-                                0.0f,
-                                (float)viewport[2],
-                                (float)viewport[3],
-                                true);
-
-                            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                            glStencilMask(0x00);
-                            glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
-                            glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-                            glDisable(GL_DEPTH_TEST);
-                            glEnable(GL_BLEND);
-                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                            DrawSplatBuffer(
-                                g_highlightMaskVBO,
-                                mvpMatrix,
-                                0.5f,
-                                HighlightOutlineExpandPxForMode(activeHighlightMode),
-                                (float)viewport[2],
-                                (float)viewport[3],
-                                true);
-                            glDisable(GL_STENCIL_TEST);
-                        } else {
-                            glDisable(GL_DEPTH_TEST);
-                            glEnable(GL_BLEND);
-                            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                            DrawSplatBuffer(
-                                g_highlightMaskVBO,
-                                mvpMatrix,
-                                0.5f,
-                                HighlightOutlineExpandPxForMode(activeHighlightMode),
-                                (float)viewport[2],
-                                (float)viewport[3],
-                                true);
-                        }
-                    }
-                }
+                RenderHighlightOverlay(mvpMatrix, viewport[0], viewport[1], viewport[2], viewport[3], stencilBits, false);
             }
         }
     }
@@ -2764,6 +2960,11 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     const float scaleDistance = 20.0f;
     bool haveBounds = false;
     double minX = 0.0, minY = 0.0, minZ = 0.0, maxX = 0.0, maxY = 0.0, maxZ = 0.0;
+    int sh_enabled_count = 0;
+    float first_rest0 = 0.0f;
+    float first_rest1 = 0.0f;
+    float first_rest2 = 0.0f;
+    bool captured_first_rest = false;
 
     for (int i = 0; i < count; ++i) {
         float mapped_position[3] = {};
@@ -2812,6 +3013,9 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
         CopyIdentity3x3(splat.world_to_local_dir);
         splat.sh_degree = std::max(0, std::min(points[i].sh_degree, 3));
         splat.use_sh = splat.sh_degree > 0 ? 1 : 0;
+        if (splat.use_sh != 0) {
+            ++sh_enabled_count;
+        }
         splat.sh_coeffs[0] = points[i].color[0];
         splat.sh_coeffs[16] = points[i].color[1];
         splat.sh_coeffs[32] = points[i].color[2];
@@ -2821,6 +3025,12 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
             splat.sh_coeffs[coeff + 1] = points[i].f_rest[coeff];
             splat.sh_coeffs[16 + coeff + 1] = points[i].f_rest[rest_coeff_count + coeff];
             splat.sh_coeffs[32 + coeff + 1] = points[i].f_rest[2 * rest_coeff_count + coeff];
+        }
+        if (!captured_first_rest && rest_coeff_count > 0) {
+            first_rest0 = points[i].f_rest[0];
+            first_rest1 = rest_coeff_count > 1 ? points[i].f_rest[1] : 0.0f;
+            first_rest2 = rest_coeff_count > 2 ? points[i].f_rest[2] : 0.0f;
+            captured_first_rest = true;
         }
         splat.use_custom_basis = 1;
         BuildMappedBasisVectors(points[i], scaleX, scaleY, scaleZ, up_axis_mode, splat.basis_x, splat.basis_y, splat.basis_z);
@@ -2861,7 +3071,13 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
         out_half_extents_xyz[2] = object.half_extents_xyz[2];
     }
 
-    LogRenderer("CHK: BuildSplatObjectFromPLYData finished local_splats=%zu", object.local_splats.size());
+    LogRenderer(
+        "CHK: BuildSplatObjectFromPLYData finished local_splats=%zu sh_enabled=%d first_dc=(%.5f, %.5f, %.5f) first_rest=(%.5f, %.5f, %.5f)",
+        object.local_splats.size(),
+        sh_enabled_count,
+        points[0].color[0], points[0].color[1], points[0].color[2],
+        first_rest0, first_rest1, first_rest2
+    );
     RefreshWorldSplatsFromObjects();
     LogRenderer("CHK: RefreshWorldSplatsFromObjects finished");
     return 1;
@@ -2970,7 +3186,10 @@ extern "C" EXPORT int SetSplatObjectHighlight(const char* object_id, int highlig
     object->highlight_mode =
         (highlight_mode == HIGHLIGHT_SELECTED) ? HIGHLIGHT_SELECTED :
         (highlight_mode == HIGHLIGHT_HOVER ? HIGHLIGHT_HOVER : HIGHLIGHT_NONE);
-    g_outlineVBO.needsUpdate = true;
+    for (GaussSplat& local_splat : object->local_splats) {
+        local_splat.highlight_mode = object->highlight_mode;
+    }
+    g_highlightMaskVBO.needsUpdate = true;
     return 1;
 }
 
@@ -2991,6 +3210,18 @@ extern "C" EXPORT int RemoveSplatObject(const char* object_id) {
     g_splatObjects.erase(newEnd, g_splatObjects.end());
     RefreshWorldSplatsFromObjects();
     return 1;
+}
+
+extern "C" EXPORT void SetSHRenderDegree(int degree) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    g_shRenderDegreeOverride = std::max(0, std::min(degree, 3));
+    g_splatVBO.needsUpdate = true;
+    g_gpuObjectDataDirty = true;
+    LogRenderer("SH render degree override set to %d", g_shRenderDegreeOverride);
+}
+
+extern "C" EXPORT int GetSHRenderDegree() {
+    return g_shRenderDegreeOverride;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {

@@ -257,6 +257,41 @@ module GaussianPoints
                 font: inherit;
               }
 
+              .slider-wrap {
+                margin-top: 12px;
+                padding: 14px;
+                border-radius: 14px;
+                border: 1px solid var(--line);
+                background: rgba(255,255,255,0.76);
+              }
+
+              .slider-head {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 10px;
+                font-size: 13px;
+              }
+
+              .slider-value {
+                font-weight: bold;
+                color: var(--accent-strong);
+              }
+
+              input[type="range"] {
+                width: 100%;
+              }
+
+              .slider-steps {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 6px;
+                margin-top: 8px;
+                font-size: 11px;
+                color: var(--muted);
+                text-align: center;
+              }
+
               .status-bar {
                 margin-top: 14px;
                 padding: 12px 14px;
@@ -337,6 +372,19 @@ module GaussianPoints
               <section class="panel">
                 <h2>Scene Controls</h2>
                 <p>Useful while iterating inside SketchUp without reopening the dialog.</p>
+                <div class="slider-wrap">
+                  <div class="slider-head">
+                    <span>SH Render Level</span>
+                    <span class="slider-value" id="shDegreeValue">3</span>
+                  </div>
+                  <input id="shDegree" type="range" min="0" max="3" step="1" value="3" />
+                  <div class="slider-steps">
+                    <span>0 · DC</span>
+                    <span>1</span>
+                    <span>2</span>
+                    <span>3 · Full</span>
+                  </div>
+                </div>
                 <div class="secondary-row">
                   <button class="mini" data-action="initialize">Initialize</button>
                   <button class="mini" data-action="render_now">Show Now</button>
@@ -355,6 +403,8 @@ module GaussianPoints
               const sandboxPath = document.getElementById('sandboxPath');
               const statusBar = document.getElementById('statusBar');
               const upAxisMode = document.getElementById('upAxisMode');
+              const shDegree = document.getElementById('shDegree');
+              const shDegreeValue = document.getElementById('shDegreeValue');
 
               function setStatus(message, level) {
                 statusBar.textContent = message;
@@ -366,6 +416,8 @@ module GaussianPoints
                 initState.textContent = payload.initialized ? 'Initialized' : 'Idle';
                 sandboxPath.textContent = payload.sandbox_dir || 'Path unavailable';
                 upAxisMode.value = payload.up_axis_mode || 'swap_b';
+                shDegree.value = String(payload.sh_render_degree ?? 3);
+                shDegreeValue.textContent = shDegree.value;
                 if (payload.message) {
                   setStatus(payload.message, payload.level || '');
                 }
@@ -383,6 +435,15 @@ module GaussianPoints
 
               upAxisMode.addEventListener('change', () => {
                 sketchup.set_up_axis_mode(upAxisMode.value);
+              });
+
+              shDegree.addEventListener('input', () => {
+                shDegreeValue.textContent = shDegree.value;
+              });
+
+              shDegree.addEventListener('change', () => {
+                setStatus('Updating SH render level...', '');
+                sketchup.set_sh_render_degree(shDegree.value);
               });
 
               document.addEventListener('DOMContentLoaded', () => {
@@ -403,6 +464,12 @@ module GaussianPoints
           mode = GaussianPoints::GaussianSplats.set_up_axis_mode(value)
           label = GaussianPoints::GaussianSplats.orientation_label(mode)
           push_state("Gaussian import orientation set to #{label}. Reload the same PLY and tell me which variant is correct.", 'ok')
+        end
+
+        @@dialog.add_action_callback('set_sh_render_degree') do |_ctx, value|
+          degree = GaussianPoints::GaussianSplats.set_sh_render_degree(value)
+          GaussianPoints::GaussianSplats.render_splats
+          push_state("SH render level set to #{degree}. Compare 0 against 3 live in the same camera view.", 'ok')
         end
 
         @@dialog.add_action_callback('initialize') do |_ctx|

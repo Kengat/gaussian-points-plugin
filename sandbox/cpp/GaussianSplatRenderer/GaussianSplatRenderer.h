@@ -47,6 +47,8 @@ extern "C" {
     EXPORT int SetSplatObjectHighlight(const char* object_id, int highlight_mode);
     EXPORT int RemoveSplatObject(const char* object_id);
     EXPORT void ClearSplatObjects();
+    EXPORT void SetSHRenderDegree(int degree);
+    EXPORT int GetSHRenderDegree();
 
     // Report an axis-aligned bounds box for the loaded splats.
     EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz);

@@ -8,6 +8,7 @@ module GaussianPoints
   module GaussianSplats
     PREF_NAMESPACE = 'GaussianPoints'.freeze
     PREF_UP_AXIS_KEY = 'gaussian_splats_up_axis'.freeze
+    PREF_SH_RENDER_DEGREE_KEY = 'gaussian_splats_sh_render_degree'.freeze
     ORIENTATION_LEGACY = 'legacy'.freeze
     ORIENTATION_SWAP_A = 'swap_a'.freeze
     ORIENTATION_SWAP_B = 'swap_b'.freeze
@@ -76,6 +77,28 @@ module GaussianPoints
       end
     end
 
+    def self.normalize_sh_render_degree(value)
+      [[value.to_i, 0].max, 3].min
+    rescue StandardError
+      3
+    end
+
+    def self.sh_render_degree
+      normalize_sh_render_degree(Sketchup.read_default(PREF_NAMESPACE, PREF_SH_RENDER_DEGREE_KEY, 3))
+    rescue StandardError
+      3
+    end
+
+    def self.set_sh_render_degree(value)
+      degree = normalize_sh_render_degree(value)
+      Sketchup.write_default(PREF_NAMESPACE, PREF_SH_RENDER_DEGREE_KEY, degree)
+      apply_sh_render_degree(degree)
+      Sketchup.active_model&.active_view&.invalidate
+      degree
+    rescue StandardError
+      3
+    end
+
     def self.hook_dll_path
       GaussianPoints::NativePaths.bridge_dll
     end
@@ -116,11 +139,23 @@ module GaussianPoints
     end
 
     def self.status_payload
+      native_sh_degree =
+        begin
+          if @renderer_dll_loaded && @get_sh_render_degree
+            normalize_sh_render_degree(@get_sh_render_degree.call)
+          else
+            sh_render_degree
+          end
+        rescue StandardError
+          sh_render_degree
+        end
+
       {
         available: available?,
         initialized: initialized?,
         loaded: loaded?,
         up_axis_mode: up_axis_mode,
+        sh_render_degree: native_sh_degree,
         sandbox_dir: plugin_dir,
         hook_loaded: @hook_dll_loaded == true,
         renderer_loaded: @renderer_dll_loaded == true,
@@ -268,6 +303,26 @@ module GaussianPoints
         end
 
         begin
+          @set_sh_render_degree = Fiddle::Function.new(
+            @renderer_dll['SetSHRenderDegree'],
+            [Fiddle::TYPE_INT],
+            Fiddle::TYPE_VOID
+          )
+        rescue Fiddle::DLError
+          @set_sh_render_degree = nil
+        end
+
+        begin
+          @get_sh_render_degree = Fiddle::Function.new(
+            @renderer_dll['GetSHRenderDegree'],
+            [],
+            Fiddle::TYPE_INT
+          )
+        rescue Fiddle::DLError
+          @get_sh_render_degree = nil
+        end
+
+        begin
           @get_splat_bounds = Fiddle::Function.new(
             @renderer_dll['GetSplatBounds'],
             [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
@@ -304,6 +359,7 @@ module GaussianPoints
 
       @install_all_hooks.call
       @initialized = true
+      apply_sh_render_degree(sh_render_degree)
       puts 'Gaussian splat hooks installed'
       true
     rescue StandardError => e
@@ -456,6 +512,15 @@ module GaussianPoints
 
     def self.clear_splat_objects
       clear_splats
+    end
+
+    def self.apply_sh_render_degree(degree = sh_render_degree)
+      return false unless setup_dlls
+      return false unless @renderer_dll_loaded
+      return false unless @set_sh_render_degree
+
+      @set_sh_render_degree.call(normalize_sh_render_degree(degree))
+      true
     end
 
     def self.init_plugin
