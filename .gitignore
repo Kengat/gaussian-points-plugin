@@ -27,3 +27,22 @@ external/SketchUpSDK/
 # Source artwork backups
 ui/icons_originals/
 ui/icons/*.tmp.png
+
+# Companion desktop app runtime data
+.gaussian_points_companion/
+companion_app_data/
+_tmp_companion_smoke*/
+_tmp_manifest*/
+
+# Python cache and local test artifacts
+.gstrain310/
+.gstrain311/
+companion_app/__pycache__/
+companion_app/tests/__pycache__/
+companion_app/tests/_tmp_*/
+companion_app/tests/_smoke_*/
+companion_app/tests/_smoke_assets/
+
+# Temporary dataset fetch worktrees and probes
+sample_datasets/_hf_lego_repo/
+sample_datasets/_probe_*

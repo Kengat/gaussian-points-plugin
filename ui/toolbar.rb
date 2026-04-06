@@ -1,40 +1,61 @@
 module GaussianPoints
   module UIparts
     module ToolbarManager
+      def self.safe_ui_action(title)
+        yield
+      rescue StandardError => e
+        UI.messagebox("#{title}\n#{e.class}: #{e.message}")
+        false
+      end
+
       def self.create_toolbar
         toolbar = UI::Toolbar.new('Gaussian_Points')
+        @commands = []
 
         cmd_import = UI::Command.new('Import') {
-          GaussianPoints::IO::Importer.import_dialog
+          safe_ui_action('Import failed') { GaussianPoints::IO::Importer.import_dialog }
         }
       cmd_import.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'import_24.png')
       cmd_import.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'import_32.png')
         cmd_import.tooltip = 'Import'
         cmd_import.status_bar_text = 'Imports data from external files.'
+        @commands << cmd_import
 
         cmd_export = UI::Command.new('Export') {
-          GaussianPoints::IO::Exporter.export_xyz
+          safe_ui_action('Export failed') { GaussianPoints::IO::Exporter.export_xyz }
         }
       cmd_export.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'export_24.png')
       cmd_export.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'export_32.png')
         cmd_export.tooltip = 'Export'
         cmd_export.status_bar_text = 'Exports geometry as points.'
+        @commands << cmd_export
 
-        cmd_gaus = UI::Command.new('Gaussian Splatting') {
-          GaussianPoints::UIparts::GaussianSplattingDialog.show_dialog
+        cmd_gaus = UI::Command.new('Gaussian Splat Loader') {
+          safe_ui_action('Gaussian Splat Loader failed') { GaussianPoints::UIparts::GaussianSplattingDialog.show_dialog }
         }
       cmd_gaus.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'gaus_24.png')
       cmd_gaus.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'gaus_32.png')
-        cmd_gaus.tooltip = 'Gaussian Splatting'
-        cmd_gaus.status_bar_text = 'Opens the integrated Gaussian splatting controls.'
+        cmd_gaus.tooltip = 'Gaussian Splat Loader'
+        cmd_gaus.status_bar_text = 'Loads a Gaussian splat into SketchUp.'
+        @commands << cmd_gaus
+
+        cmd_train_gaus = UI::Command.new('Gaussian Splat Training') {
+          safe_ui_action('Gaussian Splat Training failed') { GaussianPoints::IO::CompanionBridge.launch }
+        }
+      cmd_train_gaus.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'train_gauss_24.png')
+      cmd_train_gaus.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'train_gauss_32.png')
+        cmd_train_gaus.tooltip = 'Gaussian Splat Training'
+        cmd_train_gaus.status_bar_text = 'Launches the standalone Gaussian Splat training companion app.'
+        @commands << cmd_train_gaus
 
         toolbar.add_item(cmd_import)
         toolbar.add_item(cmd_export)
         toolbar.add_item(cmd_gaus)
+        toolbar.add_item(cmd_train_gaus)
         toolbar.add_separator
 
         cmd_vis = UI::Command.new('Visualization') {
-          VisualizationDialog.show_dialog
+          safe_ui_action('Visualization failed') { VisualizationDialog.show_dialog }
         }
       cmd_vis.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'vis_24.png')
       cmd_vis.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'vis_32.png')
@@ -142,7 +163,7 @@ module GaussianPoints
         cmd_hide.status_bar_text = 'Toggles overlay visibility.'
 
         cmd_delete = UI::Command.new('Delete') {
-          DeleteDialog.show_dialog
+          safe_ui_action('Delete dialog failed') { DeleteDialog.show_dialog }
         }
       cmd_delete.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'delete_24.png')
       cmd_delete.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'delete_32.png')
@@ -150,7 +171,7 @@ module GaussianPoints
         cmd_delete.status_bar_text = 'Removes points from the model.'
 
         cmd_settings = UI::Command.new('Settings') {
-          SettingsDialog.show_dialog
+          safe_ui_action('Settings failed') { SettingsDialog.show_dialog }
         }
       cmd_settings.small_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'settings_24.png')
       cmd_settings.large_icon = File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'icons', 'settings_32.png')

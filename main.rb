@@ -70,6 +70,7 @@ require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'octree_processor_native.rb'
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'gasp_project.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'importer.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'exporter.rb')
+require File.join(GaussianPoints::PLUGIN_DIR, 'io', 'companion_bridge.rb')
 
 require File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'clipping_box_manager.rb')
 require File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'oriented_box_gizmo_tool.rb')
@@ -90,3 +91,4 @@ require File.join(GaussianPoints::PLUGIN_DIR, 'sandbox', 'gaussian_splats_sandbo
 require File.join(GaussianPoints::PLUGIN_DIR, 'ui', 'toolbar.rb')
 
 GaussianPoints.init_plugin
+GaussianPoints::IO::CompanionBridge.register_menu
