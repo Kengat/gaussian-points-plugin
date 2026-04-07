@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
 
 from . import APP_VERSION, paths, store
+from .native_preview import NativeSplatPreview, preview_runtime_available, preview_runtime_error
 from .pipeline import copy_input_images, ensure_project_camera_manifests, list_project_images
 from .ply import PreviewPoint, read_preview_points
 
@@ -105,6 +106,9 @@ class CompanionApp:
         self.plugin_root = plugin_root
         self.selected_project_id: str | None = None
         self.preview_path: str | None = None
+        self.preview_stamp: int | None = None
+        self.preview_mode = "native" if preview_runtime_available() else "legacy"
+        self.preview_runtime_message = preview_runtime_error()
 
         paths.ensure_runtime_dirs()
         store.init_db()
@@ -205,15 +209,24 @@ class CompanionApp:
 
         preview_head = ttk.Frame(preview_panel, style="Panel.TFrame")
         preview_head.pack(fill="x", pady=(0, 8))
-        ttk.Label(preview_head, text="Scene Preview (Lightweight)", style="Body.TLabel", font=("Segoe UI", 11, "bold")).pack(side="left")
-        self.preview_hint = ttk.Label(preview_head, text="Quick orbit preview only. Final splats use the full renderer in SketchUp.", style="Sub.TLabel")
+        preview_title = "Scene Preview (Native Gaussian)" if self.preview_mode == "native" else "Scene Preview (Lightweight)"
+        ttk.Label(preview_head, text=preview_title, style="Body.TLabel", font=("Segoe UI", 11, "bold")).pack(side="left")
+        preview_hint_text = (
+            "Same gaussian renderer path as SketchUp. LMB orbit, Shift+LMB or RMB/MMB pan, wheel zoom."
+            if self.preview_mode == "native"
+            else "Quick orbit preview only. Final splats use the full renderer in SketchUp."
+        )
+        self.preview_hint = ttk.Label(preview_head, text=preview_hint_text, style="Sub.TLabel")
         self.preview_hint.pack(side="right")
 
         preview_host = tk.Frame(preview_panel, bg="#f3eee6", highlightthickness=0)
         preview_host.pack(fill="both", expand=True)
 
-        self.preview_canvas = PreviewCanvas(preview_host)
-        self.preview_canvas.pack(fill="both", expand=True)
+        if self.preview_mode == "native":
+            self.preview_view = NativeSplatPreview(preview_host, bg="#f3eee6", highlightthickness=0)
+        else:
+            self.preview_view = PreviewCanvas(preview_host)
+        self.preview_view.pack(fill="both", expand=True)
 
         self.empty_state = tk.Frame(preview_host, bg="#f3eee6")
         self.empty_state.place(relx=0.5, rely=0.5, anchor="center")
@@ -262,7 +275,12 @@ class CompanionApp:
         if not self._sample_dataset_dir():
             self.empty_sample_button.configure(state="disabled")
 
-        self.preview_footer = ttk.Label(preview_panel, text="No result yet.", style="Sub.TLabel", wraplength=920)
+        default_footer = "No result yet."
+        if self.preview_mode == "native":
+            default_footer = "Native gaussian preview ready. Double-click or press F to fit, R to reset the view."
+        elif self.preview_runtime_message:
+            default_footer = f"Fell back to lightweight preview: {self.preview_runtime_message}"
+        self.preview_footer = ttk.Label(preview_panel, text=default_footer, style="Sub.TLabel", wraplength=920)
         self.preview_footer.pack(anchor="w", pady=(8, 0))
 
         inspector = ttk.Frame(controls, style="App.TFrame", width=360)
@@ -333,9 +351,25 @@ class CompanionApp:
         self.empty_title.configure(text=title)
         self.empty_text.configure(text=message)
         if visible:
+            self.preview_view.pack_forget()
             self.empty_state.place(relx=0.5, rely=0.5, anchor="center")
         else:
             self.empty_state.place_forget()
+            if not self.preview_view.winfo_manager():
+                self.preview_view.pack(fill="both", expand=True)
+
+    def _clear_preview(self) -> None:
+        if self.preview_mode == "native":
+            self.preview_view.clear_scene()
+        else:
+            self.preview_view.set_points([])
+
+    def _load_preview_scene(self, preview_path: str) -> None:
+        if self.preview_mode == "native":
+            self.preview_view.load_scene(preview_path, force_reload=True)
+        else:
+            points, _stats = read_preview_points(preview_path)
+            self.preview_view.set_points(points)
 
     def _refresh_detail(self) -> None:
         if not self.selected_project_id:
@@ -347,8 +381,9 @@ class CompanionApp:
             self.logs_text.configure(state="normal")
             self.logs_text.delete("1.0", tk.END)
             self.logs_text.configure(state="disabled")
-            self.preview_canvas.set_points([])
+            self._clear_preview()
             self.preview_path = None
+            self.preview_stamp = None
             self.preview_footer.configure(text="The preview will appear here after a run.")
             self._set_empty_state(
                 "Start with photos or a sample scene",
@@ -407,7 +442,8 @@ class CompanionApp:
         if not preview_path or not Path(preview_path).exists():
             if self.preview_path is not None:
                 self.preview_path = None
-                self.preview_canvas.set_points([])
+                self.preview_stamp = None
+                self._clear_preview()
             if image_count == 0:
                 self.preview_footer.configure(text="This project has no photos yet.")
                 self._set_empty_state(
@@ -430,25 +466,40 @@ class CompanionApp:
                     True,
                 )
             return
-        if preview_path == self.preview_path:
+        preview_stamp = Path(preview_path).stat().st_mtime_ns
+        if preview_path == self.preview_path and preview_stamp == self.preview_stamp:
             self._set_empty_state("", "", False)
             return
         try:
-            points, stats = read_preview_points(preview_path)
+            stats = None
+            if self.preview_mode == "legacy":
+                points, stats = read_preview_points(preview_path)
+            else:
+                _points, stats = read_preview_points(preview_path, sample_limit=64)
         except Exception as error:
-            self.preview_canvas.set_points([])
+            self._clear_preview()
             self.preview_footer.configure(text=f"Preview load failed: {error}")
             self._set_empty_state("Preview failed", str(error), True)
             return
         self.preview_path = preview_path
-        self.preview_canvas.set_points(points)
-        self.preview_footer.configure(
-            text=(
-                f"Previewing {stats['point_count']} exported splats in lightweight mode. "
-                f"The saved PLY keeps full gaussian data for the SketchUp renderer. "
-                f"Bounds: {stats['bounds']['min']} -> {stats['bounds']['max']}"
+        self.preview_stamp = preview_stamp
+        self._load_preview_scene(preview_path)
+        if self.preview_mode == "native":
+            self.preview_footer.configure(
+                text=(
+                    f"Rendering {stats['point_count']} splats with the native gaussian preview. "
+                    f"Same renderer family as SketchUp, but with an interactive standalone camera. "
+                    f"Bounds: {stats['bounds']['min']} -> {stats['bounds']['max']}"
+                )
             )
-        )
+        else:
+            self.preview_footer.configure(
+                text=(
+                    f"Previewing {stats['point_count']} exported splats in lightweight mode. "
+                    f"The saved PLY keeps full gaussian data for the SketchUp renderer. "
+                    f"Bounds: {stats['bounds']['min']} -> {stats['bounds']['max']}"
+                )
+            )
         self._set_empty_state("", "", False)
 
     def _launch_worker(self, job_id: str) -> None:

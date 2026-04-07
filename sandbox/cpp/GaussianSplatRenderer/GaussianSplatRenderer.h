@@ -55,6 +55,14 @@ extern "C" {
     // Report an axis-aligned bounds box for the loaded splats.
     EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz);
 
+    // Standalone preview window support for the companion app.
+    EXPORT int CreateStandalonePreviewWindow(void* parent_hwnd, int x, int y, int width, int height);
+    EXPORT void DestroyStandalonePreviewWindow();
+    EXPORT void ResizeStandalonePreviewWindow(int x, int y, int width, int height);
+    EXPORT void RequestStandalonePreviewRedraw();
+    EXPORT void ResetStandalonePreviewCamera();
+    EXPORT void FitStandalonePreviewCamera();
+
 #ifdef __cplusplus
 }
 #endif

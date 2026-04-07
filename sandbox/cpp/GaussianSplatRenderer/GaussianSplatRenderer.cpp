@@ -1,5 +1,6 @@
 #include "GaussianSplatRenderer.h"
 #include <windows.h>
+#include <windowsx.h>
 #include <GL/glew.h>
 #include <GL/gl.h>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <cstdint>
 
 #define NOMINMAX
 #undef min
@@ -27,7 +29,13 @@ static PFN_GET_MATRIX_BY_LOC GetMatrixByLocation = nullptr;
 static PFN_GET_CAMERA_STATE GetCameraState = nullptr;
 static PFN_GET_CLIP_BOX_STATE GetClipBoxState = nullptr;
 
+struct ActiveRenderState;
 static void Normalize3(float* vector);
+static bool AcquireActiveRenderState(ActiveRenderState* state);
+static void UpdateStandalonePreviewBounds();
+static void FitStandalonePreviewCameraInternal(bool force_default_angles);
+static void InvalidateStandalonePreview();
+static LRESULT CALLBACK StandalonePreviewWndProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param);
 
 struct NativeClipBoxState {
     bool enabled = false;
@@ -38,6 +46,40 @@ struct NativeClipBoxState {
         0.0, 1.0, 0.0,
         0.0, 0.0, 1.0
     };
+};
+
+struct ActiveRenderState {
+    float view_matrix[16] = {};
+    float projection_matrix[16] = {};
+    float camera_position[3] = {};
+    float camera_target[3] = {};
+    float camera_up[3] = { 0.0f, 0.0f, 1.0f };
+    int is_perspective = 1;
+    bool has_view = false;
+    bool has_projection = false;
+    bool has_camera = false;
+    NativeClipBoxState clip_box = {};
+};
+
+struct StandalonePreviewState {
+    HWND parent_hwnd = nullptr;
+    HWND preview_hwnd = nullptr;
+    HDC device_context = nullptr;
+    HGLRC render_context = nullptr;
+    int width = 1;
+    int height = 1;
+    bool class_registered = false;
+    bool context_ready = false;
+    bool mouse_captured = false;
+    int active_button = 0;
+    POINT last_mouse = {};
+    float orbit_yaw = 0.85f;
+    float orbit_pitch = 0.35f;
+    float distance = 320.0f;
+    float target[3] = { 0.0f, 0.0f, 0.0f };
+    float scene_center[3] = { 0.0f, 0.0f, 0.0f };
+    float scene_radius = 120.0f;
+    bool has_bounds = false;
 };
 
 // Renderer-owned state for splats, buffers, and camera-driven sorting.
@@ -156,6 +198,9 @@ static bool g_gpuSplatDataDirty = true;
 static bool g_gpuObjectDataDirty = true;
 static const bool g_enableDynamicSorting = true;
 static bool g_enableFastApproximateSorting = false;
+static StandalonePreviewState g_standalonePreview = {};
+static bool g_standalonePreviewEnabled = false;
+static const wchar_t* kStandalonePreviewWindowClass = L"GaussianPointsStandalonePreview";
 
 static GLuint g_splatShader = 0;
 static GLuint g_outlineCompositeShader = 0;
@@ -1534,6 +1579,433 @@ static void Normalize3(float* vector) {
 }
 static void CrossProduct(const float* v1, const float* v2, float* r) { r[0] = v1[1] * v2[2] - v1[2] * v2[1]; r[1] = v1[2] * v2[0] - v1[0] * v2[2]; r[2] = v1[0] * v2[1] - v1[1] * v2[0]; }
 
+static float ClampFloat(float value, float min_value, float max_value) {
+    return (value < min_value) ? min_value : ((value > max_value) ? max_value : value);
+}
+
+static void SetIdentityMat4(float* matrix) {
+    memset(matrix, 0, sizeof(float) * 16);
+    matrix[0] = 1.0f;
+    matrix[5] = 1.0f;
+    matrix[10] = 1.0f;
+    matrix[15] = 1.0f;
+}
+
+static void BuildLookAtMatrix(const float* eye, const float* target, const float* up_hint, float* out_matrix) {
+    float forward[3] = {
+        target[0] - eye[0],
+        target[1] - eye[1],
+        target[2] - eye[2]
+    };
+    Normalize3(forward);
+
+    float up[3] = { up_hint[0], up_hint[1], up_hint[2] };
+    Normalize3(up);
+    if (fabs(Dot3(forward, up)) > 0.999f) {
+        up[0] = 0.0f;
+        up[1] = 1.0f;
+        up[2] = 0.0f;
+    }
+
+    float right[3] = {};
+    CrossProduct(forward, up, right);
+    Normalize3(right);
+
+    float real_up[3] = {};
+    CrossProduct(right, forward, real_up);
+    Normalize3(real_up);
+
+    out_matrix[0] = right[0];
+    out_matrix[1] = right[1];
+    out_matrix[2] = right[2];
+    out_matrix[3] = -Dot3(right, eye);
+
+    out_matrix[4] = real_up[0];
+    out_matrix[5] = real_up[1];
+    out_matrix[6] = real_up[2];
+    out_matrix[7] = -Dot3(real_up, eye);
+
+    out_matrix[8] = -forward[0];
+    out_matrix[9] = -forward[1];
+    out_matrix[10] = -forward[2];
+    out_matrix[11] = Dot3(forward, eye);
+
+    out_matrix[12] = 0.0f;
+    out_matrix[13] = 0.0f;
+    out_matrix[14] = 0.0f;
+    out_matrix[15] = 1.0f;
+}
+
+static void BuildPerspectiveMatrix(float fov_y_degrees, float aspect, float z_near, float z_far, float* out_matrix) {
+    SetIdentityMat4(out_matrix);
+    const float safe_aspect = std::max(aspect, 0.001f);
+    const float safe_near = std::max(z_near, 0.001f);
+    const float safe_far = std::max(z_far, safe_near + 0.01f);
+    const float f = 1.0f / tanf(fov_y_degrees * 0.5f * static_cast<float>(M_PI / 180.0));
+
+    memset(out_matrix, 0, sizeof(float) * 16);
+    out_matrix[0] = f / safe_aspect;
+    out_matrix[5] = f;
+    out_matrix[10] = (safe_far + safe_near) / (safe_near - safe_far);
+    out_matrix[11] = (2.0f * safe_far * safe_near) / (safe_near - safe_far);
+    out_matrix[14] = -1.0f;
+}
+
+static bool ComputeCurrentSplatBounds(double* out_min_xyz, double* out_max_xyz) {
+    if (g_splats.empty()) {
+        return false;
+    }
+
+    double min_xyz[3] = { g_splats[0].position[0], g_splats[0].position[1], g_splats[0].position[2] };
+    double max_xyz[3] = { g_splats[0].position[0], g_splats[0].position[1], g_splats[0].position[2] };
+    for (size_t index = 1; index < g_splats.size(); ++index) {
+        const GaussSplat& splat = g_splats[index];
+        min_xyz[0] = std::min(min_xyz[0], static_cast<double>(splat.position[0]));
+        min_xyz[1] = std::min(min_xyz[1], static_cast<double>(splat.position[1]));
+        min_xyz[2] = std::min(min_xyz[2], static_cast<double>(splat.position[2]));
+        max_xyz[0] = std::max(max_xyz[0], static_cast<double>(splat.position[0]));
+        max_xyz[1] = std::max(max_xyz[1], static_cast<double>(splat.position[1]));
+        max_xyz[2] = std::max(max_xyz[2], static_cast<double>(splat.position[2]));
+    }
+
+    if (out_min_xyz) {
+        memcpy(out_min_xyz, min_xyz, sizeof(min_xyz));
+    }
+    if (out_max_xyz) {
+        memcpy(out_max_xyz, max_xyz, sizeof(max_xyz));
+    }
+    return true;
+}
+
+static void UpdateStandalonePreviewBounds() {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    double min_xyz[3] = {};
+    double max_xyz[3] = {};
+    if (!ComputeCurrentSplatBounds(min_xyz, max_xyz)) {
+        g_standalonePreview.has_bounds = false;
+        g_standalonePreview.scene_center[0] = 0.0f;
+        g_standalonePreview.scene_center[1] = 0.0f;
+        g_standalonePreview.scene_center[2] = 0.0f;
+        g_standalonePreview.scene_radius = 120.0f;
+        return;
+    }
+
+    const float center_x = static_cast<float>((min_xyz[0] + max_xyz[0]) * 0.5);
+    const float center_y = static_cast<float>((min_xyz[1] + max_xyz[1]) * 0.5);
+    const float center_z = static_cast<float>((min_xyz[2] + max_xyz[2]) * 0.5);
+    const float extent_x = static_cast<float>(max_xyz[0] - min_xyz[0]);
+    const float extent_y = static_cast<float>(max_xyz[1] - min_xyz[1]);
+    const float extent_z = static_cast<float>(max_xyz[2] - min_xyz[2]);
+    const float diagonal = sqrtf((extent_x * extent_x) + (extent_y * extent_y) + (extent_z * extent_z));
+
+    g_standalonePreview.has_bounds = true;
+    g_standalonePreview.scene_center[0] = center_x;
+    g_standalonePreview.scene_center[1] = center_y;
+    g_standalonePreview.scene_center[2] = center_z;
+    g_standalonePreview.scene_radius = std::max(diagonal * 0.5f, 20.0f);
+}
+
+static void FitStandalonePreviewCameraInternal(bool force_default_angles) {
+    UpdateStandalonePreviewBounds();
+    if (g_standalonePreview.has_bounds) {
+        g_standalonePreview.target[0] = g_standalonePreview.scene_center[0];
+        g_standalonePreview.target[1] = g_standalonePreview.scene_center[1];
+        g_standalonePreview.target[2] = g_standalonePreview.scene_center[2];
+        const float fit_radius = std::max(g_standalonePreview.scene_radius, 20.0f);
+        const float fit_distance = fit_radius / sinf(35.0f * static_cast<float>(M_PI / 180.0));
+        g_standalonePreview.distance = std::max(fit_distance * 1.15f, 60.0f);
+    } else {
+        g_standalonePreview.target[0] = 0.0f;
+        g_standalonePreview.target[1] = 0.0f;
+        g_standalonePreview.target[2] = 0.0f;
+        g_standalonePreview.distance = 320.0f;
+    }
+
+    if (force_default_angles) {
+        g_standalonePreview.orbit_yaw = 0.85f;
+        g_standalonePreview.orbit_pitch = 0.35f;
+    }
+
+    InvalidateStandalonePreview();
+}
+
+static void BuildStandalonePreviewRenderState(ActiveRenderState* state) {
+    const float distance = std::max(g_standalonePreview.distance, 1.0f);
+    const float orbit_cos_pitch = cosf(g_standalonePreview.orbit_pitch);
+    const float orbit_sin_pitch = sinf(g_standalonePreview.orbit_pitch);
+    const float orbit_cos_yaw = cosf(g_standalonePreview.orbit_yaw);
+    const float orbit_sin_yaw = sinf(g_standalonePreview.orbit_yaw);
+    const float orbit[3] = {
+        orbit_cos_pitch * orbit_cos_yaw,
+        orbit_cos_pitch * orbit_sin_yaw,
+        orbit_sin_pitch
+    };
+
+    const float eye[3] = {
+        g_standalonePreview.target[0] + (orbit[0] * distance),
+        g_standalonePreview.target[1] + (orbit[1] * distance),
+        g_standalonePreview.target[2] + (orbit[2] * distance)
+    };
+    const float up[3] = { 0.0f, 0.0f, 1.0f };
+    const float aspect = static_cast<float>(std::max(g_standalonePreview.width, 1)) /
+        static_cast<float>(std::max(g_standalonePreview.height, 1));
+    const float scene_radius = std::max(g_standalonePreview.scene_radius, 20.0f);
+    const float z_near = std::max(scene_radius * 0.01f, 0.1f);
+    const float z_far = std::max(distance + (scene_radius * 8.0f), z_near + 10.0f);
+
+    BuildLookAtMatrix(eye, g_standalonePreview.target, up, state->view_matrix);
+    BuildPerspectiveMatrix(45.0f, aspect, z_near, z_far, state->projection_matrix);
+    memcpy(state->camera_position, eye, sizeof(state->camera_position));
+    memcpy(state->camera_target, g_standalonePreview.target, sizeof(state->camera_target));
+    memcpy(state->camera_up, up, sizeof(state->camera_up));
+    state->is_perspective = 1;
+    state->has_view = true;
+    state->has_projection = true;
+    state->has_camera = true;
+}
+
+static bool AcquireActiveRenderState(ActiveRenderState* state) {
+    if (state == nullptr) {
+        return false;
+    }
+
+    memset(state, 0, sizeof(ActiveRenderState));
+    state->camera_up[2] = 1.0f;
+    state->is_perspective = 1;
+
+    if (g_standalonePreviewEnabled && g_standalonePreview.preview_hwnd != nullptr && g_standalonePreview.context_ready) {
+        BuildStandalonePreviewRenderState(state);
+        return true;
+    }
+
+    LoadHookFunctions();
+    if (!GetMatrixByLocation || !GetCameraState) {
+        return false;
+    }
+
+    const int view_loc = 14;
+    const int proj_loc = 15;
+    state->has_view = GetMatrixByLocation(view_loc, state->view_matrix);
+    state->has_projection = GetMatrixByLocation(proj_loc, state->projection_matrix);
+    state->has_camera = GetCameraState(
+        state->camera_position,
+        state->camera_target,
+        state->camera_up,
+        &state->is_perspective);
+    state->clip_box = FetchClipBoxStateSnapshot();
+    return state->has_view && state->has_projection && state->has_camera;
+}
+
+static void InvalidateStandalonePreview() {
+    if (g_standalonePreview.preview_hwnd != nullptr) {
+        InvalidateRect(g_standalonePreview.preview_hwnd, nullptr, FALSE);
+    }
+}
+
+static bool InitializeStandalonePreviewContext() {
+    if (g_standalonePreview.preview_hwnd == nullptr) {
+        return false;
+    }
+    if (g_standalonePreview.context_ready) {
+        return true;
+    }
+
+    g_standalonePreview.device_context = GetDC(g_standalonePreview.preview_hwnd);
+    if (g_standalonePreview.device_context == nullptr) {
+        return false;
+    }
+
+    PIXELFORMATDESCRIPTOR pfd = {};
+    pfd.nSize = sizeof(PIXELFORMATDESCRIPTOR);
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 32;
+    pfd.cDepthBits = 24;
+    pfd.cStencilBits = 8;
+    pfd.iLayerType = PFD_MAIN_PLANE;
+
+    const int pixel_format = ChoosePixelFormat(g_standalonePreview.device_context, &pfd);
+    if (pixel_format == 0) {
+        return false;
+    }
+    if (!SetPixelFormat(g_standalonePreview.device_context, pixel_format, &pfd)) {
+        return false;
+    }
+
+    g_standalonePreview.render_context = wglCreateContext(g_standalonePreview.device_context);
+    if (g_standalonePreview.render_context == nullptr) {
+        return false;
+    }
+    if (!wglMakeCurrent(g_standalonePreview.device_context, g_standalonePreview.render_context)) {
+        return false;
+    }
+
+    g_standalonePreview.context_ready = true;
+    wglMakeCurrent(nullptr, nullptr);
+    return true;
+}
+
+static void ShutdownStandalonePreviewContext() {
+    if (g_standalonePreview.render_context != nullptr) {
+        wglMakeCurrent(nullptr, nullptr);
+        wglDeleteContext(g_standalonePreview.render_context);
+        g_standalonePreview.render_context = nullptr;
+    }
+    if (g_standalonePreview.device_context != nullptr && g_standalonePreview.preview_hwnd != nullptr) {
+        ReleaseDC(g_standalonePreview.preview_hwnd, g_standalonePreview.device_context);
+    }
+    g_standalonePreview.device_context = nullptr;
+    g_standalonePreview.context_ready = false;
+}
+
+static void PanStandalonePreview(float delta_x_pixels, float delta_y_pixels) {
+    const float distance = std::max(g_standalonePreview.distance, 1.0f);
+    const float aspect = static_cast<float>(std::max(g_standalonePreview.width, 1)) /
+        static_cast<float>(std::max(g_standalonePreview.height, 1));
+    const float view_height = 2.0f * tanf(45.0f * 0.5f * static_cast<float>(M_PI / 180.0f)) * distance;
+    const float view_width = view_height * aspect;
+    const float world_per_pixel_x = view_width / static_cast<float>(std::max(g_standalonePreview.width, 1));
+    const float world_per_pixel_y = view_height / static_cast<float>(std::max(g_standalonePreview.height, 1));
+
+    const float orbit_cos_pitch = cosf(g_standalonePreview.orbit_pitch);
+    const float orbit_sin_pitch = sinf(g_standalonePreview.orbit_pitch);
+    const float orbit_cos_yaw = cosf(g_standalonePreview.orbit_yaw);
+    const float orbit_sin_yaw = sinf(g_standalonePreview.orbit_yaw);
+    float forward[3] = {
+        -orbit_cos_pitch * orbit_cos_yaw,
+        -orbit_cos_pitch * orbit_sin_yaw,
+        -orbit_sin_pitch
+    };
+    Normalize3(forward);
+    float up_hint[3] = { 0.0f, 0.0f, 1.0f };
+    float right[3] = {};
+    CrossProduct(forward, up_hint, right);
+    Normalize3(right);
+    float up[3] = {};
+    CrossProduct(right, forward, up);
+    Normalize3(up);
+
+    const float pan_x = (-delta_x_pixels) * world_per_pixel_x;
+    const float pan_y = (delta_y_pixels) * world_per_pixel_y;
+    for (int axis = 0; axis < 3; ++axis) {
+        g_standalonePreview.target[axis] += (right[axis] * pan_x) + (up[axis] * pan_y);
+    }
+}
+
+static void RenderStandalonePreviewFrame() {
+    if (!InitializeStandalonePreviewContext()) {
+        return;
+    }
+    if (!wglMakeCurrent(g_standalonePreview.device_context, g_standalonePreview.render_context)) {
+        return;
+    }
+
+    const int viewport_width = std::max(g_standalonePreview.width, 1);
+    const int viewport_height = std::max(g_standalonePreview.height, 1);
+    glViewport(0, 0, viewport_width, viewport_height);
+    glClearColor(0.952f, 0.933f, 0.902f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    renderPointCloud();
+    SwapBuffers(g_standalonePreview.device_context);
+    wglMakeCurrent(nullptr, nullptr);
+}
+
+static LRESULT CALLBACK StandalonePreviewWndProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        g_standalonePreview.width = std::max(static_cast<int>(LOWORD(l_param)), 1);
+        g_standalonePreview.height = std::max(static_cast<int>(HIWORD(l_param)), 1);
+        InvalidateStandalonePreview();
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT paint = {};
+        BeginPaint(hwnd, &paint);
+        RenderStandalonePreviewFrame();
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK:
+        FitStandalonePreviewCameraInternal(false);
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        SetFocus(hwnd);
+        SetCapture(hwnd);
+        g_standalonePreview.mouse_captured = true;
+        g_standalonePreview.active_button =
+            (message == WM_LBUTTONDOWN && (w_param & MK_SHIFT) == 0) ? 1 : 2;
+        g_standalonePreview.last_mouse.x = GET_X_LPARAM(l_param);
+        g_standalonePreview.last_mouse.y = GET_Y_LPARAM(l_param);
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_RBUTTONUP:
+        if (g_standalonePreview.mouse_captured) {
+            ReleaseCapture();
+            g_standalonePreview.mouse_captured = false;
+            g_standalonePreview.active_button = 0;
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g_standalonePreview.active_button != 0) {
+            const int mouse_x = GET_X_LPARAM(l_param);
+            const int mouse_y = GET_Y_LPARAM(l_param);
+            const float delta_x = static_cast<float>(mouse_x - g_standalonePreview.last_mouse.x);
+            const float delta_y = static_cast<float>(mouse_y - g_standalonePreview.last_mouse.y);
+            g_standalonePreview.last_mouse.x = mouse_x;
+            g_standalonePreview.last_mouse.y = mouse_y;
+
+            if (g_standalonePreview.active_button == 1) {
+                g_standalonePreview.orbit_yaw -= delta_x * 0.0125f;
+                g_standalonePreview.orbit_pitch = ClampFloat(
+                    g_standalonePreview.orbit_pitch - (delta_y * 0.0125f),
+                    -1.45f,
+                    1.45f);
+            } else {
+                PanStandalonePreview(delta_x, delta_y);
+            }
+            InvalidateStandalonePreview();
+        }
+        return 0;
+    case WM_MOUSEWHEEL: {
+        const short wheel_delta = GET_WHEEL_DELTA_WPARAM(w_param);
+        const float zoom_factor = (wheel_delta > 0) ? 0.88f : 1.12f;
+        g_standalonePreview.distance = ClampFloat(
+            g_standalonePreview.distance * zoom_factor,
+            std::max(g_standalonePreview.scene_radius * 0.05f, 2.0f),
+            std::max(g_standalonePreview.scene_radius * 40.0f, 4000.0f));
+        InvalidateStandalonePreview();
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (w_param == 'F') {
+            FitStandalonePreviewCameraInternal(false);
+            return 0;
+        }
+        if (w_param == 'R') {
+            FitStandalonePreviewCameraInternal(true);
+            return 0;
+        }
+        break;
+    case WM_DESTROY:
+        ShutdownStandalonePreviewContext();
+        g_standalonePreview.preview_hwnd = nullptr;
+        g_standalonePreview.parent_hwnd = nullptr;
+        g_standalonePreview.width = 1;
+        g_standalonePreview.height = 1;
+        g_standalonePreviewEnabled = false;
+        return 0;
+    default:
+        break;
+    }
+
+    return DefWindowProcW(hwnd, message, w_param, l_param);
+}
+
 extern "C" EXPORT void SetPointCloud(const double* points_in, int count) { LogRenderer("SetPointCloud called."); if (!points_in || count <= 0)return; LoadHookFunctions(); g_points.clear(); g_points.reserve(count * 6); for (int i = 0;i < count;++i) { g_points.push_back((float)points_in[i * 6 + 0]); g_points.push_back((float)points_in[i * 6 + 1]); g_points.push_back((float)points_in[i * 6 + 2]); g_points.push_back((float)points_in[i * 6 + 3] / 255.f); g_points.push_back((float)points_in[i * 6 + 4] / 255.f); g_points.push_back((float)points_in[i * 6 + 5] / 255.f); } g_dataReady = true; }
 extern "C" EXPORT void AddSplat(float x, float y, float z, float r, float g, float b, float a, float scaleX, float scaleY, float rotation, bool rotateVertical) {
     std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
@@ -1578,8 +2050,17 @@ extern "C" EXPORT void AddSplatWithQuaternion(float x, float y, float z, float r
     g_splats.push_back(s);
     MarkSplatBuffersDirty();
 }
-extern "C" EXPORT void ClearSplats() { LogRenderer("ClearSplats called."); ResetSplatObjects(); }
-extern "C" EXPORT void ClearSplatObjects() { ResetSplatObjects(); }
+extern "C" EXPORT void ClearSplats() {
+    LogRenderer("ClearSplats called.");
+    ResetSplatObjects();
+    UpdateStandalonePreviewBounds();
+    InvalidateStandalonePreview();
+}
+extern "C" EXPORT void ClearSplatObjects() {
+    ResetSplatObjects();
+    UpdateStandalonePreviewBounds();
+    InvalidateStandalonePreview();
+}
 extern "C" EXPORT void SetSplatSortingMode(SplatSortingMode mode) { if (mode >= 0 && mode <= 5) { g_sortingMode = mode; LogRenderer("Sort mode set %d.", mode); } else LogRenderer("Invalid sort mode %d.", mode); }
 extern "C" EXPORT void SetFastApproximateSortingEnabled(int enabled) {
     g_enableFastApproximateSorting = (enabled != 0);
@@ -1590,6 +2071,7 @@ extern "C" EXPORT void SetFastApproximateSortingEnabled(int enabled) {
     g_gpuSplatDataDirty = true;
     g_gpuObjectDataDirty = true;
     LogRenderer("Fast approximate sorting %s.", g_enableFastApproximateSorting ? "enabled" : "disabled");
+    InvalidateStandalonePreview();
 }
 extern "C" EXPORT int GetFastApproximateSortingEnabled() { return g_enableFastApproximateSorting ? 1 : 0; }
 
@@ -1642,33 +2124,10 @@ static void RenderHighlightedSplatsIM(const NativeClipBoxState& clip_box_state) 
 extern "C" EXPORT int GetSplatBounds(double* out_min_xyz, double* out_max_xyz) {
     std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     // Bounds are consumed by the SketchUp-side proxy to keep clip planes stable.
-    if (!out_min_xyz || !out_max_xyz || g_splats.empty()) {
+    if (!out_min_xyz || !out_max_xyz) {
         return 0;
     }
-
-    double min_x = g_splats[0].position[0];
-    double min_y = g_splats[0].position[1];
-    double min_z = g_splats[0].position[2];
-    double max_x = min_x;
-    double max_y = min_y;
-    double max_z = min_z;
-
-    for (const GaussSplat& splat : g_splats) {
-        min_x = std::min(min_x, static_cast<double>(splat.position[0]));
-        min_y = std::min(min_y, static_cast<double>(splat.position[1]));
-        min_z = std::min(min_z, static_cast<double>(splat.position[2]));
-        max_x = std::max(max_x, static_cast<double>(splat.position[0]));
-        max_y = std::max(max_y, static_cast<double>(splat.position[1]));
-        max_z = std::max(max_z, static_cast<double>(splat.position[2]));
-    }
-
-    out_min_xyz[0] = min_x;
-    out_min_xyz[1] = min_y;
-    out_min_xyz[2] = min_z;
-    out_max_xyz[0] = max_x;
-    out_max_xyz[1] = max_y;
-    out_max_xyz[2] = max_z;
-    return 1;
+    return ComputeCurrentSplatBounds(out_min_xyz, out_max_xyz) ? 1 : 0;
 }
 static bool CheckGLCapabilities() { GLenum e = glewInit(); if (e != GLEW_OK) { LogRenderer("GLEW failed:%s", glewGetErrorString(e));return false; } if (!GLEW_VERSION_2_0 || !GLEW_ARB_vertex_buffer_object) { LogRenderer("WARN No VBO/Shader support");return false; } LogRenderer("OpenGL VBO/Shader support detected."); return true; }
 
@@ -2672,8 +3131,12 @@ static void DrawGPUHighlightSplats(float alpha_cutoff, float screen_expand_px, f
 extern "C" EXPORT void renderPointCloud() {
     std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     LogRenderer("CHK: renderPointCloud enter");
-    LoadHookFunctions(); if (!GetMatrixByLocation) { LogRenderer("ERROR: GetMatrixByLocation is NULL, cannot proceed."); return; } if (!GetCameraState) { LogRenderer("ERROR: GetCameraState is NULL, cannot proceed."); return; }
-    LogRenderer("CHK: hook functions ready");
+    ActiveRenderState active_state = {};
+    if (!AcquireActiveRenderState(&active_state)) {
+        LogRenderer("WARN: No active camera/matrix provider available for renderPointCloud.");
+        return;
+    }
+    LogRenderer("CHK: render state ready");
 
     static bool firstCall = true; static bool useVBO = false; static bool useGPU = false;
     if (firstCall) {
@@ -2698,29 +3161,17 @@ extern "C" EXPORT void renderPointCloud() {
     float projectionMatrix[16] = { 0 };
     float camPos[3] = { 0 };
     float camTarget[3] = { 0 };
-    float camUp[3] = { 0, 1, 0 };
+    float camUp[3] = { 0, 0, 1 };
     float viewDir[3] = { 0, 0, -1 };
-    int isPerspective = 1;
-    int viewLoc = 14;
-    int projLoc = 15;
-    LogRenderer("CHK: before GetMatrixByLocation(view)");
-    bool hasView = GetMatrixByLocation(viewLoc, viewMatrix);
-    LogRenderer("CHK: after GetMatrixByLocation(view) => %d", hasView ? 1 : 0);
-    LogRenderer("CHK: before GetMatrixByLocation(proj)");
-    bool hasProj = GetMatrixByLocation(projLoc, projectionMatrix);
-    LogRenderer("CHK: after GetMatrixByLocation(proj) => %d", hasProj ? 1 : 0);
-    LogRenderer("CHK: before GetCameraState");
-    bool hasCamera = GetCameraState(camPos, camTarget, camUp, &isPerspective);
-    LogRenderer("CHK: after GetCameraState => %d", hasCamera ? 1 : 0);
-
-    if (!hasView || !hasProj) {
-        LogRenderer("WARN: Missing View(loc%d)=%d or Projection(loc%d)=%d matrix. Skipping render.", viewLoc, hasView, projLoc, hasProj);
-        return;
-    }
-    if (!hasCamera) {
-        LogRenderer("WARN: Camera state unavailable. Skipping render.");
-        return;
-    }
+    const bool hasView = active_state.has_view;
+    const bool hasProj = active_state.has_projection;
+    const bool hasCamera = active_state.has_camera;
+    const int isPerspective = active_state.is_perspective;
+    memcpy(viewMatrix, active_state.view_matrix, sizeof(viewMatrix));
+    memcpy(projectionMatrix, active_state.projection_matrix, sizeof(projectionMatrix));
+    memcpy(camPos, active_state.camera_position, sizeof(camPos));
+    memcpy(camTarget, active_state.camera_target, sizeof(camTarget));
+    memcpy(camUp, active_state.camera_up, sizeof(camUp));
 
     viewDir[0] = camTarget[0] - camPos[0];
     viewDir[1] = camTarget[1] - camPos[1];
@@ -2731,7 +3182,7 @@ extern "C" EXPORT void renderPointCloud() {
     MultiplyMat4(projectionMatrix, viewMatrix, mvpMatrix);
     GLint viewport[4] = { 0, 0, 1, 1 };
     glGetIntegerv(GL_VIEWPORT, viewport);
-    const NativeClipBoxState clipBoxState = FetchClipBoxStateSnapshot();
+    const NativeClipBoxState clipBoxState = active_state.clip_box;
     const bool clipStateChanged = !g_hasLastClipBoxState || !ClipStatesEqual(clipBoxState, g_lastClipBoxState);
     if (clipStateChanged) {
         g_lastClipBoxState = clipBoxState;
@@ -2921,7 +3372,7 @@ extern "C" EXPORT void renderPointCloud() {
         }
     }
     else {
-        LogRenderer("DEBUG: Skipping sorting (no view matrix).");
+        LogRenderer("DEBUG: Skipping sorting (no active camera state).");
         if (g_splatVBO.indices.size() != g_splatSortIndices.size() * 6) { LogRenderer("DEBUG: EBO needs update (default order)."); UpdateSplatEBO(); }
     }
 
@@ -2949,7 +3400,7 @@ extern "C" EXPORT void renderPointCloud() {
         }
     }
     else {
-        if (!useVBO) LogRenderer("DEBUG: Skipping render (VBO disabled or IM requirements not met [view:%d, proj:%d]).", hasView, hasProj);
+        if (!useVBO) LogRenderer("DEBUG: Skipping render (VBO disabled or IM requirements not met [view:%d, proj:%d]).", hasView ? 1 : 0, hasProj ? 1 : 0);
         else if (!g_splatVBO.initialized) LogRenderer("DEBUG: Skipping render (VBO not initialized).");
         else if (g_splatShader == 0) LogRenderer("DEBUG: Skipping render (Shader not loaded).");
         else LogRenderer("DEBUG: Skipping render (Unknown reason).");
@@ -3217,12 +3668,15 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     return 1;
 }
 
-extern "C" EXPORT void LoadSplatsFromPLYWithUpAxis(const char* filename, int up_axis_mode) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } char plyPath[MAX_PATH] = {}; if (GetModuleFileNameA(plyDLL, plyPath, MAX_PATH) > 0) { LogRenderer("CHK: Loaded PlyImporter from %s", plyPath); } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); typedef int(*GPS)(); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); GPS getSize = (GPS)GetProcAddress(plyDLL, "GetPLYGaussianPointSize"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } if (getSize) { const int importerPointSize = getSize(); const int rendererPointSize = static_cast<int>(sizeof(PLYGaussianPoint)); LogRenderer("CHK: PLYGaussianPoint size importer=%d renderer=%d", importerPointSize, rendererPointSize); if (importerPointSize != rendererPointSize) { LogRenderer("ERR: PLYGaussianPoint ABI mismatch, aborting load."); FreeLibrary(plyDLL); return; } } else { LogRenderer("WARN: GetPLYGaussianPointSize not found in PlyImporter.dll"); } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); ResetSplatObjects(); BuildSplatObjectFromPLYData("__legacy__", pts, cnt, nullptr, nullptr, up_axis_mode); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); LogRenderer("PLY load finished."); }
+extern "C" EXPORT void LoadSplatsFromPLYWithUpAxis(const char* filename, int up_axis_mode) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } char plyPath[MAX_PATH] = {}; if (GetModuleFileNameA(plyDLL, plyPath, MAX_PATH) > 0) { LogRenderer("CHK: Loaded PlyImporter from %s", plyPath); } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); typedef int(*GPS)(); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); GPS getSize = (GPS)GetProcAddress(plyDLL, "GetPLYGaussianPointSize"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } if (getSize) { const int importerPointSize = getSize(); const int rendererPointSize = static_cast<int>(sizeof(PLYGaussianPoint)); LogRenderer("CHK: PLYGaussianPoint size importer=%d renderer=%d", importerPointSize, rendererPointSize); if (importerPointSize != rendererPointSize) { LogRenderer("ERR: PLYGaussianPoint ABI mismatch, aborting load."); FreeLibrary(plyDLL); return; } } else { LogRenderer("WARN: GetPLYGaussianPointSize not found in PlyImporter.dll"); } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); ResetSplatObjects(); BuildSplatObjectFromPLYData("__legacy__", pts, cnt, nullptr, nullptr, up_axis_mode); UpdateStandalonePreviewBounds(); FitStandalonePreviewCameraInternal(true); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); InvalidateStandalonePreview(); LogRenderer("PLY load finished."); }
 extern "C" EXPORT void LoadSplatsFromPLY(const char* filename) { LoadSplatsFromPLYWithUpAxis(filename, IMPORT_ORIENTATION_SWAP_B); }
 extern "C" EXPORT void AddSplatsFromPLYData(PLYGaussianPoint* points, int count) {
     LogRenderer("Adding %d splats from PLY data...", count);
     ResetSplatObjects();
     BuildSplatObjectFromPLYData("__legacy__", points, count, nullptr, nullptr, IMPORT_ORIENTATION_SWAP_B);
+    UpdateStandalonePreviewBounds();
+    FitStandalonePreviewCameraInternal(true);
+    InvalidateStandalonePreview();
 }
 
 extern "C" EXPORT int LoadSplatObjectFromPLYWithUpAxis(const char* object_id, const char* filename, double* out_center_xyz, double* out_half_extents_xyz, int up_axis_mode) {
@@ -3352,10 +3806,96 @@ extern "C" EXPORT void SetSHRenderDegree(int degree) {
     g_splatVBO.needsUpdate = true;
     g_gpuObjectDataDirty = true;
     LogRenderer("SH render degree override set to %d", g_shRenderDegreeOverride);
+    InvalidateStandalonePreview();
 }
 
 extern "C" EXPORT int GetSHRenderDegree() {
     return g_shRenderDegreeOverride;
+}
+
+extern "C" EXPORT int CreateStandalonePreviewWindow(void* parent_hwnd, int x, int y, int width, int height) {
+    HWND parent = reinterpret_cast<HWND>(parent_hwnd);
+    if (parent == nullptr) {
+        return 0;
+    }
+
+    if (!g_standalonePreview.class_registered) {
+        WNDCLASSW window_class = {};
+        window_class.lpfnWndProc = StandalonePreviewWndProc;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.lpszClassName = kStandalonePreviewWindowClass;
+        window_class.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+        window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        if (RegisterClassW(&window_class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            return 0;
+        }
+        g_standalonePreview.class_registered = true;
+    }
+
+    if (g_standalonePreview.preview_hwnd != nullptr) {
+        DestroyStandalonePreviewWindow();
+    }
+
+    g_standalonePreview.parent_hwnd = parent;
+    g_standalonePreview.width = std::max(width, 1);
+    g_standalonePreview.height = std::max(height, 1);
+    g_standalonePreview.preview_hwnd = CreateWindowExW(
+        0,
+        kStandalonePreviewWindowClass,
+        L"",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_TABSTOP,
+        x,
+        y,
+        g_standalonePreview.width,
+        g_standalonePreview.height,
+        parent,
+        nullptr,
+        GetModuleHandleW(nullptr),
+        nullptr);
+    if (g_standalonePreview.preview_hwnd == nullptr) {
+        return 0;
+    }
+
+    g_standalonePreviewEnabled = true;
+    FitStandalonePreviewCameraInternal(true);
+    return 1;
+}
+
+extern "C" EXPORT void DestroyStandalonePreviewWindow() {
+    if (g_standalonePreview.preview_hwnd != nullptr) {
+        DestroyWindow(g_standalonePreview.preview_hwnd);
+    } else {
+        ShutdownStandalonePreviewContext();
+        g_standalonePreviewEnabled = false;
+    }
+}
+
+extern "C" EXPORT void ResizeStandalonePreviewWindow(int x, int y, int width, int height) {
+    g_standalonePreview.width = std::max(width, 1);
+    g_standalonePreview.height = std::max(height, 1);
+    if (g_standalonePreview.preview_hwnd != nullptr) {
+        SetWindowPos(
+            g_standalonePreview.preview_hwnd,
+            nullptr,
+            x,
+            y,
+            g_standalonePreview.width,
+            g_standalonePreview.height,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateStandalonePreview();
+    }
+}
+
+extern "C" EXPORT void RequestStandalonePreviewRedraw() {
+    InvalidateStandalonePreview();
+}
+
+extern "C" EXPORT void ResetStandalonePreviewCamera() {
+    FitStandalonePreviewCameraInternal(true);
+}
+
+extern "C" EXPORT void FitStandalonePreviewCamera() {
+    FitStandalonePreviewCameraInternal(false);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
