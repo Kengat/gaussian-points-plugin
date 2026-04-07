@@ -107,6 +107,12 @@ def preview_runtime_available() -> bool:
     return preview_runtime_error() is None
 
 
+def preview_bridge() -> _NativePreviewBridge | None:
+    if preview_runtime_error() is not None:
+        return None
+    return _BRIDGE
+
+
 class NativeSplatPreview(tk.Frame):
     def __init__(self, master: tk.Misc, **kwargs) -> None:
         super().__init__(master, **kwargs)

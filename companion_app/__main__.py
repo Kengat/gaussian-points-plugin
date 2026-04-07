@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from .desktop_app import main
+from .qml_app import main
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-﻿require 'json'
+require 'json'
 
 module GaussianPoints
   module UIparts
@@ -14,9 +14,9 @@ module GaussianPoints
 
         @@dialog = UI::HtmlDialog.new(
           dialog_title: 'Gaussian Splatting',
-          width: 520,
-          height: 560,
-          scrollable: false,
+          width: 380,
+          height: 400,
+          scrollable: true,
           resizable: true,
           style: UI::HtmlDialog::STYLE_DIALOG
         )
@@ -30,453 +30,189 @@ module GaussianPoints
       def self.dialog_html
         <<~HTML
           <!DOCTYPE html>
-          <html>
+          <html lang="en">
           <head>
             <meta charset="UTF-8">
+            <title>Gaussian Points Studio</title>
+            <link rel="preconnect" href="https://fonts.googleapis.com">
+            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+            <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500&family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+            <script src="https://cdn.tailwindcss.com"></script>
+            <script>
+              tailwind.config = {
+                theme: {
+                  extend: {
+                    colors: {
+                      accent: '#FF5400',
+                      surface: '#0a0a0d',
+                      surfaceElevated: '#111116',
+                    }
+                  }
+                }
+              }
+            </script>
             <style>
               :root {
-                --panel: rgba(255, 250, 243, 0.92);
-                --ink: #211a15;
-                --muted: #6c6158;
-                --line: rgba(78, 62, 48, 0.14);
-                --accent: #b85c38;
-                --accent-strong: #8f3f1f;
-                --accent-soft: #f3d7bf;
-                --shadow: 0 22px 55px rgba(49, 30, 18, 0.14);
+                --bg-base: #050505;
+                --bg-surface: #0a0a0d;
+                --bg-surface-elevated: #111116;
+                --bg-surface-hover: #16161d;
+                --border-color: rgba(255, 255, 255, 0.08);
+                --border-light: rgba(255, 255, 255, 0.15);
+                --accent-primary: #FF5400;
+                --accent-cyan: #00F0FF;
+                --accent-magenta: #FF2E93;
+                --text-main: #FAFAFA;
+                --text-muted: #A1A1AA;
               }
-
-              * { box-sizing: border-box; }
-              html, body {
-                margin: 0;
-                width: 100%;
-                height: 100%;
-                overflow: hidden;
-                font-family: Georgia, "Palatino Linotype", serif;
-                color: var(--ink);
-                background:
-                  radial-gradient(circle at top left, rgba(255,255,255,0.78), transparent 36%),
-                  linear-gradient(145deg, #efe3d3 0%, #e7ddcf 48%, #f7f2ea 100%);
-              }
-
               body {
-                display: flex;
-                flex-direction: column;
-              }
-
-              .hero {
-                padding: 22px 24px 18px;
-                border-bottom: 1px solid var(--line);
-                background:
-                  linear-gradient(135deg, rgba(184,92,56,0.16), rgba(255,255,255,0) 68%),
-                  linear-gradient(180deg, rgba(255,255,255,0.8), rgba(255,255,255,0.22));
-              }
-
-              .eyebrow {
-                font-size: 11px;
-                letter-spacing: 0.22em;
-                text-transform: uppercase;
-                color: var(--muted);
-                margin-bottom: 8px;
-              }
-
-              .title {
-                font-size: 30px;
-                line-height: 1;
-                margin: 0 0 10px;
-              }
-
-              .subtitle {
+                font-family: 'Outfit', sans-serif;
+                background-color: var(--bg-base);
+                color: var(--text-main);
                 margin: 0;
-                max-width: 420px;
-                font-size: 14px;
-                line-height: 1.45;
-                color: var(--muted);
+              }
+              .font-mono { font-family: 'JetBrains Mono', monospace; }
+              .font-body { font-family: 'DM Sans', sans-serif; }
+              
+              .glass-panel {
+                background: rgba(16, 16, 22, 0.6);
+                backdrop-filter: blur(24px);
+                -webkit-backdrop-filter: blur(24px);
+                border: 1px solid var(--border-color);
+                box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.05), 0 8px 32px rgba(0, 0, 0, 0.5);
               }
 
-              .content {
-                flex: 1;
-                overflow: auto;
-                padding: 18px 18px 20px;
-              }
+              .custom-scrollbar::-webkit-scrollbar { width: 5px; }
+              .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+              .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 10px; }
+              .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
 
-              .panel {
-                background: var(--panel);
-                border: 1px solid var(--line);
-                border-radius: 18px;
-                box-shadow: var(--shadow);
-                padding: 16px;
-                margin-bottom: 14px;
-              }
-
-              .panel h2 {
-                margin: 0 0 10px;
-                font-size: 18px;
-              }
-
-              .panel p {
-                margin: 0;
-                color: var(--muted);
-                font-size: 13px;
-                line-height: 1.5;
-              }
-
-              .status-grid {
-                display: grid;
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 10px;
-                margin-top: 14px;
-              }
-
-              .status-card {
-                border: 1px solid var(--line);
-                border-radius: 14px;
-                background: rgba(255,255,255,0.72);
-                padding: 11px 12px;
-              }
-
-              .status-label {
-                font-size: 11px;
-                text-transform: uppercase;
-                letter-spacing: 0.14em;
-                color: var(--muted);
-                margin-bottom: 8px;
-              }
-
-              .status-value {
-                font-size: 15px;
-                font-weight: bold;
-              }
-
-              .pill {
-                display: inline-flex;
-                align-items: center;
-                gap: 7px;
-                padding: 7px 11px;
-                border-radius: 999px;
-                background: var(--accent-soft);
-                color: var(--accent-strong);
-                font-size: 12px;
-                margin-top: 12px;
-              }
-
-              .actions {
-                display: grid;
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 12px;
-                margin-top: 14px;
-              }
-
-              button {
-                border: none;
-                border-radius: 14px;
-                cursor: pointer;
-                font: inherit;
-                transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
-              }
-
-              button:hover {
-                transform: translateY(-1px);
-              }
-
-              .primary {
-                padding: 16px 14px;
-                background: linear-gradient(135deg, var(--accent), #d07f52);
-                color: white;
-                text-align: left;
-                box-shadow: 0 10px 20px rgba(143, 63, 31, 0.22);
-              }
-
-              .primary strong,
-              .secondary strong {
-                display: block;
-                font-size: 15px;
-                margin-bottom: 4px;
-              }
-
-              .primary span,
-              .secondary span {
-                display: block;
-                font-size: 12px;
-                line-height: 1.4;
-                opacity: 0.95;
-              }
-
-              .secondary {
-                padding: 14px;
-                text-align: left;
-                background: rgba(255,255,255,0.88);
-                color: var(--ink);
-                border: 1px solid var(--line);
-              }
-
-              .secondary-row {
-                display: grid;
-                grid-template-columns: repeat(3, minmax(0, 1fr));
-                gap: 10px;
-                margin-top: 10px;
-              }
-
-              .mini {
-                padding: 12px 10px;
-                background: rgba(255,255,255,0.88);
-                border: 1px solid var(--line);
-                color: var(--ink);
-              }
-
-              .mini.warn {
-                background: rgba(184,92,56,0.08);
-              }
-
-              .footer {
-                font-size: 12px;
-                color: var(--muted);
-                line-height: 1.45;
-                margin-top: 10px;
-              }
-
-              .field {
-                margin-top: 14px;
-              }
-
-              .field label {
-                display: block;
-                font-size: 12px;
-                text-transform: uppercase;
-                letter-spacing: 0.14em;
-                color: var(--muted);
-                margin-bottom: 8px;
-              }
-
-              .field select {
+              /* Input Range Styling Override */
+              input[type=range] {
+                -webkit-appearance: none;
                 width: 100%;
-                padding: 12px 14px;
-                border-radius: 12px;
-                border: 1px solid var(--line);
-                background: rgba(255,255,255,0.9);
-                color: var(--ink);
-                font: inherit;
+                background: transparent;
+                outline: none;
               }
-
-              .slider-wrap {
-                margin-top: 12px;
-                padding: 14px;
-                border-radius: 14px;
-                border: 1px solid var(--line);
-                background: rgba(255,255,255,0.76);
-              }
-
-              .slider-head {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                margin-bottom: 10px;
-                font-size: 13px;
-              }
-
-              .slider-value {
-                font-weight: bold;
-                color: var(--accent-strong);
-              }
-
-              input[type="range"] {
-                width: 100%;
-              }
-
-              .slider-steps {
-                display: grid;
-                grid-template-columns: repeat(4, minmax(0, 1fr));
-                gap: 6px;
-                margin-top: 8px;
-                font-size: 11px;
-                color: var(--muted);
-                text-align: center;
-              }
-
-              .status-bar {
-                margin-top: 14px;
-                padding: 12px 14px;
-                border-radius: 14px;
-                background: rgba(255,255,255,0.8);
-                border: 1px solid var(--line);
-                font-size: 13px;
-                color: var(--ink);
-              }
-
-              .status-bar.ok {
-                border-color: rgba(47, 125, 91, 0.24);
-                background: rgba(47, 125, 91, 0.08);
-              }
-
-              .status-bar.warn {
-                border-color: rgba(155, 92, 22, 0.24);
-                background: rgba(155, 92, 22, 0.08);
-              }
-
-              .toggle-card {
-                margin-top: 12px;
-                padding: 14px;
-                border-radius: 14px;
-                border: 1px solid var(--line);
-                background: rgba(255,255,255,0.76);
-              }
-
-              .toggle-row {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 14px;
-              }
-
-              .toggle-copy strong {
-                display: block;
-                font-size: 14px;
-                margin-bottom: 4px;
-              }
-
-              .toggle-copy span {
-                display: block;
-                color: var(--muted);
-                font-size: 12px;
-                line-height: 1.45;
-              }
-
-              .switch {
-                position: relative;
-                display: inline-flex;
-                width: 52px;
-                height: 30px;
-                flex: 0 0 auto;
-              }
-
-              .switch input {
-                opacity: 0;
-                width: 0;
-                height: 0;
-              }
-
-              .slider {
-                position: absolute;
-                inset: 0;
-                cursor: pointer;
-                background: rgba(108, 97, 88, 0.25);
-                border-radius: 999px;
-                transition: background 0.15s ease;
-              }
-
-              .slider:before {
-                content: "";
-                position: absolute;
-                height: 24px;
-                width: 24px;
-                left: 3px;
-                top: 3px;
-                background: white;
+              input[type=range]::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                height: 12px; width: 12px;
                 border-radius: 50%;
-                box-shadow: 0 4px 10px rgba(33, 26, 21, 0.2);
-                transition: transform 0.15s ease;
+                background: var(--accent-primary);
+                cursor: pointer;
+                margin-top: -4px;
+                box-shadow: 0 0 8px var(--accent-primary);
+              }
+              input[type=range]::-webkit-slider-runnable-track {
+                width: 100%; height: 4px;
+                cursor: pointer;
+                background: var(--border-color);
+                border-radius: 2px;
               }
 
-              .switch input:checked + .slider {
-                background: linear-gradient(135deg, var(--accent), #d07f52);
-              }
-
-              .switch input:checked + .slider:before {
-                transform: translateX(22px);
-              }
+              /* Custom toggle switch */
+              .switch-checkbox:checked { right: 0; }
+              .switch-checkbox:checked + .switch-label { background-color: var(--accent-primary); border-color: var(--accent-primary); }
+              .switch-checkbox:checked + .switch-label .switch-dot { transform: translateX(12px); background-color: white;}
             </style>
           </head>
-          <body>
-            <section class="hero">
-              <div class="eyebrow">Unified Tooling</div>
-              <h1 class="title">Gaussian Splatting</h1>
-              <p class="subtitle">
-                One control room for the current splat workflow: initialize the renderer,
-                inspect a PLY, load splats into the active SketchUp scene, force redraw, or clear them.
-              </p>
-            </section>
+          <body class="w-full h-screen overflow-hidden flex flex-col relative select-none">
+            
+            <!-- Header (Compact) -->
+            <header class="h-10 border-b border-white/10 bg-[#0A0A0D]/90 backdrop-blur-md px-4 flex items-center justify-between shrink-0 shadow-md">
+              <div class="flex items-center gap-2">
+                <div class="w-1.5 h-1.5 rounded-full bg-accent shadow-[0_0_8px_#FF5400] animate-pulse" id="statusDot"></div>
+                <h1 class="text-xs font-semibold tracking-wide">Splat Studio</h1>
+              </div>
+              <div class="text-[9px] font-mono text-zinc-500 uppercase px-1.5 py-0.5 rounded bg-white/5 border border-white/10 truncate max-w-[200px]" id="statusBar">
+                System Initializing...
+              </div>
+            </header>
 
-            <div class="content">
-              <section class="panel">
-                <h2>Runtime Status</h2>
-                <p>
-                  This panel reflects the current integrated Gaussian runtime that lives inside the main
-                  <strong>Gaussian Points</strong> plugin.
-                </p>
-
-                <div class="status-grid">
-                  <div class="status-card">
-                    <div class="status-label">Bridge / DLLs</div>
-                    <div class="status-value" id="dllState">Checking...</div>
+            <div class="flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar p-3 relative flex flex-col gap-3">
+              
+              <!-- Engine Status (Inline) -->
+              <section class="glass-panel rounded-2xl px-3 p-2.5 flex items-center justify-between gap-3 text-[10px]">
+                <div class="flex items-center gap-2 overflow-hidden flex-1">
+                  <div class="flex items-center gap-1.5 shrink-0">
+                    <span class="text-zinc-500 font-bold uppercase tracking-wide">Bridge</span>
+                    <span class="font-mono text-zinc-300" id="dllState">...</span>
                   </div>
-                  <div class="status-card">
-                    <div class="status-label">Renderer State</div>
-                    <div class="status-value" id="initState">Checking...</div>
+                  <div class="w-px h-3 bg-white/10 shrink-0"></div>
+                  <div class="flex items-center gap-1.5 shrink-0">
+                    <span class="text-zinc-500 font-bold uppercase tracking-wide">Render</span>
+                    <span class="font-mono text-zinc-300" id="initState">...</span>
+                  </div>
+                  <div class="w-px h-3 bg-white/10 shrink-0"></div>
+                  <div class="font-mono text-zinc-600 truncate flex-1" id="sandboxPath" title="Workspace path">
+                    ...
                   </div>
                 </div>
-
-                <div class="pill" id="sandboxPath">Preparing path...</div>
-                <div class="status-bar" id="statusBar">Open this window from the toolbar whenever you want to work with splats.</div>
               </section>
 
-              <section class="panel">
-                <h2>PLY Workflow</h2>
-                <p>Use the same actions as before, but now from the root toolbar instead of a separate sandbox plugin.</p>
-                <div class="field">
-                  <label for="upAxisMode">Import Orientation Test Mode</label>
-                  <select id="upAxisMode">
-                    <option value="legacy">1. Y-up (original/Postshot)</option>
-                    <option value="swap_a">2. Z-up inverted</option>
-                    <option value="swap_b">3. Z-up (default)</option>
+              <!-- Dataset & Action (Merged) -->
+              <section class="glass-panel rounded-2xl p-3 relative overflow-hidden">
+                <div class="absolute top-0 right-0 w-20 h-20 bg-accent/10 blur-[20px] rounded-full pointer-events-none transform translate-x-5 -translate-y-5"></div>
+                
+                <h3 class="text-[9px] font-bold text-zinc-500 uppercase tracking-widest mb-2 flex items-center gap-2 relative z-10">
+                  Dataset Operations <span class="flex-1 h-px bg-white/5"></span>
+                </h3>
+                
+                <div class="flex items-center gap-2 mb-2 relative z-10 w-full">
+                  <button class="flex-1 py-2 rounded-full bg-gradient-to-r from-accent to-[#FF2E93] hover:opacity-90 text-white shadow-[0_0_10px_rgba(255,84,0,0.2)] text-xs font-bold transition-all flex items-center justify-center gap-1.5" data-action="load_ply">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                    Load PLY
+                  </button>
+                  <button class="w-[70px] py-2 rounded-full bg-white/5 hover:bg-white/10 text-zinc-300 text-[10px] font-semibold transition-all flex items-center justify-center border border-white/10" title="Check PLY without loading" data-action="analyze_ply">
+                    Analyze
+                  </button>
+                  <button class="w-[70px] py-2 rounded-full bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 text-[10px] font-semibold transition-all flex items-center justify-center border border-rose-500/20" title="Clear All Plats" data-action="clear_splats">
+                    Clear
+                  </button>
+                </div>
+
+                <div class="flex items-center justify-between relative z-10 mt-3 pt-3 border-t border-white/5">
+                  <label class="text-[9px] font-bold text-zinc-500 uppercase tracking-widest shrink-0">Import Axis Mode</label>
+                  <select id="upAxisMode" class="bg-black/40 border border-white/10 text-zinc-300 text-[11px] rounded-full px-2 py-1 outline-none focus:border-accent cursor-pointer max-w-[160px]">
+                    <option value="legacy">Y-up (Legacy/Postshot)</option>
+                    <option value="swap_a">Z-up Inverted</option>
+                    <option value="swap_b" selected>Z-up (Default/Luma)</option>
                   </select>
                 </div>
-                <div class="actions">
-                  <button class="primary" data-action="load_ply">
-                    <strong>Load Gaussian PLY</strong>
-                    <span>Choose a .ply file and load splats into the active scene.</span>
-                  </button>
-                  <button class="secondary" data-action="analyze_ply">
-                    <strong>Analyze PLY</strong>
-                    <span>Run the importer check without changing the rendered splats.</span>
-                  </button>
-                </div>
               </section>
 
-              <section class="panel">
-                <h2>Scene Controls</h2>
-                <p>Useful while iterating inside SketchUp without reopening the dialog.</p>
-                <div class="slider-wrap">
-                  <div class="slider-head">
-                    <span>SH Render Level</span>
-                    <span class="slider-value" id="shDegreeValue">3</span>
-                  </div>
-                  <input id="shDegree" type="range" min="0" max="3" step="1" value="3" />
-                  <div class="slider-steps">
-                    <span>0 · DC</span>
-                    <span>1</span>
-                    <span>2</span>
-                    <span>3 · Full</span>
-                  </div>
-                </div>
-                <div class="toggle-card">
-                  <div class="toggle-row">
-                    <div class="toggle-copy">
-                      <strong>Acceleration</strong>
-                      <span>Uses the old fast approximate sorting path for higher FPS. Can reintroduce flickering at distance.</span>
+              <!-- Parameters -->
+              <section class="glass-panel rounded-2xl p-3 relative overflow-hidden">
+                <h3 class="text-[9px] font-bold text-zinc-500 uppercase tracking-widest mb-2 flex items-center gap-2 relative z-10">
+                  Visuals & Processing <span class="flex-1 h-px bg-white/5"></span>
+                </h3>
+                
+                <div class="grid grid-cols-2 gap-2 relative z-10">
+                  <div class="bg-black/30 border border-white/5 p-2 rounded-xl flex flex-col justify-center">
+                    <div class="flex justify-between items-center mb-1">
+                      <span class="text-[10px] font-semibold text-zinc-300">SH Harmonic Level</span>
+                      <span class="font-mono text-accent font-bold text-[10px]" id="shDegreeValue">3</span>
                     </div>
-                    <label class="switch">
-                      <input id="fastApproximateSorting" type="checkbox" />
-                      <span class="slider"></span>
+                    <input id="shDegree" type="range" min="0" max="3" step="1" value="3" class="w-full h-1" />
+                  </div>
+
+                  <div class="bg-black/30 border border-white/5 p-2 rounded-xl flex items-center justify-between overflow-hidden">
+                    <div class="overflow-hidden">
+                      <div class="text-[10px] font-semibold text-zinc-300 truncate">Approximate Sort</div>
+                      <div class="text-[8px] text-zinc-600 leading-none mt-1 truncate">Boost FPS / Flicker</div>
+                    </div>
+                    <label class="flex items-center cursor-pointer relative shrink-0 ml-1">
+                      <input type="checkbox" id="fastApproximateSorting" class="sr-only switch-checkbox" />
+                      <div class="switch-label block bg-white/10 w-7 h-4 rounded-full transition-colors border border-white/10">
+                        <div class="switch-dot absolute left-0.5 top-0.5 bg-zinc-400 w-3 h-3 rounded-full transition-transform"></div>
+                      </div>
                     </label>
                   </div>
                 </div>
-                <div class="secondary-row">
-                  <button class="mini" data-action="initialize">Initialize</button>
-                  <button class="mini" data-action="render_now">Show Now</button>
-                  <button class="mini warn" data-action="clear_splats">Clear</button>
-                </div>
-                <div class="footer">
-                  I kept the implementation files inside <code>sandbox</code> for now to avoid risky file churn.
-                  The user-facing entrypoint is unified here in the main plugin.
+
+                <div class="grid grid-cols-2 gap-2 mt-2 relative z-10">
+                  <button class="py-2.5 rounded-full bg-white/5 hover:bg-white/10 text-zinc-400 text-[9px] uppercase tracking-wider font-semibold transition-all border border-white/5" data-action="initialize">Force Init Engine</button>
+                  <button class="py-2.5 rounded-full bg-[#00F0FF]/10 hover:bg-[#00F0FF]/20 text-[#00F0FF] text-[9px] uppercase tracking-wider font-semibold transition-all border border-[#00F0FF]/20" data-action="render_now">Forced Redraw Output</button>
                 </div>
               </section>
             </div>
@@ -486,6 +222,7 @@ module GaussianPoints
               const initState = document.getElementById('initState');
               const sandboxPath = document.getElementById('sandboxPath');
               const statusBar = document.getElementById('statusBar');
+              const statusDot = document.getElementById('statusDot');
               const upAxisMode = document.getElementById('upAxisMode');
               const shDegree = document.getElementById('shDegree');
               const shDegreeValue = document.getElementById('shDegreeValue');
@@ -493,12 +230,27 @@ module GaussianPoints
 
               function setStatus(message, level) {
                 statusBar.textContent = message;
-                statusBar.className = 'status-bar' + (level ? ' ' + level : '');
+                if(level === 'ok') {
+                  statusBar.className = 'text-[9px] font-mono text-emerald-400 uppercase tracking-widest px-1.5 py-0.5 rounded border transition-colors bg-emerald-500/10 border-emerald-500/20 truncate max-w-[200px]';
+                  statusDot.className = 'w-1.5 h-1.5 rounded-full shadow-[0_0_8px_#10B981] bg-emerald-500';
+                } else if(level === 'warn') {
+                  statusBar.className = 'text-[9px] font-mono text-rose-400 uppercase tracking-widest px-1.5 py-0.5 rounded border transition-colors bg-rose-500/10 border-rose-500/20 truncate max-w-[200px]';
+                  statusDot.className = 'w-1.5 h-1.5 rounded-full shadow-[0_0_8px_#F43F5E] bg-rose-500';
+                } else {
+                  statusBar.className = 'text-[9px] font-mono text-zinc-400 uppercase tracking-widest px-1.5 py-0.5 rounded border transition-colors bg-white/5 border-white/10 truncate max-w-[200px]';
+                  statusDot.className = 'w-1.5 h-1.5 rounded-full shadow-[0_0_8px_#FF5400] bg-accent animate-pulse';
+                }
               }
 
               function update(payload) {
-                dllState.textContent = payload.loaded ? 'Loaded' : (payload.available ? 'Found on disk' : 'Missing pieces');
-                initState.textContent = payload.initialized ? 'Initialized' : 'Idle';
+                if(payload.loaded) {
+                  dllState.innerHTML = '<span class="text-emerald-400">Attached</span>';
+                } else {
+                  dllState.innerHTML = payload.available ? '<span class="text-amber-400">Disk OK</span>' : '<span class="text-rose-400">Missing</span>';
+                }
+                
+                initState.innerHTML = payload.initialized ? '<span class="text-[#00F0FF]">Active</span>' : '<span class="text-zinc-500">Standby</span>';
+
                 sandboxPath.textContent = payload.sandbox_dir || 'Path unavailable';
                 upAxisMode.value = payload.up_axis_mode || 'swap_b';
                 shDegree.value = String(payload.sh_render_degree ?? 3);
@@ -514,7 +266,7 @@ module GaussianPoints
               document.querySelectorAll('[data-action]').forEach((button) => {
                 button.addEventListener('click', () => {
                   const action = button.getAttribute('data-action');
-                  setStatus('Working...', '');
+                  setStatus('Executing...', '');
                   sketchup[action]();
                 });
               });
@@ -533,7 +285,7 @@ module GaussianPoints
               });
 
               fastApproximateSorting.addEventListener('change', () => {
-                setStatus('Switching render acceleration mode...', '');
+                setStatus('Switching sorting mode...', '');
                 sketchup.set_fast_approximate_sorting(fastApproximateSorting.checked ? 'true' : 'false');
               });
 

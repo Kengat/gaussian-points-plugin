@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("all", "gaussian", "pointcloud", "bridge")]
+  [ValidateSet("all", "gaussian", "preview", "pointcloud", "bridge")]
   [string[]]$Target = @("all"),
   [string]$Configuration = "Release",
   [string]$Platform = "x64"

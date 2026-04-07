@@ -201,6 +201,7 @@ static bool g_enableFastApproximateSorting = false;
 static StandalonePreviewState g_standalonePreview = {};
 static bool g_standalonePreviewEnabled = false;
 static const wchar_t* kStandalonePreviewWindowClass = L"GaussianPointsStandalonePreview";
+static HMODULE g_rendererModuleHandle = nullptr;
 
 static GLuint g_splatShader = 0;
 static GLuint g_outlineCompositeShader = 0;
@@ -234,6 +235,59 @@ static void LogRenderer(const char* format, ...) {
             logFile << "[Renderer] " << buffer << "\n";
         }
     }
+}
+
+static std::string GetDirectoryFromPath(const char* path) {
+    if (!path || !path[0]) {
+        return {};
+    }
+    const char* lastSlash = strrchr(path, '\\');
+    const char* lastForwardSlash = strrchr(path, '/');
+    const char* separator = lastSlash;
+    if (!separator || (lastForwardSlash && lastForwardSlash > separator)) {
+        separator = lastForwardSlash;
+    }
+    if (!separator) {
+        return {};
+    }
+    return std::string(path, static_cast<size_t>(separator - path));
+}
+
+static std::string GetRendererModuleDirectory() {
+    HMODULE moduleHandle = g_rendererModuleHandle;
+    if (!moduleHandle) {
+        if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&GetRendererModuleDirectory),
+            &moduleHandle)) {
+            return {};
+        }
+    }
+    char modulePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(moduleHandle, modulePath, MAX_PATH) == 0) {
+        return {};
+    }
+    return GetDirectoryFromPath(modulePath);
+}
+
+static HMODULE LoadRendererAdjacentLibrary(const char* dllName) {
+    if (!dllName || !dllName[0]) {
+        return nullptr;
+    }
+
+    const std::string moduleDirectory = GetRendererModuleDirectory();
+    if (!moduleDirectory.empty()) {
+        const std::string fullPath = moduleDirectory + "\\" + dllName;
+        LogRenderer("CHK: Trying renderer-adjacent DLL %s", fullPath.c_str());
+        HMODULE module = LoadLibraryExA(fullPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (module) {
+            return module;
+        }
+        LogRenderer("WARN: Adjacent DLL load failed for %s (err=%lu)", fullPath.c_str(), GetLastError());
+    }
+
+    LogRenderer("CHK: Falling back to bare DLL load for %s", dllName);
+    return LoadLibraryA(dllName);
 }
 
 static void PrintRendererMatrix(const char* name, const float* matrix) {
@@ -1904,7 +1958,7 @@ static void RenderStandalonePreviewFrame() {
     const int viewport_width = std::max(g_standalonePreview.width, 1);
     const int viewport_height = std::max(g_standalonePreview.height, 1);
     glViewport(0, 0, viewport_width, viewport_height);
-    glClearColor(0.952f, 0.933f, 0.902f, 1.0f);
+    glClearColor(0.0196f, 0.0196f, 0.0196f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     renderPointCloud();
     SwapBuffers(g_standalonePreview.device_context);
@@ -3668,7 +3722,7 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     return 1;
 }
 
-extern "C" EXPORT void LoadSplatsFromPLYWithUpAxis(const char* filename, int up_axis_mode) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadLibraryA("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %d", GetLastError()); return; } char plyPath[MAX_PATH] = {}; if (GetModuleFileNameA(plyDLL, plyPath, MAX_PATH) > 0) { LogRenderer("CHK: Loaded PlyImporter from %s", plyPath); } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); typedef int(*GPS)(); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); GPS getSize = (GPS)GetProcAddress(plyDLL, "GetPLYGaussianPointSize"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } if (getSize) { const int importerPointSize = getSize(); const int rendererPointSize = static_cast<int>(sizeof(PLYGaussianPoint)); LogRenderer("CHK: PLYGaussianPoint size importer=%d renderer=%d", importerPointSize, rendererPointSize); if (importerPointSize != rendererPointSize) { LogRenderer("ERR: PLYGaussianPoint ABI mismatch, aborting load."); FreeLibrary(plyDLL); return; } } else { LogRenderer("WARN: GetPLYGaussianPointSize not found in PlyImporter.dll"); } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); ResetSplatObjects(); BuildSplatObjectFromPLYData("__legacy__", pts, cnt, nullptr, nullptr, up_axis_mode); UpdateStandalonePreviewBounds(); FitStandalonePreviewCameraInternal(true); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); InvalidateStandalonePreview(); LogRenderer("PLY load finished."); }
+extern "C" EXPORT void LoadSplatsFromPLYWithUpAxis(const char* filename, int up_axis_mode) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadRendererAdjacentLibrary("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %lu", GetLastError()); return; } char plyPath[MAX_PATH] = {}; if (GetModuleFileNameA(plyDLL, plyPath, MAX_PATH) > 0) { LogRenderer("CHK: Loaded PlyImporter from %s", plyPath); } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); typedef int(*GPS)(); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); GPS getSize = (GPS)GetProcAddress(plyDLL, "GetPLYGaussianPointSize"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } if (getSize) { const int importerPointSize = getSize(); const int rendererPointSize = static_cast<int>(sizeof(PLYGaussianPoint)); LogRenderer("CHK: PLYGaussianPoint size importer=%d renderer=%d", importerPointSize, rendererPointSize); if (importerPointSize != rendererPointSize) { LogRenderer("ERR: PLYGaussianPoint ABI mismatch, aborting load."); FreeLibrary(plyDLL); return; } } else { LogRenderer("WARN: GetPLYGaussianPointSize not found in PlyImporter.dll"); } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); ResetSplatObjects(); BuildSplatObjectFromPLYData("__legacy__", pts, cnt, nullptr, nullptr, up_axis_mode); UpdateStandalonePreviewBounds(); FitStandalonePreviewCameraInternal(true); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); InvalidateStandalonePreview(); LogRenderer("PLY load finished."); }
 extern "C" EXPORT void LoadSplatsFromPLY(const char* filename) { LoadSplatsFromPLYWithUpAxis(filename, IMPORT_ORIENTATION_SWAP_B); }
 extern "C" EXPORT void AddSplatsFromPLYData(PLYGaussianPoint* points, int count) {
     LogRenderer("Adding %d splats from PLY data...", count);
@@ -3685,9 +3739,9 @@ extern "C" EXPORT int LoadSplatObjectFromPLYWithUpAxis(const char* object_id, co
         return 0;
     }
 
-    HMODULE plyDLL = LoadLibraryA("PlyImporter.dll");
+    HMODULE plyDLL = LoadRendererAdjacentLibrary("PlyImporter.dll");
     if (!plyDLL) {
-        LogRenderer("ERR Load PlyImporter %d", GetLastError());
+        LogRenderer("ERR Load PlyImporter %lu", GetLastError());
         return 0;
     }
     char plyPath[MAX_PATH] = {};
@@ -3900,7 +3954,7 @@ extern "C" EXPORT void FitStandalonePreviewCamera() {
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
-    case DLL_PROCESS_ATTACH: LogRenderer("DLL_PROCESS_ATTACH"); LoadHookFunctions(); break;
+    case DLL_PROCESS_ATTACH: g_rendererModuleHandle = hModule; LogRenderer("DLL_PROCESS_ATTACH"); LoadHookFunctions(); break;
     case DLL_PROCESS_DETACH: LogRenderer("DLL_PROCESS_DETACH"); break;
     case DLL_THREAD_ATTACH: break;
     case DLL_THREAD_DETACH: break;

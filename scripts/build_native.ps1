@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("all", "gaussian", "pointcloud", "bridge")]
+  [ValidateSet("all", "gaussian", "preview", "pointcloud", "bridge")]
   [string[]]$Target = @("all"),
   [string]$Configuration = "Release",
   [string]$Platform = "x64"
@@ -31,7 +31,8 @@ function Invoke-NativeProjectBuild {
     [Parameter(Mandatory = $true)][string]$Name,
     [Parameter(Mandatory = $true)][string]$ProjectPath,
     [Parameter(Mandatory = $true)][string]$DllName,
-    [Parameter(Mandatory = $true)][string]$RuntimeDestination
+    [Parameter(Mandatory = $true)][string]$RuntimeDestination,
+    [string]$TargetName
   )
 
   $msbuild = Get-MSBuildPath
@@ -49,11 +50,18 @@ function Invoke-NativeProjectBuild {
 
   Normalize-ProcessPathEnvironment
 
-  & $msbuild $ProjectPath `
-    /p:Configuration=$Configuration `
-    /p:Platform=$Platform `
-    /p:OutDir=$outDir `
-    /p:IntDir=$intDir
+  $msbuildArgs = @(
+    $ProjectPath,
+    "/p:Configuration=$Configuration",
+    "/p:Platform=$Platform",
+    "/p:OutDir=$outDir",
+    "/p:IntDir=$intDir"
+  )
+  if ($TargetName) {
+    $msbuildArgs += "/p:TargetName=$TargetName"
+  }
+
+  & $msbuild @msbuildArgs
 
   $exitCode = $LASTEXITCODE
   if ($exitCode -ne 0 -and -not (Test-Path $builtDll)) {
@@ -92,7 +100,7 @@ function Invoke-NativeProjectBuild {
 
 $targetsToBuild =
   if ($Target -contains "all") {
-    @("gaussian", "pointcloud", "bridge")
+    @("gaussian", "preview", "pointcloud", "bridge")
   } else {
     $Target
   }
@@ -102,6 +110,12 @@ $projectMap = @{
     ProjectPath = Join-Path $repoRoot "sandbox\cpp\build\GaussianSplatRenderer\GaussianSplatRenderer\GaussianSplatRenderer.vcxproj"
     DllName = "GaussianSplatRenderer.dll"
     RuntimeDestination = Join-Path $repoRoot "sandbox\runtime\GaussianSplatRenderer.dll"
+  }
+  preview = @{
+    ProjectPath = Join-Path $repoRoot "sandbox\cpp\build\GaussianSplatRenderer\GaussianSplatRenderer\GaussianSplatRenderer.vcxproj"
+    DllName = "GaussianSplatRenderer_preview.dll"
+    RuntimeDestination = Join-Path $repoRoot "sandbox\runtime\GaussianSplatRenderer_preview.dll"
+    TargetName = "GaussianSplatRenderer_preview"
   }
   pointcloud = @{
     ProjectPath = Join-Path $repoRoot "cpp\build\PointCloudRendererDLL\PointCloudRendererDLL\PointCloudRendererDLL.vcxproj"
@@ -126,7 +140,8 @@ foreach ($targetName in $targetsToBuild) {
     -Name $targetName `
     -ProjectPath $spec.ProjectPath `
     -DllName $spec.DllName `
-    -RuntimeDestination $spec.RuntimeDestination
+    -RuntimeDestination $spec.RuntimeDestination `
+    -TargetName $spec.TargetName
 }
 
 $results | Format-Table -AutoSize
