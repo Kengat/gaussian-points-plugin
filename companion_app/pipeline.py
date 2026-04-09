@@ -14,11 +14,18 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageFilter, ImageOps
 
+try:
+    import cv2  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency in some UI runtimes
+    cv2 = None
+
 from . import paths, store
 from .ply import write_gaussian_ply
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+ARCHIVE_SUFFIXES = {".zip"}
 SAMPLE_DATASET_NAME = "nerf_synthetic_lego_12"
 
 
@@ -36,15 +43,192 @@ def copy_input_images(project_id: str, image_paths: list[str]) -> list[Path]:
     target_dir = paths.project_input_dir(project_id)
     copied: list[Path] = []
     source_to_destination: dict[str, str] = {}
-    for index, source in enumerate(image_paths):
+    start_index = len(list_project_images(project_id)) if target_dir.exists() else 0
+    for offset, source in enumerate(image_paths):
         source_path = Path(source)
         extension = source_path.suffix.lower() or ".png"
-        destination = target_dir / f"{index:03d}_{source_path.stem}{extension}"
+        destination = target_dir / f"{start_index + offset:03d}_{source_path.stem}{extension}"
         shutil.copy2(source_path, destination)
         copied.append(destination)
         source_to_destination[source_path.name] = destination.name
     _copy_matching_transforms(project_id, image_paths, source_to_destination)
     return copied
+
+
+def ingest_media_sources(project_id: str, media_paths: list[str]) -> dict[str, object]:
+    if not media_paths:
+        return {
+            "copied_files": [],
+            "image_count": 0,
+            "source_images": 0,
+            "source_videos": 0,
+            "video_frames": 0,
+            "source_archives": 0,
+            "source_directories": 0,
+        }
+
+    paths.ensure_project_dirs(project_id)
+    import_root = stage_file(project_id, "imports")
+    import_root.mkdir(parents=True, exist_ok=True)
+
+    groups: list[list[Path]] = []
+    seen_sources: set[str] = set()
+    stats = {
+        "source_images": 0,
+        "source_videos": 0,
+        "video_frames": 0,
+        "source_archives": 0,
+        "source_directories": 0,
+    }
+
+    for raw_source in media_paths:
+        source_path = Path(raw_source)
+        groups.extend(_expand_media_source(project_id, source_path, import_root, seen_sources, stats))
+
+    copied: list[Path] = []
+    for group in groups:
+        if group:
+            copied.extend(copy_input_images(project_id, [str(path) for path in group]))
+
+    if not copied:
+        raise RuntimeError("No supported media files were found. Use images, videos, folders, or .zip datasets.")
+
+    return {
+        "copied_files": [str(path) for path in copied],
+        "image_count": len(copied),
+        **stats,
+    }
+
+
+def _expand_media_source(
+    project_id: str,
+    source_path: Path,
+    import_root: Path,
+    seen_sources: set[str],
+    stats: dict[str, int],
+) -> list[list[Path]]:
+    if not source_path.exists():
+        return []
+
+    if source_path.is_dir():
+        stats["source_directories"] += 1
+        return _collect_directory_media(project_id, source_path, import_root, seen_sources, stats)
+
+    try:
+        source_key = str(source_path.resolve())
+    except OSError:
+        source_key = str(source_path)
+    if source_key in seen_sources:
+        return []
+    seen_sources.add(source_key)
+
+    suffix = source_path.suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        stats["source_images"] += 1
+        return [[source_path]]
+    if suffix in VIDEO_SUFFIXES:
+        stats["source_videos"] += 1
+        frames = _extract_video_frames(project_id, source_path, import_root)
+        stats["video_frames"] += len(frames)
+        return [frames] if frames else []
+    if suffix in ARCHIVE_SUFFIXES:
+        stats["source_archives"] += 1
+        extracted_dir = _extract_archive(source_path, import_root)
+        return _collect_directory_media(project_id, extracted_dir, import_root, seen_sources, stats)
+    return []
+
+
+def _collect_directory_media(
+    project_id: str,
+    directory: Path,
+    import_root: Path,
+    seen_sources: set[str],
+    stats: dict[str, int],
+) -> list[list[Path]]:
+    image_groups: dict[Path, list[Path]] = {}
+    nested_groups: list[list[Path]] = []
+
+    for file_path in sorted(path for path in directory.rglob("*") if path.is_file()):
+        suffix = file_path.suffix.lower()
+        if suffix in IMAGE_SUFFIXES:
+            try:
+                file_key = str(file_path.resolve())
+            except OSError:
+                file_key = str(file_path)
+            if file_key in seen_sources:
+                continue
+            seen_sources.add(file_key)
+            stats["source_images"] += 1
+            image_groups.setdefault(file_path.parent, []).append(file_path)
+        elif suffix in VIDEO_SUFFIXES or suffix in ARCHIVE_SUFFIXES:
+            nested_groups.extend(_expand_media_source(project_id, file_path, import_root, seen_sources, stats))
+
+    grouped_images = [image_groups[parent] for parent in sorted(image_groups)]
+    return grouped_images + nested_groups
+
+
+def _safe_media_name(path: Path) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", path.stem).strip("._")
+    return safe or "media"
+
+
+def _extract_archive(archive_path: Path, import_root: Path) -> Path:
+    extract_dir = import_root / f"archive_{_safe_media_name(archive_path)}"
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    root_resolved = extract_dir.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            member_target = (extract_dir / member.filename).resolve()
+            if member_target != root_resolved and root_resolved not in member_target.parents:
+                raise RuntimeError(f"Archive {archive_path.name} contains unsafe paths.")
+            archive.extract(member, extract_dir)
+    return extract_dir
+
+
+def _extract_video_frames(project_id: str, video_path: Path, import_root: Path) -> list[Path]:
+    if cv2 is None:
+        raise RuntimeError("Video import requires OpenCV (cv2), but it is not available in this runtime.")
+
+    target_dir = import_root / f"video_{_safe_media_name(video_path)}"
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video file {video_path.name}.")
+
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    desired_frames = 16
+    if frame_count > 0:
+        desired_frames = min(24, max(8, frame_count // 24))
+        frame_indices = sorted(
+            {
+                int(round(((frame_count - 1) * index) / max(1, desired_frames - 1)))
+                for index in range(desired_frames)
+            }
+        )
+    else:
+        frame_indices = list(range(desired_frames))
+
+    frames: list[Path] = []
+    for output_index, frame_index in enumerate(frame_indices):
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            continue
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_path = target_dir / f"{output_index:03d}_{video_path.stem}.jpg"
+        Image.fromarray(rgb_frame).save(frame_path, format="JPEG", quality=92)
+        frames.append(frame_path)
+
+    capture.release()
+    if not frames:
+        raise RuntimeError(f"No usable frames were extracted from {video_path.name}.")
+    return frames
 
 
 def _normalized_source_name(name: str) -> str:

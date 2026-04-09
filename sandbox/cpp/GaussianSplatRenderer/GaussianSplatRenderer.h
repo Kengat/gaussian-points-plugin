@@ -62,6 +62,7 @@ extern "C" {
     EXPORT void RequestStandalonePreviewRedraw();
     EXPORT void ResetStandalonePreviewCamera();
     EXPORT void FitStandalonePreviewCamera();
+    EXPORT double GetStandalonePreviewFPS();
 
 #ifdef __cplusplus
 }

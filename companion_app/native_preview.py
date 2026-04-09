@@ -15,8 +15,8 @@ class _NativePreviewBridge:
     def __init__(self) -> None:
         runtime_dir = paths.repo_root() / "sandbox" / "runtime"
         candidates = [
-            runtime_dir / "GaussianSplatRenderer_preview.dll",
             runtime_dir / "GaussianSplatRenderer.dll",
+            runtime_dir / "GaussianSplatRenderer_preview.dll",
             paths.repo_root() / "sandbox" / "GaussianSplatRenderer.dll",
         ]
         renderer_path = next((path for path in candidates if path.exists()), None)
@@ -52,6 +52,10 @@ class _NativePreviewBridge:
         self.dll.SetSHRenderDegree.restype = None
         self.dll.SetFastApproximateSortingEnabled.argtypes = [ctypes.c_int]
         self.dll.SetFastApproximateSortingEnabled.restype = None
+        self._get_preview_fps = getattr(self.dll, "GetStandalonePreviewFPS", None)
+        if self._get_preview_fps is not None:
+            self._get_preview_fps.argtypes = []
+            self._get_preview_fps.restype = ctypes.c_double
 
     def create_window(self, parent_hwnd: int, width: int, height: int) -> bool:
         return bool(self.dll.CreateStandalonePreviewWindow(ctypes.c_void_p(parent_hwnd), 0, 0, int(width), int(height)))
@@ -77,6 +81,11 @@ class _NativePreviewBridge:
 
     def fit_camera(self) -> None:
         self.dll.FitStandalonePreviewCamera()
+
+    def get_preview_fps(self) -> float:
+        if self._get_preview_fps is None:
+            return 0.0
+        return float(self._get_preview_fps())
 
     def set_sh_degree(self, degree: int) -> None:
         self.dll.SetSHRenderDegree(int(degree))
@@ -183,6 +192,11 @@ class NativeSplatPreview(tk.Frame):
     def fit_view(self) -> None:
         if self.available and self._window_created:
             self.bridge.fit_camera()
+
+    def preview_fps(self) -> float:
+        if not self.available or not self._window_created:
+            return 0.0
+        return self.bridge.get_preview_fps()
 
     def _apply_pending_scene(self) -> None:
         if not self.available:

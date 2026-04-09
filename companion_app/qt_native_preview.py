@@ -22,6 +22,10 @@ class NativePreviewHost(QtWidgets.QWidget):
         self._pending_path: str | None = None
         self._current_path: str | None = None
         self._up_axis_mode = DEFAULT_UP_AXIS_MODE
+        self._redraw_timer = QtCore.QTimer(self)
+        self._redraw_timer.setInterval(120)
+        self._redraw_timer.timeout.connect(self._heartbeat_redraw)
+        self._redraw_timer.start()
 
     @property
     def available(self) -> bool:
@@ -78,6 +82,14 @@ class NativePreviewHost(QtWidgets.QWidget):
         if self.available and self._window_created:
             self._bridge.reset_camera()
 
+    def preview_fps(self) -> float:
+        if not self.available or not self._window_created:
+            return 0.0
+        try:
+            return float(self._bridge.get_preview_fps())
+        except Exception:
+            return 0.0
+
     def _ensure_window(self) -> None:
         if not self.available or self._window_created or not self.isVisible():
             return
@@ -95,6 +107,16 @@ class NativePreviewHost(QtWidgets.QWidget):
             native_width, native_height = self._native_size()
             self._bridge.resize_window(native_width, native_height)
             self._bridge.request_redraw()
+
+    def _heartbeat_redraw(self) -> None:
+        if not self.available or not self._window_created or not self.isVisible():
+            return
+        if not self._current_path and not self._pending_path:
+            return
+        try:
+            self._bridge.request_redraw()
+        except Exception:
+            pass
 
     def _native_size(self) -> tuple[int, int]:
         dpr = max(float(self.devicePixelRatioF()), 1.0)

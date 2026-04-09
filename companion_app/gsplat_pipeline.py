@@ -5,6 +5,7 @@ import math
 import os
 import random
 import shutil
+import sqlite3
 import time
 import zipfile
 from dataclasses import dataclass
@@ -17,13 +18,16 @@ import numpy as np
 from PIL import Image, ImageOps
 from gsplat.exporter import export_splats
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy.base import Strategy
+from gsplat.strategy.ops import inject_noise_to_position
 
 from . import paths, store
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 SH_C0 = 0.28209479177387814
+_MCMC_RUNTIME_MODE: str | None = None
 
 
 @dataclass
@@ -66,6 +70,18 @@ def _result_ply_path(project_id: str) -> Path:
 
 def _result_manifest_path(project_id: str) -> Path:
     return paths.project_result_dir(project_id) / "scene_manifest.json"
+
+
+def _training_summary_path(project_id: str) -> Path:
+    return paths.project_result_dir(project_id) / "training_summary.json"
+
+
+def _ensure_torch_extensions_dir() -> Path:
+    configured = os.environ.get("TORCH_EXTENSIONS_DIR")
+    extension_dir = Path(configured) if configured else (paths.data_root() / "torch_extensions")
+    extension_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCH_EXTENSIONS_DIR"] = str(extension_dir)
+    return extension_dir
 
 
 def _list_project_images(project_id: str) -> list[Path]:
@@ -152,6 +168,538 @@ def _ssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     sigma_xy = F.avg_pool2d(pred * target, kernel_size=11, stride=1, padding=5) - (mu_x * mu_y)
     ssim_map = ((2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)) / ((mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2))
     return ssim_map.mean()
+
+
+def _psnr_from_mse(mse: torch.Tensor) -> torch.Tensor:
+    return -10.0 * torch.log10(mse.clamp_min(1e-8))
+
+
+def _compute_relocation_torch(
+    opacities: torch.Tensor,
+    scales: torch.Tensor,
+    ratios: torch.Tensor,
+    binoms: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n = opacities.shape[0]
+    if n == 0:
+        return opacities, scales
+
+    opacities = opacities.contiguous()
+    scales = scales.contiguous()
+    ratios = ratios.to(dtype=torch.int64, device=opacities.device).clamp_min(1)
+    binoms = binoms.to(dtype=opacities.dtype, device=opacities.device)
+
+    new_opacities = 1.0 - torch.pow(1.0 - opacities, 1.0 / ratios.to(opacities.dtype))
+    max_ratio = int(ratios.max().item())
+    denom_sum = torch.zeros_like(opacities)
+    for i in range(1, max_ratio + 1):
+        active = ratios >= i
+        if not torch.any(active):
+            continue
+        active_indices = torch.nonzero(active, as_tuple=False).squeeze(-1)
+        active_opacity = new_opacities[active_indices]
+        partial = torch.zeros_like(active_opacity)
+        for k in range(i):
+            coeff = binoms[i - 1, k]
+            sign = -1.0 if (k % 2) else 1.0
+            partial = partial + (coeff * sign / math.sqrt(float(k + 1))) * torch.pow(active_opacity, k + 1)
+        denom_sum[active_indices] = denom_sum[active_indices] + partial
+
+    denom_sum = denom_sum.clamp_min(1e-8)
+    coeff = (opacities / denom_sum).unsqueeze(-1)
+    new_scales = coeff * scales
+    return new_opacities, new_scales
+
+
+def _multinomial_sample(weights: torch.Tensor, n: int, replacement: bool = True) -> torch.Tensor:
+    num_elements = weights.size(0)
+    if num_elements <= 2**24:
+        return torch.multinomial(weights, n, replacement=replacement)
+    normalized = weights / weights.sum().clamp_min(1e-12)
+    sampled = np.random.choice(
+        num_elements,
+        size=n,
+        replace=replacement,
+        p=normalized.detach().cpu().numpy(),
+    )
+    return torch.from_numpy(sampled).to(weights.device)
+
+
+@torch.no_grad()
+def _update_param_with_optimizer(
+    param_fn,
+    optimizer_fn,
+    params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+    optimizers: dict[str, torch.optim.Optimizer],
+    names: list[str] | None = None,
+) -> None:
+    target_names = names or list(params.keys())
+    for name in target_names:
+        param = params[name]
+        new_param = param_fn(name, param)
+        params[name] = new_param
+        if name not in optimizers:
+            continue
+        optimizer = optimizers[name]
+        for index in range(len(optimizer.param_groups)):
+            param_state = optimizer.state[param]
+            del optimizer.state[param]
+            for key, value in list(param_state.items()):
+                if key != "step":
+                    param_state[key] = optimizer_fn(key, value)
+            optimizer.param_groups[index]["params"] = [new_param]
+            optimizer.state[new_param] = param_state
+
+
+@torch.no_grad()
+def _mcmc_relocate(
+    params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+    optimizers: dict[str, torch.optim.Optimizer],
+    mask: torch.Tensor,
+    binoms: torch.Tensor,
+    min_opacity: float,
+) -> int:
+    opacities = torch.sigmoid(params["opacities"])
+    dead_indices = mask.nonzero(as_tuple=True)[0]
+    alive_indices = (~mask).nonzero(as_tuple=True)[0]
+    n_dead = int(dead_indices.numel())
+    if n_dead == 0 or alive_indices.numel() == 0:
+        return 0
+
+    probs = opacities[alive_indices].flatten().clamp_min(1e-12)
+    sampled_indices = alive_indices[_multinomial_sample(probs, n_dead, replacement=True)]
+    ratios = torch.bincount(sampled_indices, minlength=opacities.shape[0])[sampled_indices] + 1
+    new_opacities, new_scales = _compute_relocation_torch(
+        opacities=opacities[sampled_indices],
+        scales=torch.exp(params["scales"])[sampled_indices],
+        ratios=ratios,
+        binoms=binoms,
+    )
+    eps = torch.finfo(opacities.dtype).eps
+    new_opacities = torch.clamp(new_opacities, min=min_opacity, max=1.0 - eps)
+
+    def param_fn(name: str, tensor: torch.Tensor) -> torch.nn.Parameter:
+        updated = tensor.clone()
+        if name == "opacities":
+            updated[sampled_indices] = torch.logit(new_opacities)
+        elif name == "scales":
+            updated[sampled_indices] = torch.log(new_scales)
+        updated[dead_indices] = updated[sampled_indices]
+        return torch.nn.Parameter(updated, requires_grad=tensor.requires_grad)
+
+    def optimizer_fn(_key: str, value: torch.Tensor) -> torch.Tensor:
+        updated = value.clone()
+        updated[sampled_indices] = 0
+        return updated
+
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    return n_dead
+
+
+@torch.no_grad()
+def _mcmc_sample_add(
+    params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+    optimizers: dict[str, torch.optim.Optimizer],
+    n_new: int,
+    binoms: torch.Tensor,
+    min_opacity: float,
+) -> int:
+    if n_new <= 0:
+        return 0
+
+    opacities = torch.sigmoid(params["opacities"]).flatten().clamp_min(1e-12)
+    sampled_indices = _multinomial_sample(opacities, n_new, replacement=True)
+    ratios = torch.bincount(sampled_indices, minlength=opacities.shape[0])[sampled_indices] + 1
+    new_opacities, new_scales = _compute_relocation_torch(
+        opacities=opacities[sampled_indices],
+        scales=torch.exp(params["scales"])[sampled_indices],
+        ratios=ratios,
+        binoms=binoms,
+    )
+    eps = torch.finfo(opacities.dtype).eps
+    new_opacities = torch.clamp(new_opacities, min=min_opacity, max=1.0 - eps)
+
+    def param_fn(name: str, tensor: torch.Tensor) -> torch.nn.Parameter:
+        repeats = [1] * tensor.dim()
+        if name == "means":
+            addition = tensor[sampled_indices]
+        elif name == "scales":
+            addition = torch.log(new_scales)
+        elif name == "opacities":
+            addition = torch.logit(new_opacities)
+        else:
+            repeats[0] = 1
+            addition = tensor[sampled_indices]
+        return torch.nn.Parameter(torch.cat([tensor, addition], dim=0), requires_grad=tensor.requires_grad)
+
+    def optimizer_fn(_key: str, value: torch.Tensor) -> torch.Tensor:
+        zeros = torch.zeros((n_new, *value.shape[1:]), dtype=value.dtype, device=value.device)
+        return torch.cat([value, zeros], dim=0)
+
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    return n_new
+
+
+class _TorchFallbackMCMCStrategy(Strategy):
+    def __init__(
+        self,
+        *,
+        cap_max: int = 1_000_000,
+        noise_lr: float = 5e5,
+        refine_start_iter: int = 500,
+        refine_stop_iter: int = 25_000,
+        refine_every: int = 100,
+        min_opacity: float = 0.005,
+        verbose: bool = False,
+    ) -> None:
+        self.cap_max = cap_max
+        self.noise_lr = noise_lr
+        self.refine_start_iter = refine_start_iter
+        self.refine_stop_iter = refine_stop_iter
+        self.refine_every = refine_every
+        self.min_opacity = min_opacity
+        self.verbose = verbose
+
+    def initialize_state(self) -> dict[str, object]:
+        n_max = 51
+        binoms = torch.zeros((n_max, n_max), dtype=torch.float32)
+        for n in range(n_max):
+            for k in range(n + 1):
+                binoms[n, k] = math.comb(n, k)
+        return {"binoms": binoms}
+
+    def check_sanity(
+        self,
+        params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+        optimizers: dict[str, torch.optim.Optimizer],
+    ) -> None:
+        super().check_sanity(params, optimizers)
+        for key in ["means", "scales", "quats", "opacities"]:
+            assert key in params, f"{key} is required in params but missing."
+
+    def step_post_backward(
+        self,
+        params: dict[str, torch.nn.Parameter] | torch.nn.ParameterDict,
+        optimizers: dict[str, torch.optim.Optimizer],
+        state: dict[str, object],
+        step: int,
+        info: dict,
+        lr: float,
+    ) -> None:
+        del info
+        binoms = state["binoms"]
+        assert isinstance(binoms, torch.Tensor)
+        binoms = binoms.to(params["means"].device)
+        state["binoms"] = binoms
+
+        if step < self.refine_stop_iter and step > self.refine_start_iter and step % self.refine_every == 0:
+            opacities = torch.sigmoid(params["opacities"].flatten())
+            dead_mask = opacities <= self.min_opacity
+            relocated = _mcmc_relocate(params, optimizers, dead_mask, binoms, self.min_opacity)
+            current_count = len(params["means"])
+            target_count = min(self.cap_max, int(1.05 * current_count))
+            added = _mcmc_sample_add(params, optimizers, max(0, target_count - current_count), binoms, self.min_opacity)
+            if self.verbose:
+                print(f"Step {step}: relocated {relocated}, added {added}, total={len(params['means'])}")
+            torch.cuda.empty_cache()
+
+        inject_noise_to_position(params=params, optimizers=optimizers, state={}, scaler=lr * self.noise_lr)
+
+
+def _ensure_mcmc_runtime(job: dict | None, device: torch.device) -> str:
+    global _MCMC_RUNTIME_MODE
+    if _MCMC_RUNTIME_MODE is not None:
+        return _MCMC_RUNTIME_MODE
+
+    import gsplat.relocation as relocation_module
+    import gsplat.strategy.ops as strategy_ops_module
+
+    try:
+        opacities = torch.tensor([0.5], dtype=torch.float32, device=device)
+        scales = torch.ones((1, 3), dtype=torch.float32, device=device)
+        ratios = torch.ones((1,), dtype=torch.int32, device=device)
+        binoms = torch.ones((2, 2), dtype=torch.float32, device=device)
+        relocation_module.compute_relocation(opacities, scales, ratios, binoms)
+        _MCMC_RUNTIME_MODE = "native"
+    except Exception as error:
+        relocation_module.compute_relocation = _compute_relocation_torch
+        strategy_ops_module.compute_relocation = _compute_relocation_torch
+        _MCMC_RUNTIME_MODE = "torch_fallback"
+        if job is not None:
+            _log_line(
+                job,
+                f"MCMC relocation backend fell back to pure PyTorch because native gsplat relocation is unavailable: {error}",
+            )
+    return _MCMC_RUNTIME_MODE
+
+
+def _positive_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _positive_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0.0 else None
+
+
+def _normalize_quality_preset(settings: dict) -> str:
+    preset = str(settings.get("quality_preset") or "balanced").strip().lower()
+    if preset not in {"compact", "balanced", "high"}:
+        return "balanced"
+    return preset
+
+
+def _auto_gaussian_budget(view_count: int, initial_points: int, train_resolution: int, preset: str) -> int:
+    profile_table = {
+        "compact": {"point_factor": 2.5, "view_resolution_weight": 8.0, "minimum": 40_000, "maximum": 300_000},
+        "balanced": {"point_factor": 4.0, "view_resolution_weight": 12.0, "minimum": 80_000, "maximum": 650_000},
+        "high": {"point_factor": 6.0, "view_resolution_weight": 18.0, "minimum": 140_000, "maximum": 1_250_000},
+    }
+    profile = profile_table[preset]
+    budget = int(round((initial_points * profile["point_factor"]) + (view_count * train_resolution * profile["view_resolution_weight"])))
+    return max(int(profile["minimum"]), min(int(profile["maximum"]), budget))
+
+
+def _resolve_training_profile(settings: dict, view_count: int, initial_points: int) -> dict[str, object]:
+    max_steps = int(settings.get("train_steps", 1200))
+    train_resolution = int(settings.get("train_resolution", 640))
+    preset = _normalize_quality_preset(settings)
+    strategy_name = str(settings.get("strategy_name") or "auto").strip().lower()
+    if strategy_name not in {"auto", "default", "mcmc"}:
+        strategy_name = "auto"
+    if strategy_name == "auto":
+        strategy_name = "mcmc"
+
+    max_gaussians = _positive_int(settings.get("max_gaussians")) or _auto_gaussian_budget(
+        view_count,
+        initial_points,
+        train_resolution,
+        preset,
+    )
+
+    if strategy_name == "mcmc":
+        start_ratio = {"compact": 0.10, "balanced": 0.10, "high": 0.12}[preset]
+        stop_ratio = {"compact": 0.70, "balanced": 0.80, "high": 0.90}[preset]
+    else:
+        start_ratio = {"compact": 0.10, "balanced": 0.10, "high": 0.12}[preset]
+        stop_ratio = {"compact": 0.45, "balanced": 0.55, "high": 0.65}[preset]
+    max_refine_iter = max(1, max_steps - 1)
+    refine_start_iter = _positive_int(settings.get("densify_start_iter")) or max(25, int(max_steps * start_ratio))
+    refine_start_iter = min(max_refine_iter, refine_start_iter)
+    refine_stop_iter = _positive_int(settings.get("densify_stop_iter")) or max(50, int(max_steps * stop_ratio))
+    refine_stop_iter = min(max_refine_iter, refine_stop_iter)
+    if refine_stop_iter <= refine_start_iter:
+        refine_start_iter = max(1, min(refine_start_iter, max_refine_iter - 1))
+        refine_stop_iter = min(max_refine_iter, max(refine_start_iter + 1, refine_stop_iter))
+    refine_every = _positive_int(settings.get("densify_interval")) or (75 if preset == "compact" else 50)
+
+    profile: dict[str, object] = {
+        "preset": preset,
+        "strategy_name": strategy_name,
+        "max_gaussians": int(max_gaussians),
+        "refine_start_iter": int(refine_start_iter),
+        "refine_stop_iter": int(refine_stop_iter),
+        "refine_every": int(refine_every),
+        "refine_scale2d_stop_iter": int(max_steps),
+        "opacity_reset_interval": _positive_int(settings.get("opacity_reset_interval")) or max(1000, int(max_steps * 0.6)),
+    }
+
+    if strategy_name == "mcmc":
+        profile["min_opacity"] = _positive_float(settings.get("min_opacity")) or {
+            "compact": 0.015,
+            "balanced": 0.010,
+            "high": 0.0075,
+        }[preset]
+        profile["noise_lr"] = _positive_float(settings.get("mcmc_noise_lr")) or {
+            "compact": 3.0e5,
+            "balanced": 4.0e5,
+            "high": 5.0e5,
+        }[preset]
+        return profile
+
+    absgrad_setting = settings.get("absgrad")
+    absgrad = bool(absgrad_setting) if absgrad_setting is not None else (preset != "compact")
+    grow_grad2d = _positive_float(settings.get("grow_grad2d"))
+    if grow_grad2d is None:
+        grow_grad2d = 8.0e-4 if absgrad else 2.0e-4
+        if preset == "compact":
+            grow_grad2d *= 1.25
+        elif preset == "high":
+            grow_grad2d *= 0.85
+
+    profile.update(
+        {
+            "absgrad": absgrad,
+            "grow_grad2d": grow_grad2d,
+            "prune_opa": _positive_float(settings.get("prune_opa")) or {
+                "compact": 0.015,
+                "balanced": 0.010,
+                "high": 0.0075,
+            }[preset],
+            "grow_scale3d": float(settings.get("grow_scale3d", 0.01)),
+            "grow_scale2d": float(settings.get("grow_scale2d", 0.05)),
+            "prune_scale3d": float(settings.get("prune_scale3d", 0.1)),
+            "prune_scale2d": float(settings.get("prune_scale2d", 0.15)),
+            "revised_opacity": bool(settings.get("revised_opacity", True)),
+        }
+    )
+    return profile
+
+
+def _build_target_pixels(
+    view: TrainingView,
+    device: torch.device,
+    *,
+    random_background: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    target_rgb = view.rgb_tensor.unsqueeze(0).to(device)
+    target_alpha = view.alpha_tensor.unsqueeze(0).to(device)
+    if view.has_alpha and random_background:
+        backgrounds = torch.rand((1, 3), dtype=torch.float32, device=device)
+    else:
+        backgrounds = torch.ones((1, 3), dtype=torch.float32, device=device)
+    pixels = (target_rgb * target_alpha) + (backgrounds[:, None, None, :] * (1.0 - target_alpha))
+    return target_rgb, target_alpha, backgrounds, pixels
+
+
+def _render_view(
+    splats: torch.nn.ParameterDict,
+    view: TrainingView,
+    device: torch.device,
+    *,
+    sh_degree_to_use: int,
+    absgrad: bool,
+    backgrounds: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    camtoworld = view.camtoworld.unsqueeze(0).to(device)
+    K = view.K.unsqueeze(0).to(device)
+    renders, alphas, info = rasterization(
+        means=splats["means"],
+        quats=splats["quats"],
+        scales=torch.exp(splats["scales"]),
+        opacities=torch.sigmoid(splats["opacities"]),
+        colors=torch.cat([splats["sh0"], splats["shN"]], dim=1),
+        viewmats=torch.linalg.inv(camtoworld),
+        Ks=K,
+        width=view.width,
+        height=view.height,
+        sh_degree=sh_degree_to_use,
+        packed=False,
+        absgrad=absgrad,
+        rasterize_mode="classic",
+        backgrounds=backgrounds,
+    )
+    return renders[..., :3], alphas, info
+
+
+def _visible_gaussian_count(info: dict) -> int:
+    radii = info.get("radii")
+    if radii is None:
+        return 0
+    visible = radii > 0.0
+    if visible.ndim >= 3:
+        visible = visible.all(dim=-1)
+    if visible.ndim == 2:
+        visible = visible.any(dim=0)
+    return int(visible.sum().item())
+
+
+def _evaluate_splats(
+    splats: torch.nn.ParameterDict,
+    views: list[TrainingView],
+    device: torch.device,
+    *,
+    sh_degree: int,
+    absgrad: bool,
+) -> dict[str, float]:
+    totals = {
+        "l1": 0.0,
+        "ssim": 0.0,
+        "psnr": 0.0,
+        "alpha_l1": 0.0,
+        "visible_gaussians": 0.0,
+    }
+    if not views:
+        return {key: 0.0 for key in totals}
+
+    with torch.no_grad():
+        for view in views:
+            _target_rgb, target_alpha, backgrounds, pixels = _build_target_pixels(
+                view,
+                device,
+                random_background=False,
+            )
+            colors_pred, alpha_pred, info = _render_view(
+                splats,
+                view,
+                device,
+                sh_degree_to_use=sh_degree,
+                absgrad=absgrad,
+                backgrounds=backgrounds,
+            )
+            l1_loss = F.l1_loss(colors_pred, pixels)
+            mse = F.mse_loss(colors_pred, pixels)
+            totals["l1"] += float(l1_loss.item())
+            totals["ssim"] += float(_ssim(colors_pred, pixels).item())
+            totals["psnr"] += float(_psnr_from_mse(mse).item())
+            if view.has_alpha:
+                totals["alpha_l1"] += float(F.l1_loss(alpha_pred, target_alpha).item())
+            totals["visible_gaussians"] += float(_visible_gaussian_count(info))
+
+    scale = 1.0 / float(len(views))
+    return {key: round(value * scale, 5) for key, value in totals.items()}
+
+
+@torch.no_grad()
+def _prune_coordinate_outliers(
+    splats: torch.nn.ParameterDict,
+    *,
+    job: dict | None = None,
+) -> int:
+    means = splats["means"].detach()
+    if means.ndim != 2 or means.shape[0] < 1024:
+        return 0
+
+    center = means.median(dim=0).values
+    distances = torch.linalg.norm(means - center, dim=1)
+    q99_value = float(torch.quantile(distances, 0.99).item())
+    q999_value = float(torch.quantile(distances, 0.999).item())
+    if not math.isfinite(q99_value) or not math.isfinite(q999_value):
+        return 0
+
+    extreme_tail_detected = q999_value > max(250.0, q99_value * 8.0)
+    if not extreme_tail_detected:
+        return 0
+
+    prune_threshold = max(150.0, q99_value * 3.0)
+    keep_mask = distances <= prune_threshold
+    removed = int((~keep_mask).sum().item())
+    if removed <= 0:
+        return 0
+
+    for name in list(splats.keys()):
+        parameter = splats[name]
+        filtered = parameter.detach()[keep_mask].clone()
+        splats[name] = torch.nn.Parameter(filtered, requires_grad=parameter.requires_grad)
+
+    if job is not None:
+        _log_line(
+            job,
+            f"Pruned {removed:,} coordinate outlier splats after training "
+            f"(q99={q99_value:.2f}, q999={q999_value:.2f}, threshold={prune_threshold:.2f}).",
+        )
+    return removed
 
 
 def _convert_blender_camtoworld(transform_matrix: list[list[float]]) -> torch.Tensor:
@@ -542,22 +1090,53 @@ def _pick_reconstruction(reconstructions: dict[int, pycolmap.Reconstruction]) ->
     )
 
 
+def _probe_sqlite_database(database_path: Path) -> None:
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    probe_path = database_path.with_name(f"{database_path.stem}_probe{database_path.suffix}")
+    try:
+        with sqlite3.connect(probe_path) as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS gp_probe(id INTEGER PRIMARY KEY, value TEXT)")
+            connection.execute("INSERT INTO gp_probe(value) VALUES ('ok')")
+            connection.execute("DELETE FROM gp_probe")
+            connection.commit()
+    except sqlite3.Error as error:
+        raise RuntimeError(
+            f"COLMAP scratch database is not writable at {database_path}. "
+            "Move the companion scratch directory to a local temp folder."
+        ) from error
+    finally:
+        if probe_path.exists():
+            try:
+                probe_path.unlink()
+            except OSError:
+                pass
+
+
 def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruction:
     image_dir = _prepare_colmap_images(project)
-    colmap_dir = _stage_dir(project["id"], "colmap")
+    colmap_dir = paths.project_colmap_scratch_dir(project["id"])
     database_path = colmap_dir / "database.db"
     sparse_dir = colmap_dir / "sparse"
 
     if settings.get("force_restart"):
-        if database_path.exists():
-            database_path.unlink()
-        if sparse_dir.exists():
-            shutil.rmtree(sparse_dir)
+        if colmap_dir.exists():
+            shutil.rmtree(colmap_dir)
+        colmap_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        colmap_dir.mkdir(parents=True, exist_ok=True)
 
     if sparse_dir.exists():
         existing = sorted(path for path in sparse_dir.iterdir() if path.is_dir())
         if existing:
+            _log_line(job, f"Reusing cached COLMAP reconstruction from {existing[0]}.")
             return pycolmap.Reconstruction(existing[0])
+
+    if database_path.exists():
+        database_path.unlink()
+    _probe_sqlite_database(database_path)
+
+    _log_line(job, f"COLMAP scratch workspace: {colmap_dir}")
+    _log_line(job, f"Prepared {len(list(image_dir.iterdir()))} normalized images for SfM.")
 
     _update(job["id"], "COLMAP", 0.08, "Extracting image features.")
     extraction_options = pycolmap.FeatureExtractionOptions()
@@ -580,7 +1159,7 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
         raise RuntimeError("Stopped during feature extraction.")
     _log_line(job, "COLMAP feature extraction finished.")
 
-    _update(job["id"], "COLMAP", 0.14, "Matching image features.")
+    _update(job["id"], "COLMAP", 0.14, "Matching image features. This can take a few minutes on larger datasets.")
     pycolmap.match_exhaustive(database_path, matching_options=matching_options)
     if _should_stop(job["id"]):
         raise RuntimeError("Stopped during feature matching.")
@@ -685,7 +1264,13 @@ def _load_training_views_from_transforms(
     return _align_views_to_reconstruction(views, reconstruction)
 
 
-def _train_gaussians(project: dict, job: dict, settings: dict, reconstruction: pycolmap.Reconstruction | None, views: list[TrainingView]) -> tuple[Path, int, dict]:
+def _train_gaussians(
+    project: dict,
+    job: dict,
+    settings: dict,
+    reconstruction: pycolmap.Reconstruction | None,
+    views: list[TrainingView],
+) -> tuple[Path, int, dict, dict[str, object]]:
     known_camera_mode = bool(settings.get("_known_camera_mode", False))
     if known_camera_mode:
         _update(job["id"], "Training", 0.28, "Initializing Gaussians from known-camera alpha visual hull.")
@@ -720,8 +1305,8 @@ def _train_gaussians(project: dict, job: dict, settings: dict, reconstruction: p
         for point in reconstruction.points3D.values():
             points.append(point.xyz)
             colors.append([channel / 255.0 for channel in point.color])
-        points_tensor = torch.tensor(points, dtype=torch.float32)
-        rgb_tensor = torch.tensor(colors, dtype=torch.float32)
+        points_tensor = torch.from_numpy(np.asarray(points, dtype=np.float32))
+        rgb_tensor = torch.from_numpy(np.asarray(colors, dtype=np.float32))
         filtered_points, filtered_colors = _filter_sparse_points_with_masks(
             points_tensor,
             rgb_tensor,
@@ -758,11 +1343,17 @@ def _train_gaussians(project: dict, job: dict, settings: dict, reconstruction: p
     rgb_tensor = rgb_tensor.to(device)
     neighbor_distance = _knn_mean_distance(points_tensor)
     scene_scale = float(torch.linalg.norm(points_tensor - points_tensor.mean(dim=0), dim=1).max().item())
+    initial_gaussian_count = int(len(points_tensor))
 
     sh_degree = int(settings.get("sh_degree", 3))
     init_opacity = float(settings.get("init_opacity", 0.10))
     sh_dim = (sh_degree + 1) ** 2
-
+    training_profile = _resolve_training_profile(settings, len(views), initial_gaussian_count)
+    strategy_name = str(training_profile["strategy_name"])
+    target_gaussian_budget = int(training_profile["max_gaussians"])
+    if strategy_name == "mcmc":
+        torch_extensions_dir = _ensure_torch_extensions_dir()
+        _log_line(job, f"Using torch extensions cache at {torch_extensions_dir}")
     splats = torch.nn.ParameterDict(
         {
             "means": torch.nn.Parameter(points_tensor),
@@ -784,23 +1375,50 @@ def _train_gaussians(project: dict, job: dict, settings: dict, reconstruction: p
     }
 
     max_steps = int(settings.get("train_steps", 1200))
-    strategy = DefaultStrategy(
-        prune_opa=float(settings.get("prune_opa", 0.005)),
-        grow_grad2d=float(settings.get("grow_grad2d", 7.5e-5)),
-        grow_scale3d=float(settings.get("grow_scale3d", 0.01)),
-        grow_scale2d=float(settings.get("grow_scale2d", 0.05)),
-        prune_scale3d=float(settings.get("prune_scale3d", 0.1)),
-        prune_scale2d=float(settings.get("prune_scale2d", 0.15)),
-        refine_scale2d_stop_iter=int(settings.get("refine_scale2d_stop_iter", max_steps)),
-        verbose=False,
-        refine_start_iter=int(settings.get("densify_start_iter", 250)),
-        refine_stop_iter=int(settings.get("densify_stop_iter", min(max_steps - 1, 7000))),
-        refine_every=int(settings.get("densify_interval", 100)),
-        reset_every=int(settings.get("opacity_reset_interval", 1500)),
-        pause_refine_after_reset=len(views),
-        absgrad=bool(settings.get("absgrad", True)),
+    mcmc_runtime_mode = "disabled"
+    if strategy_name == "mcmc":
+        mcmc_runtime_mode = _ensure_mcmc_runtime(job, device)
+        strategy_class = MCMCStrategy if mcmc_runtime_mode == "native" else _TorchFallbackMCMCStrategy
+        strategy = strategy_class(
+            cap_max=target_gaussian_budget,
+            noise_lr=float(training_profile["noise_lr"]),
+            refine_start_iter=int(training_profile["refine_start_iter"]),
+            refine_stop_iter=int(training_profile["refine_stop_iter"]),
+            refine_every=int(training_profile["refine_every"]),
+            min_opacity=float(training_profile["min_opacity"]),
+            verbose=False,
+        )
+        strategy_absgrad = False
+        strategy_state = strategy.initialize_state()
+    else:
+        strategy = DefaultStrategy(
+            prune_opa=float(training_profile["prune_opa"]),
+            grow_grad2d=float(training_profile["grow_grad2d"]),
+            grow_scale3d=float(training_profile["grow_scale3d"]),
+            grow_scale2d=float(training_profile["grow_scale2d"]),
+            prune_scale3d=float(training_profile["prune_scale3d"]),
+            prune_scale2d=float(training_profile["prune_scale2d"]),
+            refine_scale2d_stop_iter=int(training_profile["refine_scale2d_stop_iter"]),
+            verbose=False,
+            refine_start_iter=int(training_profile["refine_start_iter"]),
+            refine_stop_iter=int(training_profile["refine_stop_iter"]),
+            refine_every=int(training_profile["refine_every"]),
+            reset_every=int(training_profile["opacity_reset_interval"]),
+            pause_refine_after_reset=len(views),
+            absgrad=bool(training_profile["absgrad"]),
+            revised_opacity=bool(training_profile["revised_opacity"]),
+        )
+        strategy_absgrad = bool(training_profile["absgrad"])
+        strategy_state = strategy.initialize_state(scene_scale=max(scene_scale, 1.0))
+    _log_line(
+        job,
+        "Training profile "
+        f"preset={training_profile['preset']} strategy={strategy_name} "
+        f"runtime={mcmc_runtime_mode if strategy_name == 'mcmc' else 'default'} "
+        f"budget={target_gaussian_budget:,} init={initial_gaussian_count:,} "
+        f"refine={training_profile['refine_start_iter']}..{training_profile['refine_stop_iter']} "
+        f"every={training_profile['refine_every']}",
     )
-    strategy_state = strategy.initialize_state(scene_scale=max(scene_scale, 1.0))
     strategy.check_sanity(splats, optimizers)
 
     random.seed(42)
@@ -812,49 +1430,45 @@ def _train_gaussians(project: dict, job: dict, settings: dict, reconstruction: p
     lambda_dssim = float(settings.get("lambda_dssim", 0.20))
     alpha_loss_weight = float(settings.get("alpha_loss_weight", 0.05))
     random_background = bool(settings.get("random_background", True))
+    budget_pause_logged = False
 
     for step in range(max_steps):
         if _should_stop(job["id"]):
             raise RuntimeError("Stopped during Gaussian Splat training.")
 
         view = random.choice(views)
-        target_rgb = view.rgb_tensor.unsqueeze(0).to(device)
-        target_alpha = view.alpha_tensor.unsqueeze(0).to(device)
-        if view.has_alpha and random_background:
-            backgrounds = torch.rand((1, 3), dtype=torch.float32, device=device)
-        else:
-            backgrounds = torch.ones((1, 3), dtype=torch.float32, device=device)
-        pixels = (target_rgb * target_alpha) + (backgrounds[:, None, None, :] * (1.0 - target_alpha))
-        camtoworld = view.camtoworld.unsqueeze(0).to(device)
-        K = view.K.unsqueeze(0).to(device)
+        _target_rgb, target_alpha, backgrounds, pixels = _build_target_pixels(
+            view,
+            device,
+            random_background=random_background,
+        )
 
         sh_degree_to_use = min(sh_degree, step // max(1, max_steps // max(1, sh_degree + 1)))
-        renders, _alphas, info = rasterization(
-            means=splats["means"],
-            quats=splats["quats"],
-            scales=torch.exp(splats["scales"]),
-            opacities=torch.sigmoid(splats["opacities"]),
-            colors=torch.cat([splats["sh0"], splats["shN"]], dim=1),
-            viewmats=torch.linalg.inv(camtoworld),
-            Ks=K,
-            width=view.width,
-            height=view.height,
-            sh_degree=sh_degree_to_use,
-            packed=False,
-            absgrad=strategy.absgrad,
-            rasterize_mode="classic",
+        colors_pred, alpha_pred, info = _render_view(
+            splats,
+            view,
+            device,
+            sh_degree_to_use=sh_degree_to_use,
+            absgrad=strategy_absgrad,
             backgrounds=backgrounds,
         )
-        colors_pred = renders[..., :3]
-        alpha_pred = _alphas
 
-        strategy.step_pre_backward(
-            params=splats,
-            optimizers=optimizers,
-            state=strategy_state,
-            step=step,
-            info=info,
-        )
+        budget_paused = strategy_name == "default" and len(splats["means"]) >= target_gaussian_budget
+        if budget_paused and not budget_pause_logged:
+            budget_pause_logged = True
+            _log_line(
+                job,
+                f"Reached gaussian budget at step {step + 1}; pausing further densification at {len(splats['means']):,} splats.",
+            )
+
+        if strategy_name == "default" and not budget_paused:
+            strategy.step_pre_backward(
+                params=splats,
+                optimizers=optimizers,
+                state=strategy_state,
+                step=step,
+                info=info,
+            )
         if view.has_alpha:
             pixel_weights = 0.15 + (0.85 * target_alpha)
             l1_loss = (torch.abs(colors_pred - pixels) * pixel_weights).sum() / (pixel_weights.sum() * 3.0).clamp_min(1e-6)
@@ -873,14 +1487,25 @@ def _train_gaussians(project: dict, job: dict, settings: dict, reconstruction: p
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        strategy.step_post_backward(
-            params=splats,
-            optimizers=optimizers,
-            state=strategy_state,
-            step=step,
-            info=info,
-            packed=False,
-        )
+        if strategy_name == "mcmc":
+            means_lr = float(optimizers["means"].param_groups[0]["lr"])
+            strategy.step_post_backward(
+                params=splats,
+                optimizers=optimizers,
+                state=strategy_state,
+                step=step,
+                info=info,
+                lr=means_lr,
+            )
+        elif not budget_paused:
+            strategy.step_post_backward(
+                params=splats,
+                optimizers=optimizers,
+                state=strategy_state,
+                step=step,
+                info=info,
+                packed=False,
+            )
 
         if step == 0 or (step + 1) % 25 == 0 or step == max_steps - 1:
             progress = progress_base + (progress_span * ((step + 1) / max_steps))
@@ -894,6 +1519,35 @@ def _train_gaussians(project: dict, job: dict, settings: dict, reconstruction: p
                 job,
                 f"Train step {step + 1}/{max_steps}: loss={loss_value:.5f}, l1={l1_value:.5f}, ssim={ssim_value:.5f}, sh_degree={sh_degree_to_use}, gaussians={len(splats['means'])}",
             )
+
+    pruned_outliers = _prune_coordinate_outliers(splats, job=job)
+
+    evaluation = _evaluate_splats(
+        splats,
+        views,
+        device,
+        sh_degree=sh_degree,
+        absgrad=strategy_absgrad,
+    )
+    training_summary = {
+        "quality_preset": str(training_profile["preset"]),
+        "strategy_name": strategy_name,
+        "mcmc_runtime_mode": mcmc_runtime_mode if strategy_name == "mcmc" else "not_used",
+        "gaussian_budget": target_gaussian_budget,
+        "initial_gaussians": initial_gaussian_count,
+        "pruned_coordinate_outliers": pruned_outliers,
+        "final_gaussians": int(len(splats["means"])),
+        "train_steps": max_steps,
+        "train_resolution": int(settings.get("train_resolution", 640)),
+        "metrics": evaluation,
+    }
+    _log_line(
+        job,
+        "Final evaluation "
+        f"PSNR={evaluation['psnr']:.3f} SSIM={evaluation['ssim']:.4f} "
+        f"L1={evaluation['l1']:.4f} alpha_l1={evaluation['alpha_l1']:.4f} "
+        f"visible={evaluation['visible_gaussians']:.0f}",
+    )
 
     result_path = _result_ply_path(project["id"])
     export_splats(
@@ -909,10 +1563,17 @@ def _train_gaussians(project: dict, job: dict, settings: dict, reconstruction: p
 
     bounds_min = splats["means"].detach().cpu().min(dim=0).values.tolist()
     bounds_max = splats["means"].detach().cpu().max(dim=0).values.tolist()
-    return result_path, len(splats["means"]), {"min": bounds_min, "max": bounds_max}
+    return result_path, len(splats["means"]), {"min": bounds_min, "max": bounds_max}, training_summary
 
 
-def _export_handoff(project: dict, job: dict, workspace_ply: Path, point_count: int, bounds: dict) -> dict:
+def _export_handoff(
+    project: dict,
+    job: dict,
+    workspace_ply: Path,
+    point_count: int,
+    bounds: dict,
+    training_summary: dict[str, object],
+) -> dict:
     _update(job["id"], "Exporting", 0.9, "Writing the trained splat and SketchUp handoff package.")
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     export_dir = paths.exports_root() / f"{project['name'].replace(' ', '_')}_{timestamp}"
@@ -920,9 +1581,15 @@ def _export_handoff(project: dict, job: dict, workspace_ply: Path, point_count: 
 
     exported_ply = export_dir / "scene.ply"
     shutil.copy2(workspace_ply, exported_ply)
+    ply_size_bytes = int(exported_ply.stat().st_size)
+    summary_payload = dict(training_summary)
+    summary_payload["ply_size_bytes"] = ply_size_bytes
+    summary_payload["scene_ply"] = str(exported_ply)
+    summary_path = _training_summary_path(project["id"])
+    summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
 
     manifest = {
-        "version": 2,
+        "version": 3,
         "project_id": project["id"],
         "project_name": project["name"],
         "backend": project["backend"],
@@ -935,6 +1602,8 @@ def _export_handoff(project: dict, job: dict, workspace_ply: Path, point_count: 
             "type": "gaussian_ply",
             "path": str(exported_ply),
         },
+        "training_summary_path": str(summary_path),
+        "training_summary": summary_payload,
     }
     manifest_path = export_dir / "scene_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -960,6 +1629,7 @@ def _export_handoff(project: dict, job: dict, workspace_ply: Path, point_count: 
         status="ready",
         last_result_ply=str(workspace_ply),
         last_manifest_path=str(manifest_path),
+        last_training_summary=summary_payload,
     )
     return manifest
 
@@ -973,8 +1643,8 @@ def run_gsplat_job(project: dict, job: dict, settings: dict) -> dict:
             _log_line(job, "Known-camera alpha dataset detected. Training will use the manifest frame directly and will not mix in COLMAP poses.")
             manifest_settings = dict(settings)
             manifest_settings["_known_camera_mode"] = True
-            workspace_ply, point_count, bounds = _train_gaussians(project, job, manifest_settings, None, manifest_views)
-            manifest = _export_handoff(project, job, workspace_ply, point_count, bounds)
+            workspace_ply, point_count, bounds, training_summary = _train_gaussians(project, job, manifest_settings, None, manifest_views)
+            manifest = _export_handoff(project, job, workspace_ply, point_count, bounds, training_summary)
             _log_line(job, f"Exported trained splats to {manifest['scene_ply']}.")
             return manifest
 
@@ -984,7 +1654,7 @@ def run_gsplat_job(project: dict, job: dict, settings: dict) -> dict:
         _log_line(job, f"Loaded {len(views)} training views from camera manifest {manifest_path.name}.")
     else:
         _log_line(job, f"Loaded {len(views)} registered training views from SfM.")
-    workspace_ply, point_count, bounds = _train_gaussians(project, job, settings, reconstruction, views)
-    manifest = _export_handoff(project, job, workspace_ply, point_count, bounds)
+    workspace_ply, point_count, bounds, training_summary = _train_gaussians(project, job, settings, reconstruction, views)
+    manifest = _export_handoff(project, job, workspace_ply, point_count, bounds, training_summary)
     _log_line(job, f"Exported trained splats to {manifest['scene_ply']}.")
     return manifest

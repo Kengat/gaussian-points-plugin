@@ -48,6 +48,7 @@ def create_project(name: str, backend: str = "gsplat_colmap", note: str | None =
     project_id = uuid.uuid4().hex
     paths.ensure_project_dirs(project_id)
     now = utc_now()
+    initial_training_settings = sanitize_training_settings(default_job_settings(force_restart=False))
     payload = {
         "id": project_id,
         "name": name.strip() or "Untitled Project",
@@ -60,6 +61,8 @@ def create_project(name: str, backend: str = "gsplat_colmap", note: str | None =
         "result_dir": str(paths.project_result_dir(project_id)),
         "last_result_ply": None,
         "last_manifest_path": None,
+        "last_training_summary": None,
+        "training_settings": initial_training_settings,
         "note": note,
     }
     with _LOCK:
@@ -99,6 +102,9 @@ def update_project(project_id: str, **updates: Any) -> dict[str, Any] | None:
 def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
     return {
         "trainer_backend": "gsplat_colmap",
+        "quality_preset": "balanced",
+        "strategy_name": "auto",
+        "max_gaussians": 0,
         "train_steps": 3000,
         "train_resolution": 640,
         "sh_degree": 3,
@@ -112,9 +118,9 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "shN_lr": 1.25e-4,
         "sfm_max_image_size": 1600,
         "sfm_num_threads": 6,
-        "densify_start_iter": 250,
-        "densify_stop_iter": 7000,
-        "densify_interval": 100,
+        "densify_start_iter": 0,
+        "densify_stop_iter": 0,
+        "densify_interval": 0,
         "opacity_reset_interval": 1500,
         "alpha_loss_weight": 0.05,
         "random_background": True,
@@ -123,8 +129,12 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "visual_hull_seed_points": 1400,
         "visual_hull_init_grid": 40,
         "visual_hull_support_ratio": 0.8,
-        "grow_grad2d": 7.5e-5,
-        "absgrad": True,
+        "grow_grad2d": 0.0,
+        "prune_opa": 0.0,
+        "min_opacity": 0.0,
+        "mcmc_noise_lr": 0.0,
+        "absgrad": None,
+        "revised_opacity": True,
         "grid_size": 56,
         "max_image_edge": 960,
         "mask_threshold": 46,
@@ -133,6 +143,30 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "subject_fill_ratio": 0.68,
         "force_restart": force_restart,
     }
+
+
+def sanitize_training_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
+    defaults = default_job_settings(force_restart=False)
+    sanitized: dict[str, Any] = {}
+    source = settings or {}
+    for key, default_value in defaults.items():
+        if key == "force_restart":
+            continue
+        sanitized[key] = source.get(key, default_value)
+    return sanitized
+
+
+def project_training_settings(project_id: str, force_restart: bool = False) -> dict[str, Any]:
+    merged = default_job_settings(force_restart=force_restart)
+    project = get_project(project_id)
+    saved_settings = sanitize_training_settings((project or {}).get("training_settings"))
+    merged.update(saved_settings)
+    merged["force_restart"] = force_restart
+    return merged
+
+
+def save_project_training_settings(project_id: str, settings: dict[str, Any]) -> dict[str, Any] | None:
+    return update_project(project_id, training_settings=sanitize_training_settings(settings))
 
 
 def create_job(project_id: str, settings: dict[str, Any]) -> dict[str, Any]:
@@ -163,7 +197,11 @@ def create_job(project_id: str, settings: dict[str, Any]) -> dict[str, Any]:
         state = _load_state()
         state["jobs"][job_id] = payload
         _save_state(state)
-    update_project(project_id, status="queued")
+    update_project(
+        project_id,
+        status="queued",
+        training_settings=sanitize_training_settings(settings),
+    )
     return payload
 
 

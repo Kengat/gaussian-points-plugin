@@ -12,7 +12,7 @@ from tkinter import ttk
 
 from . import APP_VERSION, paths, store
 from .native_preview import NativeSplatPreview, preview_runtime_available, preview_runtime_error
-from .pipeline import copy_input_images, ensure_project_camera_manifests, list_project_images
+from .pipeline import ensure_project_camera_manifests, ingest_media_sources, list_project_images
 from .ply import PreviewPoint, read_preview_points
 
 
@@ -519,16 +519,16 @@ class CompanionApp:
             creationflags=creationflags,
         )
 
-    def _create_project_from_paths(self, name: str, image_paths: list[str], note: str | None = None) -> None:
+    def _create_project_from_paths(self, name: str, media_paths: list[str], note: str | None = None) -> None:
         clean_name = name.strip()
         if not clean_name:
             messagebox.showinfo("Project Name Required", "Enter a project name first.", parent=self.root)
             return
-        if not image_paths:
-            messagebox.showinfo("No Photos Selected", "Choose one or more photos to create the project.", parent=self.root)
+        if not media_paths:
+            messagebox.showinfo("No Media Selected", "Choose one or more media files to create the project.", parent=self.root)
             return
         project = store.create_project(name=clean_name, note=note)
-        copy_input_images(project["id"], image_paths)
+        ingest_media_sources(project["id"], media_paths)
         self.selected_project_id = project["id"]
         self.refresh_projects()
         self.project_tree.selection_set(project["id"])
@@ -541,25 +541,35 @@ class CompanionApp:
         )
         if name is None:
             return
-        image_paths = filedialog.askopenfilenames(
-            title="Choose project photos",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")],
+        media_paths = filedialog.askopenfilenames(
+            title="Choose project media",
+            filetypes=[
+                ("Supported Media", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.zip"),
+                ("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"),
+                ("Videos", "*.mp4 *.mov *.m4v *.avi *.mkv *.webm"),
+                ("Archives", "*.zip"),
+            ],
             parent=self.root,
         )
-        self._create_project_from_paths(name, list(image_paths))
+        self._create_project_from_paths(name, list(media_paths))
 
     def add_photos_to_project(self) -> None:
         if not self.selected_project_id:
             messagebox.showinfo("No Project Selected", "Create or select a project first.", parent=self.root)
             return
-        image_paths = filedialog.askopenfilenames(
-            title="Add photos to project",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")],
+        media_paths = filedialog.askopenfilenames(
+            title="Add media to project",
+            filetypes=[
+                ("Supported Media", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.zip"),
+                ("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"),
+                ("Videos", "*.mp4 *.mov *.m4v *.avi *.mkv *.webm"),
+                ("Archives", "*.zip"),
+            ],
             parent=self.root,
         )
-        if not image_paths:
+        if not media_paths:
             return
-        copy_input_images(self.selected_project_id, list(image_paths))
+        ingest_media_sources(self.selected_project_id, list(media_paths))
         self.refresh_projects()
 
     def create_sample_project(self) -> None:
@@ -567,8 +577,8 @@ class CompanionApp:
         if not sample_dir:
             messagebox.showerror("Sample Missing", "Bundled sample dataset was not found.", parent=self.root)
             return
-        image_paths = [str(path) for path in sorted(sample_dir.glob("*.png"))]
-        self._create_project_from_paths("Sample Lego 12 Views", image_paths, note="bundled_sample:nerf_synthetic_lego_12")
+        media_paths = [str(path) for path in sorted(sample_dir.glob("*.png"))]
+        self._create_project_from_paths("Sample Lego 12 Views", media_paths, note="bundled_sample:nerf_synthetic_lego_12")
 
     def _prompt_job_settings(self, force_restart: bool) -> dict | None:
         settings = store.default_job_settings(force_restart=force_restart)

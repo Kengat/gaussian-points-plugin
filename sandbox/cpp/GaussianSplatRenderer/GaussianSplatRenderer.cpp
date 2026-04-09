@@ -80,6 +80,11 @@ struct StandalonePreviewState {
     float scene_center[3] = { 0.0f, 0.0f, 0.0f };
     float scene_radius = 120.0f;
     bool has_bounds = false;
+    LARGE_INTEGER perf_frequency = {};
+    bool perf_frequency_ready = false;
+    bool has_frame_timing = false;
+    double smoothed_fps = 0.0;
+    bool swap_interval_configured = false;
 };
 
 // Renderer-owned state for splats, buffers, and camera-driven sorting.
@@ -1895,6 +1900,19 @@ static bool InitializeStandalonePreviewContext() {
         return false;
     }
 
+    if (!g_standalonePreview.perf_frequency_ready) {
+        g_standalonePreview.perf_frequency_ready = (QueryPerformanceFrequency(&g_standalonePreview.perf_frequency) != 0);
+    }
+
+    if (!g_standalonePreview.swap_interval_configured) {
+        typedef BOOL(WINAPI* PFNWGLSWAPINTERVALEXTPROC)(int interval);
+        auto swap_interval = reinterpret_cast<PFNWGLSWAPINTERVALEXTPROC>(wglGetProcAddress("wglSwapIntervalEXT"));
+        if (swap_interval != nullptr) {
+            swap_interval(0);
+        }
+        g_standalonePreview.swap_interval_configured = true;
+    }
+
     g_standalonePreview.context_ready = true;
     wglMakeCurrent(nullptr, nullptr);
     return true;
@@ -2033,6 +2051,11 @@ static void RenderStandalonePreviewFrame() {
         return;
     }
 
+    LARGE_INTEGER frame_start = {};
+    if (g_standalonePreview.perf_frequency_ready) {
+        QueryPerformanceCounter(&frame_start);
+    }
+
     const int viewport_width = std::max(g_standalonePreview.width, 1);
     const int viewport_height = std::max(g_standalonePreview.height, 1);
     glViewport(0, 0, viewport_width, viewport_height);
@@ -2041,6 +2064,24 @@ static void RenderStandalonePreviewFrame() {
     DrawBackgroundDotGrid(viewport_width, viewport_height);
     renderPointCloud();
     SwapBuffers(g_standalonePreview.device_context);
+    LARGE_INTEGER frame_end = {};
+    if (g_standalonePreview.perf_frequency_ready && QueryPerformanceCounter(&frame_end) != 0) {
+        const LONGLONG ticks = frame_end.QuadPart - frame_start.QuadPart;
+        const double frequency = static_cast<double>(g_standalonePreview.perf_frequency.QuadPart);
+        if (ticks > 0 && frequency > 0.0) {
+            const double frame_seconds = static_cast<double>(ticks) / frequency;
+            if (frame_seconds > 0.0) {
+                const double instant_fps = 1.0 / frame_seconds;
+                if (!g_standalonePreview.has_frame_timing || g_standalonePreview.smoothed_fps <= 0.0) {
+                    g_standalonePreview.smoothed_fps = instant_fps;
+                } else {
+                    g_standalonePreview.smoothed_fps =
+                        (g_standalonePreview.smoothed_fps * 0.9) + (instant_fps * 0.1);
+                }
+                g_standalonePreview.has_frame_timing = true;
+            }
+        }
+    }
     wglMakeCurrent(nullptr, nullptr);
 }
 
@@ -4029,6 +4070,13 @@ extern "C" EXPORT void ResetStandalonePreviewCamera() {
 
 extern "C" EXPORT void FitStandalonePreviewCamera() {
     FitStandalonePreviewCameraInternal(false);
+}
+
+extern "C" EXPORT double GetStandalonePreviewFPS() {
+    if (!g_standalonePreview.has_frame_timing) {
+        return 0.0;
+    }
+    return g_standalonePreview.smoothed_fps;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {

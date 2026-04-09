@@ -16,12 +16,12 @@ from PIL import Image
 
 from . import APP_VERSION, paths, store
 from .native_preview import preview_bridge, preview_runtime_available, preview_runtime_error
-from .pipeline import copy_input_images, ensure_project_camera_manifests, list_project_images
+from .pipeline import ensure_project_camera_manifests, ingest_media_sources, list_project_images
 from .ply import read_preview_points
 
 
-IMAGE_FILE_FILTER = (
-    "Image Files (*.bmp;*.jpg;*.jpeg;*.png;*.tif;*.tiff;*.webp)",
+MEDIA_FILE_FILTER = (
+    "Media Files (*.bmp;*.jpg;*.jpeg;*.png;*.tif;*.tiff;*.webp;*.mp4;*.mov;*.m4v;*.avi;*.mkv;*.webm;*.zip)",
     "All files (*.*)",
 )
 PREVIEW_HIDDEN_X = -10000
@@ -125,6 +125,14 @@ class NativePreviewOverlay:
             self._parent_hwnd = None
             self._form = None
             self._panel = None
+
+    def preview_fps(self) -> float:
+        if not self.available or not self._window_created:
+            return 0.0
+        try:
+            return float(self.bridge.get_preview_fps())
+        except Exception:
+            return 0.0
 
     def _ensure_window(self) -> None:
         if not self.available or self._window_created or self._parent_hwnd is None or not self._bounds.usable:
@@ -346,11 +354,11 @@ class CompanionApi:
             clean_name = (name or "").strip()
             if not clean_name:
                 return self._failure("Enter a project name first.")
-            files = self._pick_image_files()
+            files = self._pick_media_files()
             if not files:
                 return self._failure("Project creation cancelled.", cancelled=True)
             project = store.create_project(name=clean_name)
-            copy_input_images(project["id"], list(files))
+            ingest_media_sources(project["id"], list(files))
             self._active_project_hint = project["id"]
             return self._success("Project created.", state=self._build_state(project["id"]))
 
@@ -361,12 +369,12 @@ class CompanionApi:
             project = store.get_project(project_id)
             if not project:
                 return self._failure("Project was not found.")
-            files = self._pick_image_files()
+            files = self._pick_media_files()
             if not files:
-                return self._failure("No photos were added.", cancelled=True)
-            copy_input_images(project_id, list(files))
+                return self._failure("No media was added.", cancelled=True)
+            ingest_media_sources(project_id, list(files))
             self._active_project_hint = project_id
-            return self._success("Photos added.", state=self._build_state(project_id))
+            return self._success("Media added.", state=self._build_state(project_id))
 
     def create_sample_project(self) -> dict[str, Any]:
         with self._lock:
@@ -378,7 +386,7 @@ class CompanionApi:
                 name="Sample Lego 12 Views",
                 note="bundled_sample:nerf_synthetic_lego_12",
             )
-            copy_input_images(project["id"], image_paths)
+            ingest_media_sources(project["id"], image_paths)
             self._active_project_hint = project["id"]
             return self._success("Sample project created.", state=self._build_state(project["id"]))
 
@@ -448,7 +456,7 @@ class CompanionApi:
                 return self._failure("Project was not found.")
             images = list_project_images(project_id)
             if not images:
-                return self._failure("Add photos to the selected project first.")
+                return self._failure("Add media to the selected project first.")
             existing = store.latest_job(project_id)
             if existing and existing["status"] == "running":
                 return self._failure("This project already has a running job.")
@@ -544,6 +552,7 @@ class CompanionApi:
 
         latest_manifest_path = project.get("last_manifest_path")
         point_count = preview.get("pointCount")
+        preview_fps = self._preview_overlay.preview_fps()
         properties = [
             {"label": "Source Directory", "value": project["workspace_dir"], "copyable": True},
             {"label": "Image Count", "value": f"{image_count} frames"},
@@ -573,11 +582,11 @@ class CompanionApi:
                 "canTrain": image_count > 0 and (not latest_job or latest_job["status"] != "running"),
                 "canStop": bool(latest_job and latest_job["status"] == "running"),
                 "canOpenExport": bool(latest_manifest_path),
-            },
-            "hud": {
-                "splats": point_count,
-                "performance": "24.1 FPS" if latest_job and latest_job["status"] == "running" else "60.2 FPS",
-            },
+              },
+              "hud": {
+                  "splats": point_count,
+                  "performance": f"{preview_fps:0.1f} FPS",
+              },
             "statusPanel": {
                 "progressPercent": percent,
                 "progressLabel": status_title,
@@ -788,13 +797,13 @@ class CompanionApi:
         sample_dir = root / "sample_datasets" / "nerf_synthetic_lego_12" / "images"
         return sample_dir if sample_dir.exists() else None
 
-    def _pick_image_files(self) -> tuple[str, ...] | None:
+    def _pick_media_files(self) -> tuple[str, ...] | None:
         if not self._window or not self._webview:
             return None
         result = self._window.create_file_dialog(
             self._webview.OPEN_DIALOG,
             allow_multiple=True,
-            file_types=IMAGE_FILE_FILTER,
+            file_types=MEDIA_FILE_FILTER,
         )
         return tuple(result) if result else None
 

@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
 
 from . import APP_VERSION, paths, store
-from .pipeline import copy_input_images, ensure_project_camera_manifests, list_project_images
+from .pipeline import ensure_project_camera_manifests, ingest_media_sources, list_project_images
 from .ply import PreviewPoint, read_preview_points
 
 
@@ -374,14 +374,19 @@ class CompanionApp:
         name = simpledialog.askstring("Project Name", "Project name:", parent=self.root)
         if name is None:
             return
-        image_paths = filedialog.askopenfilenames(
-            title="Choose project photos",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp")],
+        media_paths = filedialog.askopenfilenames(
+            title="Choose project media",
+            filetypes=[
+                ("Supported Media", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.zip"),
+                ("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"),
+                ("Videos", "*.mp4 *.mov *.m4v *.avi *.mkv *.webm"),
+                ("Archives", "*.zip"),
+            ],
         )
-        if not image_paths:
+        if not media_paths:
             return
         project = store.create_project(name=name)
-        copy_input_images(project["id"], list(image_paths))
+        ingest_media_sources(project["id"], list(media_paths))
         self.selected_project_id = project["id"]
         self.refresh_projects()
         self.project_tree.selection_set(project["id"])

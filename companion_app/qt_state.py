@@ -12,7 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import paths, store
 from .native_preview import preview_runtime_available, preview_runtime_error
-from .pipeline import copy_input_images, ensure_project_camera_manifests, list_project_images
+from .pipeline import ensure_project_camera_manifests, ingest_media_sources, list_project_images
 from .ply import read_preview_points
 
 
@@ -35,8 +35,15 @@ class ThemedDialog(QtWidgets.QDialog):
             "QDialog{background:transparent;}"
             "QFrame#card{background:#1B1B20; border:1px solid rgba(255,255,255,0.10); border-radius:18px;}"
             "QLabel{color:#FAFAFA;}"
-            "QLineEdit{background:#111116; color:#FAFAFA; border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:10px 12px;}"
-            "QLineEdit:focus{border:1px solid #FF5400;}"
+            "QLineEdit,QSpinBox,QComboBox{background:#111116; color:#FAFAFA; border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:10px 12px; min-height:20px;}"
+            "QLineEdit:focus,QSpinBox:focus,QComboBox:focus{border:1px solid #FF5400;}"
+            "QComboBox::drop-down{border:none; width:24px;}"
+            "QComboBox::down-arrow{image:none; width:0; height:0;}"
+            "QComboBox QAbstractItemView{background:#111116; color:#FAFAFA; border:1px solid rgba(255,255,255,0.12); selection-background-color:#FF5400; selection-color:#FFFFFF; outline:none;}"
+            "QAbstractSpinBox::up-button,QAbstractSpinBox::down-button{width:0px; border:none;}"
+            "QCheckBox{color:#E4E4E7; font-size:13px; font-weight:500; spacing:10px;}"
+            "QCheckBox::indicator{width:18px; height:18px; border-radius:6px; border:1px solid rgba(255,255,255,0.16); background:#111116;}"
+            "QCheckBox::indicator:checked{background:#FF5400; border:1px solid #FF5400;}"
             "QPushButton{min-width:88px; min-height:34px; border-radius:8px; font-size:12px; font-weight:700; padding:0 14px;}"
         )
 
@@ -227,6 +234,165 @@ class DeleteProjectDialog(ThemedDialog):
         self.delete_button.clicked.connect(self.accept)
 
 
+class TrainModelDialog(ThemedDialog):
+    PRESET_OPTIONS = [
+        ("compact", "Compact"),
+        ("balanced", "Balanced"),
+        ("high", "High"),
+    ]
+    STRATEGY_OPTIONS = [
+        ("auto", "Auto"),
+        ("mcmc", "MCMC"),
+        ("default", "Default"),
+    ]
+
+    def __init__(
+        self,
+        project_name: str,
+        settings: dict[str, Any],
+        *,
+        restart: bool,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__("Restart Training" if restart else "Train Model", parent)
+        self.setMinimumWidth(620)
+        self.header_badge.setStyleSheet("QFrame{background:rgba(255,84,0,0.12); border-radius:8px;}")
+        self.set_header_icon("play", "accent")
+
+        subtitle = QtWidgets.QLabel(
+            f'Configure training for "{project_name}". These settings are saved for this project and reused next time.'
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("font-size:13px; color:#A1A1AA; line-height:1.35;")
+        self.body.insertWidget(0, subtitle)
+
+        grid_host = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(grid_host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(14)
+
+        self.steps_input = QtWidgets.QSpinBox()
+        self.steps_input.setRange(200, 20_000)
+        self.steps_input.setSingleStep(100)
+        self.steps_input.setValue(int(settings.get("train_steps", 3000)))
+
+        self.preset_combo = QtWidgets.QComboBox()
+        for value, label in self.PRESET_OPTIONS:
+            self.preset_combo.addItem(label, value)
+        self._set_combo_value(self.preset_combo, str(settings.get("quality_preset", "balanced")))
+
+        self.strategy_combo = QtWidgets.QComboBox()
+        for value, label in self.STRATEGY_OPTIONS:
+            self.strategy_combo.addItem(label, value)
+        self._set_combo_value(self.strategy_combo, str(settings.get("strategy_name", "auto")))
+
+        self.resolution_input = QtWidgets.QSpinBox()
+        self.resolution_input.setRange(256, 2048)
+        self.resolution_input.setSingleStep(64)
+        self.resolution_input.setValue(int(settings.get("train_resolution", 640)))
+
+        self.sfm_image_size_input = QtWidgets.QSpinBox()
+        self.sfm_image_size_input.setRange(640, 4096)
+        self.sfm_image_size_input.setSingleStep(160)
+        self.sfm_image_size_input.setValue(int(settings.get("sfm_max_image_size", 1600)))
+
+        self.sh_degree_input = QtWidgets.QSpinBox()
+        self.sh_degree_input.setRange(0, 4)
+        self.sh_degree_input.setValue(int(settings.get("sh_degree", 3)))
+
+        self.max_gaussians_input = QtWidgets.QSpinBox()
+        self.max_gaussians_input.setRange(0, 5_000_000)
+        self.max_gaussians_input.setSingleStep(10_000)
+        self.max_gaussians_input.setSpecialValueText("Auto")
+        self.max_gaussians_input.setValue(int(settings.get("max_gaussians", 0)))
+
+        self.random_background_checkbox = QtWidgets.QCheckBox("Random background compositing")
+        self.random_background_checkbox.setChecked(bool(settings.get("random_background", True)))
+
+        self.revised_opacity_checkbox = QtWidgets.QCheckBox("Use revised opacity handling")
+        self.revised_opacity_checkbox.setChecked(bool(settings.get("revised_opacity", True)))
+
+        self._add_field(grid, 0, 0, "Training steps", self.steps_input)
+        self._add_field(grid, 0, 1, "Quality preset", self.preset_combo)
+        self._add_field(grid, 1, 0, "Strategy", self.strategy_combo)
+        self._add_field(grid, 1, 1, "Gaussian budget", self.max_gaussians_input)
+        self._add_field(grid, 2, 0, "Train resolution", self.resolution_input)
+        self._add_field(grid, 2, 1, "SfM image size", self.sfm_image_size_input)
+        self._add_field(grid, 3, 0, "SH degree", self.sh_degree_input)
+
+        options_box = QtWidgets.QFrame()
+        options_box.setStyleSheet("QFrame{background:#111116; border:1px solid rgba(255,255,255,0.10); border-radius:12px;}")
+        options_layout = QtWidgets.QVBoxLayout(options_box)
+        options_layout.setContentsMargins(14, 12, 14, 12)
+        options_layout.setSpacing(10)
+        options_layout.addWidget(self.random_background_checkbox)
+        options_layout.addWidget(self.revised_opacity_checkbox)
+        grid.addWidget(options_box, 4, 0, 1, 2)
+
+        note = QtWidgets.QLabel(
+            "Tip: use Auto + Balanced for most real captures. Set Gaussian budget to Auto unless you need a strict upper bound."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("font-size:12px; color:#71717A;")
+        grid.addWidget(note, 5, 0, 1, 2)
+
+        self.body.insertWidget(1, grid_host)
+
+        self.cancel_button = self.add_button("Cancel")
+        self.confirm_button = self.add_button("Restart" if restart else "Train", accent="primary")
+        self.cancel_button.clicked.connect(self.reject)
+        self.confirm_button.clicked.connect(self.accept)
+        self.set_initial_focus(self.steps_input.lineEdit())
+
+    @staticmethod
+    def _set_combo_value(combo: QtWidgets.QComboBox, value: str) -> None:
+        for index in range(combo.count()):
+            if combo.itemData(index) == value:
+                combo.setCurrentIndex(index)
+                return
+
+    @staticmethod
+    def _field_label(text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setStyleSheet("font-size:12px; font-weight:500; color:#A1A1AA;")
+        return label
+
+    def _add_field(
+        self,
+        layout: QtWidgets.QGridLayout,
+        row: int,
+        column: int,
+        label_text: str,
+        widget: QtWidgets.QWidget,
+    ) -> None:
+        holder = QtWidgets.QWidget()
+        holder_layout = QtWidgets.QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setSpacing(8)
+        holder_layout.addWidget(self._field_label(label_text))
+        holder_layout.addWidget(widget)
+        layout.addWidget(holder, row, column)
+
+    @property
+    def training_settings(self) -> dict[str, Any]:
+        settings = store.default_job_settings(force_restart=False)
+        settings.update(
+            {
+                "train_steps": int(self.steps_input.value()),
+                "quality_preset": str(self.preset_combo.currentData()),
+                "strategy_name": str(self.strategy_combo.currentData()),
+                "train_resolution": int(self.resolution_input.value()),
+                "sfm_max_image_size": int(self.sfm_image_size_input.value()),
+                "sh_degree": int(self.sh_degree_input.value()),
+                "max_gaussians": int(self.max_gaussians_input.value()),
+                "random_background": bool(self.random_background_checkbox.isChecked()),
+                "revised_opacity": bool(self.revised_opacity_checkbox.isChecked()),
+            }
+        )
+        return settings
+
+
 class QtStateController(QtCore.QObject):
     stateChanged = QtCore.Signal()
 
@@ -304,14 +470,14 @@ class QtStateController(QtCore.QObject):
             return
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
             None,
-            "Choose project photos",
+            "Choose project media",
             "",
-            "Images (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp)",
+            "Supported Media (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.zip)",
         )
         if not files:
             return
         project = store.create_project(name=name)
-        copy_input_images(project["id"], list(files))
+        ingest_media_sources(project["id"], list(files))
         self._active_project_id = project["id"]
         self.refresh()
 
@@ -352,13 +518,13 @@ class QtStateController(QtCore.QObject):
             return
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
             None,
-            "Add photos to project",
+            "Add media to project",
             "",
-            "Images (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp)",
+            "Supported Media (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.zip)",
         )
         if not files:
             return
-        copy_input_images(self._active_project_id, list(files))
+        ingest_media_sources(self._active_project_id, list(files))
         self.refresh()
 
     @QtCore.Slot()
@@ -368,7 +534,7 @@ class QtStateController(QtCore.QObject):
             return
         files = [str(path) for path in sorted(sample_dir.glob("*.png"))]
         project = store.create_project("Sample Lego 12 Views", note="bundled_sample:nerf_synthetic_lego_12")
-        copy_input_images(project["id"], files)
+        ingest_media_sources(project["id"], files)
         self._active_project_id = project["id"]
         self.refresh()
 
@@ -376,19 +542,31 @@ class QtStateController(QtCore.QObject):
     def startTrainingDialog(self, restart: bool = False) -> None:
         if not self._active_project_id:
             return
+        project = store.get_project(self._active_project_id)
+        if not project:
+            return
         images = list_project_images(self._active_project_id)
         if not images:
             return
         latest = store.latest_job(self._active_project_id)
         if latest and latest["status"] == "running":
             return
-        steps, ok = QtWidgets.QInputDialog.getInt(None, "Training Steps", "How many training steps?", 3000, 200, 20000, 100)
-        if not ok:
+        settings = store.project_training_settings(self._active_project_id, force_restart=restart)
+        dialog = TrainModelDialog(
+            project["name"],
+            settings,
+            restart=restart,
+            parent=self._app_window(),
+        )
+        if dialog.run() != QtWidgets.QDialog.DialogCode.Accepted:
             return
-        settings = store.default_job_settings(force_restart=restart)
-        settings["train_steps"] = int(steps)
-        settings["densify_stop_iter"] = min(int(settings["densify_stop_iter"]), max(int(steps) - 1, 1))
-        settings["refine_scale2d_stop_iter"] = int(steps)
+        settings = dialog.training_settings
+        settings["force_restart"] = bool(restart)
+        settings["densify_stop_iter"] = min(
+            int(settings.get("densify_stop_iter", 0)),
+            max(int(settings["train_steps"]) - 1, 1),
+        )
+        settings["refine_scale2d_stop_iter"] = int(settings["train_steps"])
         ensure_project_camera_manifests(self._active_project_id)
         job = store.create_job(self._active_project_id, settings)
         self._launch_worker(job["id"])

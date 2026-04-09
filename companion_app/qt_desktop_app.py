@@ -10,7 +10,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import APP_VERSION, store
 from .native_preview import preview_bridge, preview_runtime_available
-from .pipeline import copy_input_images
 from .web_desktop_app import CompanionApi
 
 
@@ -42,13 +41,13 @@ class QtStateApi(CompanionApi):
     def _sync_preview_overlay(self, preview: dict[str, Any]) -> None:
         return
 
-    def _pick_image_files(self) -> tuple[str, ...] | None:
+    def _pick_media_files(self) -> tuple[str, ...] | None:
         parent = self._window if isinstance(self._window, QtWidgets.QWidget) else None
         files, _filter = QtWidgets.QFileDialog.getOpenFileNames(
             parent,
-            "Select input photos",
+            "Select input media",
             "",
-            "Images (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp);;All files (*.*)",
+            "Supported Media (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.zip);;All files (*.*)",
         )
         return tuple(files) if files else None
 
@@ -137,6 +136,14 @@ class NativePreviewWidget(QtWidgets.QWidget):
         self.bridge.load_ply(scene_path)
         self.bridge.request_redraw()
         self._current_path = str(scene_path)
+
+    def preview_fps(self) -> float:
+        if not self.available or not self._window_created:
+            return 0.0
+        try:
+            return float(self.bridge.get_preview_fps())
+        except Exception:
+            return 0.0
 
 
 class ClickableFrame(QtWidgets.QFrame):
@@ -227,6 +234,7 @@ class DotViewport(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.preview = NativePreviewWidget(self)
+        self._last_fps = 0.0
         self.preview.setStyleSheet("background:#07070A; border-radius:28px;")
         self.hud = QtWidgets.QFrame(self)
         self.hud.setStyleSheet(
@@ -241,7 +249,7 @@ class DotViewport(QtWidgets.QWidget):
         self.splats_value.setStyleSheet("color:#00F0FF; font-size:22px; font-weight:700;")
         perf_label = QtWidgets.QLabel("PERFORMANCE")
         perf_label.setStyleSheet("color:#6B7280; font-size:10px; font-weight:700; letter-spacing:2px;")
-        self.performance_value = QtWidgets.QLabel("60.2 FPS")
+        self.performance_value = QtWidgets.QLabel("0.0 FPS")
         self.performance_value.setStyleSheet("color:#F4F4F5; font-size:18px; font-weight:600;")
         splat_col = QtWidgets.QVBoxLayout()
         splat_col.addWidget(splat_label)
@@ -264,11 +272,14 @@ class DotViewport(QtWidgets.QWidget):
         self.placeholder = QtWidgets.QLabel("Scene preview will appear here", self)
         self.placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.placeholder.setStyleSheet("color:#71717A; font-size:16px; font-weight:500;")
+        self.fps_timer = QtCore.QTimer(self)
+        self.fps_timer.setInterval(350)
+        self.fps_timer.timeout.connect(self._refresh_fps)
+        self.fps_timer.start()
 
     def set_preview_state(self, preview: dict[str, Any], performance_text: str) -> None:
         splats = preview.get("pointCount")
         self.splats_value.setText(f"{int(splats):,}" if isinstance(splats, int) else "0")
-        self.performance_value.setText(performance_text)
         if preview.get("hasScene") and preview.get("path"):
             self.placeholder.hide()
             self.preview.load_scene(preview["path"], force_reload=False)
@@ -276,6 +287,18 @@ class DotViewport(QtWidgets.QWidget):
             self.preview.clear_scene()
             self.placeholder.setText(preview.get("emptyTitle") or "Scene preview will appear here")
             self.placeholder.show()
+        self._refresh_fps(fallback_text=performance_text)
+
+    def _refresh_fps(self, fallback_text: str | None = None) -> None:
+        fps = self.preview.preview_fps()
+        if fps > 0.0:
+            self._last_fps = fps
+            self.performance_value.setText(f"{fps:0.1f} FPS")
+            return
+        if self._last_fps > 0.0:
+            self.performance_value.setText(f"{self._last_fps:0.1f} FPS")
+            return
+        self.performance_value.setText(fallback_text or "0.0 FPS")
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -767,7 +790,7 @@ class QtCompanionWindow(QtWidgets.QMainWindow):
         self.export_body.setText(export_panel.get("body") or "")
         self.export_ply_button.setEnabled(bool(export_panel.get("canExport")))
         self.export_sketchup_button.setEnabled(bool(export_panel.get("canExport")))
-        self.viewport.set_preview_state(preview, (detail.get("hud") or {}).get("performance") or "60.2 FPS")
+        self.viewport.set_preview_state(preview, (detail.get("hud") or {}).get("performance") or "0.0 FPS")
         self._render_properties(detail.get("propertiesPanel") or {})
         self._render_logs(detail.get("logs") or "")
         self._render_photos(detail.get("photos") or [])

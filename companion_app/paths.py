@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -24,12 +25,12 @@ def data_root() -> Path:
         return _DATA_ROOT
 
     base = os.environ.get("LOCALAPPDATA")
-    preferred = Path(base) / APP_DIR_NAME if base else Path.home() / f".{APP_DIR_NAME.lower()}"
-    try:
-        preferred.mkdir(parents=True, exist_ok=True)
-        _DATA_ROOT = preferred
-    except PermissionError:
-        _DATA_ROOT = Path.cwd() / "companion_app_data"
+    candidates = []
+    if base:
+        candidates.append(Path(base) / APP_DIR_NAME)
+    candidates.append(Path(tempfile.gettempdir()) / APP_DIR_NAME)
+    candidates.append(Path.cwd() / "companion_app_data")
+    _DATA_ROOT = _pick_writable_dir(candidates)
     return _DATA_ROOT
 
 
@@ -54,6 +55,21 @@ def ensure_runtime_dirs() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
+def _pick_writable_dir(candidates: list[Path]) -> Path:
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return candidate
+        except OSError:
+            continue
+    fallback = candidates[-1]
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
 def preferred_worker_python() -> Path | None:
     candidates = [
         repo_root() / ".gstrain310" / "Scripts" / "python.exe",
@@ -65,6 +81,22 @@ def preferred_worker_python() -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def scratch_root() -> Path:
+    override = os.environ.get("GAUSSIAN_POINTS_COMPANION_SCRATCH_HOME")
+    if override:
+        candidate = Path(override)
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    candidates = []
+    if local_app_data:
+        candidates.append(Path(local_app_data) / APP_DIR_NAME / "scratch")
+    candidates.append(Path(tempfile.gettempdir()) / APP_DIR_NAME / "scratch")
+    candidates.append(data_root() / "scratch")
+    return _pick_writable_dir(candidates)
 
 
 def project_root(project_id: str) -> Path:
@@ -85,6 +117,14 @@ def project_result_dir(project_id: str) -> Path:
 
 def project_log_dir(project_id: str) -> Path:
     return project_root(project_id) / "logs"
+
+
+def project_scratch_dir(project_id: str) -> Path:
+    return scratch_root() / "projects" / project_id
+
+
+def project_colmap_scratch_dir(project_id: str) -> Path:
+    return project_scratch_dir(project_id) / "colmap"
 
 
 def ensure_project_dirs(project_id: str) -> None:

@@ -33,6 +33,11 @@ class ViewportWidget(QtWidgets.QWidget):
         hud_layout.addLayout(self._metric("Splats", self._splat_value))
         hud_layout.addWidget(self._divider())
         hud_layout.addLayout(self._metric("Performance", self._perf_value))
+        self._last_fps = 0.0
+        self._fps_timer = QtCore.QTimer(self)
+        self._fps_timer.setInterval(350)
+        self._fps_timer.timeout.connect(self._refresh_fps)
+        self._fps_timer.start()
 
         self._fit_button = QtWidgets.QPushButton(self)
         self._fit_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
@@ -59,8 +64,6 @@ class ViewportWidget(QtWidgets.QWidget):
         footer = preview.get("footer") or ""
         self._footer.setText(footer)
         self._splat_value.setText(f"{int(preview.get('pointCount') or 0):,}")
-        running = bool(((detail or {}).get("toolbar") or {}).get("canStop"))
-        self._perf_value.setText("24.1 FPS" if running else "60.2 FPS")
         if preview.get("hasScene") and preview.get("path"):
             self._placeholder.hide()
             self._host.load_scene(preview["path"])
@@ -68,6 +71,8 @@ class ViewportWidget(QtWidgets.QWidget):
             self._host.clear_scene()
             self._placeholder.setText(preview.get("emptyTitle") or "Scene preview will appear here")
             self._placeholder.show()
+        hud = (detail or {}).get("hud") or {}
+        self._refresh_fps(fallback_text=hud.get("performance"))
         self._reposition()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
@@ -125,11 +130,22 @@ class ViewportWidget(QtWidgets.QWidget):
         return panel
 
     def _make_value(self, color: str) -> QtWidgets.QLabel:
-        label = QtWidgets.QLabel("0")
+        label = QtWidgets.QLabel("0.0 FPS" if color == "#F4F4F5" else "0")
         label.setStyleSheet(f"color:{color};")
         font = self._mono_font(14, 600)
         label.setFont(font)
         return label
+
+    def _refresh_fps(self, fallback_text: str | None = None) -> None:
+        fps = self._host.preview_fps()
+        if fps > 0.0:
+            self._last_fps = fps
+            self._perf_value.setText(f"{fps:0.1f} FPS")
+            return
+        if self._last_fps > 0.0:
+            self._perf_value.setText(f"{self._last_fps:0.1f} FPS")
+            return
+        self._perf_value.setText(fallback_text or "0.0 FPS")
 
     def _metric(self, title: str, value: QtWidgets.QLabel) -> QtWidgets.QVBoxLayout:
         layout = QtWidgets.QVBoxLayout()
