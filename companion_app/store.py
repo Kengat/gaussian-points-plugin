@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import threading
 import uuid
@@ -25,11 +26,102 @@ def _default_state() -> dict[str, Any]:
     return {"projects": {}, "jobs": {}}
 
 
-def _load_state() -> dict[str, Any]:
+def _read_state_file() -> dict[str, Any]:
     path = _store_path()
     if not path.exists():
         return _default_state()
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _pid_exists(pid: Any) -> bool:
+    try:
+        pid_value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_value <= 0:
+        return False
+    if ctypes is None:  # pragma: no cover
+        return False
+    process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid_value)
+    if not process:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+            return False
+        return int(exit_code.value) == 259
+    finally:
+        ctypes.windll.kernel32.CloseHandle(process)
+
+
+def _reconcile_job_record(job: dict[str, Any], *, mark_stop_requested: bool = False) -> tuple[dict[str, Any], bool]:
+    updated = False
+    status = str(job.get("status") or "")
+    if status == "running":
+        pid = job.get("pid")
+        if pid and not _pid_exists(pid):
+            job["finished_at"] = job.get("finished_at") or utc_now()
+            if mark_stop_requested or job.get("stop_requested"):
+                job["status"] = "stopped"
+                job["stage"] = "Stopped"
+                job["message"] = "Stopped after the worker process exited."
+                job["error_text"] = None
+            else:
+                job["status"] = "failed"
+                job["stage"] = "Failed"
+                message = f"Worker process {pid} is no longer running."
+                job["message"] = message
+                job["error_text"] = message
+            updated = True
+        elif mark_stop_requested:
+            job["stop_requested"] = 1
+            job["message"] = "Stop requested by user."
+            updated = True
+    elif mark_stop_requested:
+        job["stop_requested"] = 1
+        job["message"] = "Stop requested by user."
+        updated = True
+    return job, updated
+
+
+def _project_status_from_jobs(state: dict[str, Any], project_id: str) -> str:
+    project_jobs = [job for job in state["jobs"].values() if job["project_id"] == project_id]
+    if not project_jobs:
+        project = state["projects"].get(project_id) or {}
+        return str(project.get("status") or "idle")
+    latest = max(project_jobs, key=lambda item: (item.get("created_at") or "", item.get("updated_at") or ""))
+    status = str(latest.get("status") or "idle")
+    return "ready" if status == "completed" else status
+
+
+def _reconcile_state(state: dict[str, Any]) -> bool:
+    changed = False
+    touched_projects: set[str] = set()
+    for job_id, job in state["jobs"].items():
+        reconciled, updated = _reconcile_job_record(job)
+        if updated:
+            reconciled["updated_at"] = utc_now()
+            state["jobs"][job_id] = reconciled
+            touched_projects.add(reconciled["project_id"])
+            changed = True
+    for project_id in touched_projects:
+        project = state["projects"].get(project_id)
+        if not project:
+            continue
+        desired_status = _project_status_from_jobs(state, project_id)
+        if project.get("status") != desired_status:
+            project["status"] = desired_status
+            project["updated_at"] = utc_now()
+            state["projects"][project_id] = project
+            changed = True
+    return changed
+
+
+def _load_state() -> dict[str, Any]:
+    state = _read_state_file()
+    if _reconcile_state(state):
+        _save_state(state)
+    return state
 
 
 def _save_state(state: dict[str, Any]) -> None:
@@ -104,9 +196,13 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "trainer_backend": "gsplat_colmap",
         "quality_preset": "balanced",
         "strategy_name": "auto",
+        "rasterize_mode": "auto",
+        "sfm_match_mode": "auto",
         "max_gaussians": 0,
         "train_steps": 3000,
         "train_resolution": 640,
+        "validation_fraction": 0.18,
+        "min_validation_views": 2,
         "sh_degree": 3,
         "init_opacity": 0.10,
         "lambda_dssim": 0.20,
@@ -124,6 +220,10 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "opacity_reset_interval": 1500,
         "alpha_loss_weight": 0.05,
         "random_background": True,
+        "enable_exposure_compensation": True,
+        "exposure_gain_lr": 2.0e-3,
+        "exposure_bias_lr": 1.0e-3,
+        "exposure_regularization": 1.0e-3,
         "mask_min_views": 2,
         "alpha_mask_threshold": 0.2,
         "visual_hull_seed_points": 1400,
@@ -255,6 +355,22 @@ def delete_project(project_id: str) -> bool:
 
 
 def request_job_stop(job_id: str) -> None:
+    with _LOCK:
+        state = _read_state_file()
+        job = state["jobs"].get(job_id)
+        if not job:
+            return
+        job, updated = _reconcile_job_record(job, mark_stop_requested=True)
+        if updated:
+            job["updated_at"] = utc_now()
+            state["jobs"][job_id] = job
+            project = state["projects"].get(job["project_id"])
+            if project:
+                project["status"] = _project_status_from_jobs(state, job["project_id"])
+                project["updated_at"] = utc_now()
+                state["projects"][job["project_id"]] = project
+            _save_state(state)
+            return
     update_job(job_id, stop_requested=1, message="Stop requested by user.")
 
 

@@ -245,6 +245,17 @@ class TrainModelDialog(ThemedDialog):
         ("mcmc", "MCMC"),
         ("default", "Default"),
     ]
+    RASTERIZE_OPTIONS = [
+        ("auto", "Auto"),
+        ("antialiased", "Antialiased"),
+        ("classic", "Classic"),
+    ]
+    SFM_MATCH_OPTIONS = [
+        ("auto", "Auto"),
+        ("exhaustive", "Exhaustive"),
+        ("sequential", "Sequential"),
+        ("spatial", "Spatial"),
+    ]
 
     def __init__(
         self,
@@ -287,6 +298,16 @@ class TrainModelDialog(ThemedDialog):
             self.strategy_combo.addItem(label, value)
         self._set_combo_value(self.strategy_combo, str(settings.get("strategy_name", "auto")))
 
+        self.rasterize_combo = QtWidgets.QComboBox()
+        for value, label in self.RASTERIZE_OPTIONS:
+            self.rasterize_combo.addItem(label, value)
+        self._set_combo_value(self.rasterize_combo, str(settings.get("rasterize_mode", "auto")))
+
+        self.sfm_match_combo = QtWidgets.QComboBox()
+        for value, label in self.SFM_MATCH_OPTIONS:
+            self.sfm_match_combo.addItem(label, value)
+        self._set_combo_value(self.sfm_match_combo, str(settings.get("sfm_match_mode", "auto")))
+
         self.resolution_input = QtWidgets.QSpinBox()
         self.resolution_input.setRange(256, 2048)
         self.resolution_input.setSingleStep(64)
@@ -307,11 +328,20 @@ class TrainModelDialog(ThemedDialog):
         self.max_gaussians_input.setSpecialValueText("Auto")
         self.max_gaussians_input.setValue(int(settings.get("max_gaussians", 0)))
 
+        self.validation_fraction_input = QtWidgets.QDoubleSpinBox()
+        self.validation_fraction_input.setRange(0.0, 0.45)
+        self.validation_fraction_input.setSingleStep(0.05)
+        self.validation_fraction_input.setDecimals(2)
+        self.validation_fraction_input.setValue(float(settings.get("validation_fraction", 0.18)))
+
         self.random_background_checkbox = QtWidgets.QCheckBox("Random background compositing")
         self.random_background_checkbox.setChecked(bool(settings.get("random_background", True)))
 
         self.revised_opacity_checkbox = QtWidgets.QCheckBox("Use revised opacity handling")
         self.revised_opacity_checkbox.setChecked(bool(settings.get("revised_opacity", True)))
+
+        self.exposure_compensation_checkbox = QtWidgets.QCheckBox("Exposure compensation")
+        self.exposure_compensation_checkbox.setChecked(bool(settings.get("enable_exposure_compensation", True)))
 
         self._add_field(grid, 0, 0, "Training steps", self.steps_input)
         self._add_field(grid, 0, 1, "Quality preset", self.preset_combo)
@@ -320,22 +350,26 @@ class TrainModelDialog(ThemedDialog):
         self._add_field(grid, 2, 0, "Train resolution", self.resolution_input)
         self._add_field(grid, 2, 1, "SfM image size", self.sfm_image_size_input)
         self._add_field(grid, 3, 0, "SH degree", self.sh_degree_input)
+        self._add_field(grid, 3, 1, "Validation split", self.validation_fraction_input)
+        self._add_field(grid, 4, 0, "Rasterization", self.rasterize_combo)
+        self._add_field(grid, 4, 1, "SfM matching", self.sfm_match_combo)
 
         options_box = QtWidgets.QFrame()
         options_box.setStyleSheet("QFrame{background:#111116; border:1px solid rgba(255,255,255,0.10); border-radius:12px;}")
         options_layout = QtWidgets.QVBoxLayout(options_box)
         options_layout.setContentsMargins(14, 12, 14, 12)
         options_layout.setSpacing(10)
+        options_layout.addWidget(self.exposure_compensation_checkbox)
         options_layout.addWidget(self.random_background_checkbox)
         options_layout.addWidget(self.revised_opacity_checkbox)
-        grid.addWidget(options_box, 4, 0, 1, 2)
+        grid.addWidget(options_box, 5, 0, 1, 2)
 
         note = QtWidgets.QLabel(
-            "Tip: use Auto + Balanced for most real captures. Set Gaussian budget to Auto unless you need a strict upper bound."
+            "Tip: use Auto + Balanced + Antialiased for real captures. Keep Gaussian budget on Auto and reserve 10-20% of views for validation."
         )
         note.setWordWrap(True)
         note.setStyleSheet("font-size:12px; color:#71717A;")
-        grid.addWidget(note, 5, 0, 1, 2)
+        grid.addWidget(note, 6, 0, 1, 2)
 
         self.body.insertWidget(1, grid_host)
 
@@ -382,12 +416,16 @@ class TrainModelDialog(ThemedDialog):
                 "train_steps": int(self.steps_input.value()),
                 "quality_preset": str(self.preset_combo.currentData()),
                 "strategy_name": str(self.strategy_combo.currentData()),
+                "rasterize_mode": str(self.rasterize_combo.currentData()),
+                "sfm_match_mode": str(self.sfm_match_combo.currentData()),
                 "train_resolution": int(self.resolution_input.value()),
                 "sfm_max_image_size": int(self.sfm_image_size_input.value()),
                 "sh_degree": int(self.sh_degree_input.value()),
                 "max_gaussians": int(self.max_gaussians_input.value()),
+                "validation_fraction": float(self.validation_fraction_input.value()),
                 "random_background": bool(self.random_background_checkbox.isChecked()),
                 "revised_opacity": bool(self.revised_opacity_checkbox.isChecked()),
+                "enable_exposure_compensation": bool(self.exposure_compensation_checkbox.isChecked()),
             }
         )
         return settings
@@ -631,12 +669,31 @@ class QtStateController(QtCore.QObject):
         percent = int(round(float(latest["progress"]) * 100)) if latest else 0
         last_loss = self._extract_last_loss(logs) or "--"
         camera = f"camera manifest: {int(manifest['usable_views'])} views" if manifest["mode"] == "manifest" else "SfM-only cameras"
+        training_summary = project.get("last_training_summary") or {}
+        train_metrics = training_summary.get("metrics") or {}
+        validation_metrics = training_summary.get("validation_metrics") or {}
+        diagnostics = training_summary.get("dataset_diagnostics") or {}
+        properties = [
+            {"label": "Source Directory", "value": project["workspace_dir"], "copyable": True},
+            {"label": "Image Count", "value": f"{len(images)} Frames"},
+            {"label": "Resolution", "value": resolution},
+        ]
+        if train_metrics.get("psnr") is not None:
+            properties.append({"label": "Train PSNR", "value": f"{float(train_metrics['psnr']):.3f}"})
+        if validation_metrics.get("psnr") is not None:
+            properties.append({"label": "Val PSNR", "value": f"{float(validation_metrics['psnr']):.3f}"})
+        if validation_metrics.get("ssim") is not None:
+            properties.append({"label": "Val SSIM", "value": f"{float(validation_metrics['ssim']):.4f}"})
+        if diagnostics.get("quality_score") is not None:
+            properties.append({"label": "Dataset Score", "value": f"{float(diagnostics['quality_score']):.1f}/100"})
+        if diagnostics.get("registered_view_ratio") is not None:
+            properties.append({"label": "Registered Views", "value": f"{float(diagnostics['registered_view_ratio']) * 100.0:.1f}%"})
         return {
             "header": {"title": project["name"], "status": project["status"], "subtitle": f"{len(images)} photos | {camera} | {project['workspace_dir']}"},
             "toolbar": {"canTrain": bool(images) and not (latest and latest["status"] == "running"), "canStop": bool(latest and latest["status"] == "running"), "canExport": bool(project.get("last_manifest_path"))},
             "preview": preview,
             "statusPanel": {"progress": percent, "progressLabel": f"{percent}%", "statusText": latest["status"].capitalize() if latest else "Ready", "stage": latest["stage"] if latest else "Ready", "timeTotal": self._job_duration(latest), "finalLoss": last_loss},
-            "propertiesPanel": {"items": [{"label": "Source Directory", "value": project["workspace_dir"], "copyable": True}, {"label": "Image Count", "value": f"{len(images)} Frames"}, {"label": "Resolution", "value": resolution}]},
+            "propertiesPanel": {"items": properties},
             "exportPanel": {"body": "Trained splats are compiled and ready. Choose a destination format to export the geometry." if project.get("last_manifest_path") else "Run a project first to generate the exported splat package."},
             "logs": logs,
             "consoleRows": self._console_rows(logs),

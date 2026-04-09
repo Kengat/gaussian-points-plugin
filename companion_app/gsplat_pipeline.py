@@ -23,6 +23,7 @@ from gsplat.strategy.base import Strategy
 from gsplat.strategy.ops import inject_noise_to_position
 
 from . import paths, store
+from .quality import compute_dataset_diagnostics, split_training_views, summarize_registered_views
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -32,6 +33,7 @@ _MCMC_RUNTIME_MODE: str | None = None
 
 @dataclass
 class TrainingView:
+    view_index: int
     image_name: str
     rgb_tensor: torch.Tensor
     alpha_tensor: torch.Tensor
@@ -460,6 +462,26 @@ def _normalize_quality_preset(settings: dict) -> str:
     return preset
 
 
+def _resolve_rasterize_mode(settings: dict, preset: str) -> str:
+    mode = str(settings.get("rasterize_mode") or "auto").strip().lower()
+    if mode not in {"auto", "classic", "antialiased"}:
+        mode = "auto"
+    if mode == "auto":
+        return "classic" if preset == "compact" else "antialiased"
+    return mode
+
+
+def _resolve_sfm_match_mode(settings: dict, image_count: int) -> str:
+    mode = str(settings.get("sfm_match_mode") or "auto").strip().lower()
+    if mode not in {"auto", "exhaustive", "sequential", "spatial"}:
+        mode = "auto"
+    if mode == "auto":
+        if image_count >= 48:
+            return "sequential"
+        return "exhaustive"
+    return mode
+
+
 def _auto_gaussian_budget(view_count: int, initial_points: int, train_resolution: int, preset: str) -> int:
     profile_table = {
         "compact": {"point_factor": 2.5, "view_resolution_weight": 8.0, "minimum": 40_000, "maximum": 300_000},
@@ -507,6 +529,7 @@ def _resolve_training_profile(settings: dict, view_count: int, initial_points: i
     profile: dict[str, object] = {
         "preset": preset,
         "strategy_name": strategy_name,
+        "rasterize_mode": _resolve_rasterize_mode(settings, preset),
         "max_gaussians": int(max_gaussians),
         "refine_start_iter": int(refine_start_iter),
         "refine_stop_iter": int(refine_stop_iter),
@@ -581,6 +604,7 @@ def _render_view(
     sh_degree_to_use: int,
     absgrad: bool,
     backgrounds: torch.Tensor,
+    rasterize_mode: str,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     camtoworld = view.camtoworld.unsqueeze(0).to(device)
     K = view.K.unsqueeze(0).to(device)
@@ -597,10 +621,22 @@ def _render_view(
         sh_degree=sh_degree_to_use,
         packed=False,
         absgrad=absgrad,
-        rasterize_mode="classic",
+        rasterize_mode=rasterize_mode,
         backgrounds=backgrounds,
     )
     return renders[..., :3], alphas, info
+
+
+def _apply_exposure_compensation(
+    colors_pred: torch.Tensor,
+    view: TrainingView,
+    exposure_params: dict[str, torch.nn.Parameter] | None,
+) -> torch.Tensor:
+    if exposure_params is None:
+        return colors_pred
+    gains = torch.exp(exposure_params["log_gains"][view.view_index]).view(1, 1, 1, 3)
+    bias = exposure_params["rgb_bias"][view.view_index].view(1, 1, 1, 3)
+    return torch.clamp((colors_pred * gains) + bias, 0.0, 1.0)
 
 
 def _visible_gaussian_count(info: dict) -> int:
@@ -622,6 +658,8 @@ def _evaluate_splats(
     *,
     sh_degree: int,
     absgrad: bool,
+    rasterize_mode: str,
+    exposure_params: dict[str, torch.nn.Parameter] | None = None,
 ) -> dict[str, float]:
     totals = {
         "l1": 0.0,
@@ -647,7 +685,9 @@ def _evaluate_splats(
                 sh_degree_to_use=sh_degree,
                 absgrad=absgrad,
                 backgrounds=backgrounds,
+                rasterize_mode=rasterize_mode,
             )
+            colors_pred = _apply_exposure_compensation(colors_pred, view, exposure_params)
             l1_loss = F.l1_loss(colors_pred, pixels)
             mse = F.mse_loss(colors_pred, pixels)
             totals["l1"] += float(l1_loss.item())
@@ -756,6 +796,7 @@ def _align_views_to_reconstruction(views: list[TrainingView], reconstruction: py
             aligned_pose = _apply_similarity_to_camtoworld(view.camtoworld, scale, rotation, translation)
         aligned_views.append(
             TrainingView(
+                view_index=len(aligned_views),
                 image_name=view.image_name,
                 rgb_tensor=view.rgb_tensor,
                 alpha_tensor=view.alpha_tensor,
@@ -1114,6 +1155,7 @@ def _probe_sqlite_database(database_path: Path) -> None:
 
 def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruction:
     image_dir = _prepare_colmap_images(project)
+    image_paths = sorted(path for path in image_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
     colmap_dir = paths.project_colmap_scratch_dir(project["id"])
     database_path = colmap_dir / "database.db"
     sparse_dir = colmap_dir / "sparse"
@@ -1136,7 +1178,7 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
     _probe_sqlite_database(database_path)
 
     _log_line(job, f"COLMAP scratch workspace: {colmap_dir}")
-    _log_line(job, f"Prepared {len(list(image_dir.iterdir()))} normalized images for SfM.")
+    _log_line(job, f"Prepared {len(image_paths)} normalized images for SfM.")
 
     _update(job["id"], "COLMAP", 0.08, "Extracting image features.")
     extraction_options = pycolmap.FeatureExtractionOptions()
@@ -1154,16 +1196,23 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
     mapping_options.extract_colors = True
     mapping_options.num_threads = int(settings.get("sfm_num_threads", 6))
 
+    match_mode = _resolve_sfm_match_mode(settings, len(image_paths))
+
     pycolmap.extract_features(database_path, image_dir, extraction_options=extraction_options)
     if _should_stop(job["id"]):
         raise RuntimeError("Stopped during feature extraction.")
     _log_line(job, "COLMAP feature extraction finished.")
 
-    _update(job["id"], "COLMAP", 0.14, "Matching image features. This can take a few minutes on larger datasets.")
-    pycolmap.match_exhaustive(database_path, matching_options=matching_options)
+    _update(job["id"], "COLMAP", 0.14, f"Matching image features with {match_mode} mode.")
+    if match_mode == "sequential":
+        pycolmap.match_sequential(database_path, matching_options=matching_options)
+    elif match_mode == "spatial":
+        pycolmap.match_spatial(database_path, matching_options=matching_options)
+    else:
+        pycolmap.match_exhaustive(database_path, matching_options=matching_options)
     if _should_stop(job["id"]):
         raise RuntimeError("Stopped during feature matching.")
-    _log_line(job, "COLMAP exhaustive matching finished.")
+    _log_line(job, f"COLMAP {match_mode} matching finished.")
 
     _update(job["id"], "COLMAP", 0.22, "Recovering camera poses and sparse points.")
     reconstructions = pycolmap.incremental_mapping(database_path, image_dir, sparse_dir, options=mapping_options)
@@ -1201,6 +1250,7 @@ def _load_training_views(project: dict, reconstruction: pycolmap.Reconstruction,
 
         views.append(
             TrainingView(
+                view_index=len(views),
                 image_name=image.name,
                 rgb_tensor=rgb_pixels,
                 alpha_tensor=alpha_pixels,
@@ -1249,6 +1299,7 @@ def _load_training_views_from_transforms(
 
         views.append(
             TrainingView(
+                view_index=len(views),
                 image_name=image_path.name,
                 rgb_tensor=rgb_pixels,
                 alpha_tensor=alpha_pixels,
@@ -1270,6 +1321,7 @@ def _train_gaussians(
     settings: dict,
     reconstruction: pycolmap.Reconstruction | None,
     views: list[TrainingView],
+    dataset_diagnostics: dict[str, object] | None = None,
 ) -> tuple[Path, int, dict, dict[str, object]]:
     known_camera_mode = bool(settings.get("_known_camera_mode", False))
     if known_camera_mode:
@@ -1349,6 +1401,12 @@ def _train_gaussians(
     init_opacity = float(settings.get("init_opacity", 0.10))
     sh_dim = (sh_degree + 1) ** 2
     training_profile = _resolve_training_profile(settings, len(views), initial_gaussian_count)
+    train_views, validation_views = split_training_views(
+        views,
+        validation_fraction=float(settings.get("validation_fraction", 0.18)),
+        min_validation_views=int(settings.get("min_validation_views", 2)),
+    )
+    rasterize_mode = str(training_profile["rasterize_mode"])
     strategy_name = str(training_profile["strategy_name"])
     target_gaussian_budget = int(training_profile["max_gaussians"])
     if strategy_name == "mcmc":
@@ -1365,6 +1423,13 @@ def _train_gaussians(
         }
     ).to(device)
 
+    exposure_params: dict[str, torch.nn.Parameter] | None = None
+    if bool(settings.get("enable_exposure_compensation", True)):
+        exposure_params = {
+            "log_gains": torch.nn.Parameter(torch.zeros((len(views), 3), dtype=torch.float32, device=device)),
+            "rgb_bias": torch.nn.Parameter(torch.zeros((len(views), 3), dtype=torch.float32, device=device)),
+        }
+
     optimizers = {
         "means": torch.optim.Adam([{"params": splats["means"], "lr": float(settings.get("means_lr", 1.6e-4))}], eps=1e-15),
         "scales": torch.optim.Adam([{"params": splats["scales"], "lr": float(settings.get("scales_lr", 5.0e-3))}], eps=1e-15),
@@ -1373,6 +1438,20 @@ def _train_gaussians(
         "sh0": torch.optim.Adam([{"params": splats["sh0"], "lr": float(settings.get("sh0_lr", 2.5e-3))}], eps=1e-15),
         "shN": torch.optim.Adam([{"params": splats["shN"], "lr": float(settings.get("shN_lr", 1.25e-4))}], eps=1e-15),
     }
+    auxiliary_optimizers: list[torch.optim.Optimizer] = []
+    if exposure_params is not None:
+        auxiliary_optimizers.extend(
+            [
+                torch.optim.Adam(
+                    [{"params": exposure_params["log_gains"], "lr": float(settings.get("exposure_gain_lr", 2.0e-3))}],
+                    eps=1e-15,
+                ),
+                torch.optim.Adam(
+                    [{"params": exposure_params["rgb_bias"], "lr": float(settings.get("exposure_bias_lr", 1.0e-3))}],
+                    eps=1e-15,
+                ),
+            ]
+        )
 
     max_steps = int(settings.get("train_steps", 1200))
     mcmc_runtime_mode = "disabled"
@@ -1417,7 +1496,9 @@ def _train_gaussians(
         f"runtime={mcmc_runtime_mode if strategy_name == 'mcmc' else 'default'} "
         f"budget={target_gaussian_budget:,} init={initial_gaussian_count:,} "
         f"refine={training_profile['refine_start_iter']}..{training_profile['refine_stop_iter']} "
-        f"every={training_profile['refine_every']}",
+        f"every={training_profile['refine_every']} rasterize={rasterize_mode} "
+        f"train_views={len(train_views)} val_views={len(validation_views)} "
+        f"exposure={'on' if exposure_params is not None else 'off'}",
     )
     strategy.check_sanity(splats, optimizers)
 
@@ -1429,6 +1510,7 @@ def _train_gaussians(
     progress_span = 0.54
     lambda_dssim = float(settings.get("lambda_dssim", 0.20))
     alpha_loss_weight = float(settings.get("alpha_loss_weight", 0.05))
+    exposure_regularization = float(settings.get("exposure_regularization", 1.0e-3))
     random_background = bool(settings.get("random_background", True))
     budget_pause_logged = False
 
@@ -1436,7 +1518,7 @@ def _train_gaussians(
         if _should_stop(job["id"]):
             raise RuntimeError("Stopped during Gaussian Splat training.")
 
-        view = random.choice(views)
+        view = random.choice(train_views)
         _target_rgb, target_alpha, backgrounds, pixels = _build_target_pixels(
             view,
             device,
@@ -1451,7 +1533,9 @@ def _train_gaussians(
             sh_degree_to_use=sh_degree_to_use,
             absgrad=strategy_absgrad,
             backgrounds=backgrounds,
+            rasterize_mode=rasterize_mode,
         )
+        colors_pred = _apply_exposure_compensation(colors_pred, view, exposure_params)
 
         budget_paused = strategy_name == "default" and len(splats["means"]) >= target_gaussian_budget
         if budget_paused and not budget_pause_logged:
@@ -1477,13 +1561,27 @@ def _train_gaussians(
             l1_loss = F.l1_loss(colors_pred, pixels)
             alpha_loss = torch.zeros((), dtype=torch.float32, device=device)
         ssim_score = _ssim(colors_pred, pixels)
-        loss = ((1.0 - lambda_dssim) * l1_loss) + (lambda_dssim * (1.0 - ssim_score)) + (alpha_loss_weight * alpha_loss)
+        exposure_reg = torch.zeros((), dtype=torch.float32, device=device)
+        if exposure_params is not None:
+            exposure_reg = (
+                exposure_params["log_gains"][view.view_index].pow(2).mean()
+                + exposure_params["rgb_bias"][view.view_index].pow(2).mean()
+            )
+        loss = (
+            ((1.0 - lambda_dssim) * l1_loss)
+            + (lambda_dssim * (1.0 - ssim_score))
+            + (alpha_loss_weight * alpha_loss)
+            + (exposure_regularization * exposure_reg)
+        )
         loss.backward()
         loss_value = float(loss.item())
         l1_value = float(l1_loss.item())
         ssim_value = float(ssim_score.item())
 
         for optimizer in optimizers.values():
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        for optimizer in auxiliary_optimizers:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -1522,31 +1620,58 @@ def _train_gaussians(
 
     pruned_outliers = _prune_coordinate_outliers(splats, job=job)
 
-    evaluation = _evaluate_splats(
+    train_evaluation = _evaluate_splats(
         splats,
-        views,
+        train_views,
         device,
         sh_degree=sh_degree,
         absgrad=strategy_absgrad,
+        rasterize_mode=rasterize_mode,
+        exposure_params=exposure_params,
+    )
+    validation_evaluation = _evaluate_splats(
+        splats,
+        validation_views or train_views,
+        device,
+        sh_degree=sh_degree,
+        absgrad=strategy_absgrad,
+        rasterize_mode=rasterize_mode,
+        exposure_params=exposure_params,
     )
     training_summary = {
         "quality_preset": str(training_profile["preset"]),
         "strategy_name": strategy_name,
         "mcmc_runtime_mode": mcmc_runtime_mode if strategy_name == "mcmc" else "not_used",
+        "rasterize_mode": rasterize_mode,
         "gaussian_budget": target_gaussian_budget,
         "initial_gaussians": initial_gaussian_count,
         "pruned_coordinate_outliers": pruned_outliers,
         "final_gaussians": int(len(splats["means"])),
         "train_steps": max_steps,
         "train_resolution": int(settings.get("train_resolution", 640)),
-        "metrics": evaluation,
+        "train_view_count": len(train_views),
+        "validation_view_count": len(validation_views),
+        "metrics": train_evaluation,
+        "validation_metrics": validation_evaluation,
+        "dataset_diagnostics": dataset_diagnostics or {},
+        "exposure_compensation": {
+            "enabled": exposure_params is not None,
+            "regularization": exposure_regularization,
+        },
     }
     _log_line(
         job,
-        "Final evaluation "
-        f"PSNR={evaluation['psnr']:.3f} SSIM={evaluation['ssim']:.4f} "
-        f"L1={evaluation['l1']:.4f} alpha_l1={evaluation['alpha_l1']:.4f} "
-        f"visible={evaluation['visible_gaussians']:.0f}",
+        "Final train evaluation "
+        f"PSNR={train_evaluation['psnr']:.3f} SSIM={train_evaluation['ssim']:.4f} "
+        f"L1={train_evaluation['l1']:.4f} alpha_l1={train_evaluation['alpha_l1']:.4f} "
+        f"visible={train_evaluation['visible_gaussians']:.0f}",
+    )
+    _log_line(
+        job,
+        "Final validation evaluation "
+        f"PSNR={validation_evaluation['psnr']:.3f} SSIM={validation_evaluation['ssim']:.4f} "
+        f"L1={validation_evaluation['l1']:.4f} alpha_l1={validation_evaluation['alpha_l1']:.4f} "
+        f"visible={validation_evaluation['visible_gaussians']:.0f}",
     )
 
     result_path = _result_ply_path(project["id"])
@@ -1635,6 +1760,19 @@ def _export_handoff(
 
 
 def run_gsplat_job(project: dict, job: dict, settings: dict) -> dict:
+    dataset_images = _list_project_images(project["id"])
+    dataset_diagnostics = compute_dataset_diagnostics(dataset_images)
+    _log_line(
+        job,
+        "Dataset diagnostics "
+        f"quality_score={dataset_diagnostics['quality_score']:.1f} "
+        f"sharpness={dataset_diagnostics['sharpness_mean']:.5f} "
+        f"brightness_std={dataset_diagnostics['brightness_std']:.5f} "
+        f"duplicates={dataset_diagnostics['duplicate_like_pairs']}",
+    )
+    for warning in dataset_diagnostics.get("warnings", []):
+        _log_line(job, f"Dataset warning: {warning}")
+
     manifest_path = _find_transforms_manifest(project["id"])
     if manifest_path:
         manifest_views = _load_training_views_from_transforms(project, manifest_path, None, settings)
@@ -1643,18 +1781,34 @@ def run_gsplat_job(project: dict, job: dict, settings: dict) -> dict:
             _log_line(job, "Known-camera alpha dataset detected. Training will use the manifest frame directly and will not mix in COLMAP poses.")
             manifest_settings = dict(settings)
             manifest_settings["_known_camera_mode"] = True
-            workspace_ply, point_count, bounds, training_summary = _train_gaussians(project, job, manifest_settings, None, manifest_views)
+            manifest_diagnostics = summarize_registered_views(dataset_diagnostics, len(manifest_views))
+            workspace_ply, point_count, bounds, training_summary = _train_gaussians(
+                project,
+                job,
+                manifest_settings,
+                None,
+                manifest_views,
+                manifest_diagnostics,
+            )
             manifest = _export_handoff(project, job, workspace_ply, point_count, bounds, training_summary)
             _log_line(job, f"Exported trained splats to {manifest['scene_ply']}.")
             return manifest
 
     reconstruction = _run_colmap(project, job, settings)
     views = _load_training_views(project, reconstruction, settings)
+    dataset_diagnostics = summarize_registered_views(dataset_diagnostics, len(views))
     if manifest_path:
         _log_line(job, f"Loaded {len(views)} training views from camera manifest {manifest_path.name}.")
     else:
         _log_line(job, f"Loaded {len(views)} registered training views from SfM.")
-    workspace_ply, point_count, bounds, training_summary = _train_gaussians(project, job, settings, reconstruction, views)
+    workspace_ply, point_count, bounds, training_summary = _train_gaussians(
+        project,
+        job,
+        settings,
+        reconstruction,
+        views,
+        dataset_diagnostics,
+    )
     manifest = _export_handoff(project, job, workspace_ply, point_count, bounds, training_summary)
     _log_line(job, f"Exported trained splats to {manifest['scene_ply']}.")
     return manifest

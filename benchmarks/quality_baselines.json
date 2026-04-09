@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "updated_at": "2026-04-09T15:45:00+03:00",
+  "notes": [
+    "This file stores persistent quality baselines for future benchmark comparisons.",
+    "Entries with compare_enabled=false are legacy train-only references captured before held-out validation metrics were added."
+  ],
+  "entries": {
+    "sample_datasets/nerf_synthetic_lego_12/images|compact|auto|25|640": {
+      "label": "Sample Lego canary (compact, 25 steps)",
+      "compare_enabled": true,
+      "dataset_kind": "canary",
+      "metrics_source": "train_and_validation",
+      "metrics": {
+        "train_psnr": 14.29001,
+        "train_ssim": 0.64598,
+        "val_psnr": 14.17273,
+        "val_ssim": 0.64471,
+        "final_gaussians": 1400
+      },
+      "gates": {
+        "min_val_psnr": 14.0,
+        "min_val_ssim": 0.64,
+        "max_gaussians": 2000
+      },
+      "source_report": "_tmp_benchmark_quality_smoke2/benchmark_report.json"
+    },
+    "real_capture/test_room_high_4_20260409": {
+      "label": "Test Room High 4",
+      "compare_enabled": false,
+      "dataset_kind": "real_capture",
+      "metrics_source": "legacy_train_only",
+      "metrics": {
+        "train_psnr": 24.51388,
+        "train_ssim": 0.84329,
+        "final_gaussians": 233861,
+        "gaussian_budget": 295996,
+        "pruned_coordinate_outliers": 836,
+        "ply_size_bytes": 55192673
+      },
+      "run": {
+        "quality_preset": "balanced",
+        "strategy_name": "mcmc",
+        "mcmc_runtime_mode": "native",
+        "train_steps": 3000,
+        "train_resolution": 640
+      }
+    },
+    "real_capture/new_test_room_319k_20260409": {
+      "label": "New test room 319k",
+      "compare_enabled": false,
+      "dataset_kind": "real_capture",
+      "metrics_source": "legacy_train_only",
+      "metrics": {
+        "train_psnr": 23.81863,
+        "train_ssim": 0.84701,
+        "final_gaussians": 319936,
+        "gaussian_budget": 296356,
+        "ply_size_bytes": 75506373
+      },
+      "run": {
+        "quality_preset": "balanced",
+        "strategy_name": "default",
+        "train_steps": 1500,
+        "train_resolution": 640
+      }
+    },
+    "real_capture/test_room_3_20260409": {
+      "label": "Test Room 3",
+      "compare_enabled": false,
+      "dataset_kind": "real_capture",
+      "metrics_source": "legacy_train_only",
+      "metrics": {
+        "train_psnr": 21.98575,
+        "train_ssim": 0.78193,
+        "final_gaussians": 93039,
+        "gaussian_budget": 296720,
+        "pruned_coordinate_outliers": 378,
+        "ply_size_bytes": 21958680
+      },
+      "run": {
+        "quality_preset": "balanced",
+        "strategy_name": "mcmc",
+        "mcmc_runtime_mode": "native",
+        "train_steps": 1600,
+        "train_resolution": 640
+      }
+    }
+  }
+}

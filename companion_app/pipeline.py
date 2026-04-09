@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shutil
+import sys
 import time
 import zipfile
 from array import array
@@ -751,10 +752,12 @@ def run_job(job_id: str) -> int:
         raise RuntimeError(f"Unknown project for job {job_id}")
 
     settings = dict(job["settings"])
-    Path(job["log_path"]).write_text("", encoding="utf-8")
+    if os.environ.get("GAUSSIAN_POINTS_WORKER_SUPERVISED") != "1":
+        Path(job["log_path"]).write_text("", encoding="utf-8")
     store.update_job(job_id, status="running", started_at=store.utc_now(), pid=os.getpid(), stop_requested=0)
     store.update_project(project["id"], status="running")
     log_line(job, f"Started job {job_id} for project '{project['name']}'.")
+    log_line(job, f"Worker runtime: {sys.executable}")
 
     try:
         if settings.get("force_restart"):
