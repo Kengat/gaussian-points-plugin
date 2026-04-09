@@ -65,6 +65,7 @@ Rectangle {
             color: hovered ? "#0DFFFFFF" : "transparent"
             border.color: "#1AFFFFFF"
             border.width: 1
+            Behavior on color { ColorAnimation { duration: 200 } }
 
             RowLayout {
                 id: datasetRow
@@ -82,7 +83,7 @@ Rectangle {
 
             MouseArea {
                 anchors.fill: parent
-                hoverEnabled: true
+                hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                 onEntered: parent.hovered = true
                 onExited: parent.hovered = false
                 onClicked: controller.addPhotosDialog()
@@ -118,6 +119,7 @@ Rectangle {
                     implicitWidth: trainRow.implicitWidth + 28
                     color: hovered ? "#FF6A22" : "#FF5400"
                     opacity: toolbar.canTrain ? 1.0 : 0.45
+                    Behavior on color { ColorAnimation { duration: 200 } }
 
                     RowLayout {
                         id: trainRow
@@ -137,6 +139,7 @@ Rectangle {
                         anchors.fill: parent
                         enabled: !!toolbar.canTrain
                         hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
                         onEntered: parent.hovered = true
                         onExited: parent.hovered = false
                         onClicked: controller.startTrainingDialog(false)
@@ -156,6 +159,7 @@ Rectangle {
                         implicitHeight: 32
                         color: hovered ? "#14FFFFFF" : "transparent"
                         opacity: modelData.enabled ? 1.0 : 0.45
+                        Behavior on color { ColorAnimation { duration: 200 } }
 
                         IconImage {
                             anchors.centerIn: parent
@@ -168,6 +172,7 @@ Rectangle {
                             anchors.fill: parent
                             enabled: modelData.enabled
                             hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
                             onEntered: parent.hovered = true
                             onExited: parent.hovered = false
                             onClicked: modelData.action()

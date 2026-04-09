@@ -68,13 +68,18 @@ module GaussianPoints
       def find_python_gui
         candidates = []
         candidates << ENV['PYTHONW'] if ENV['PYTHONW']
+        # Prefer the bundled venvs that have PySide6 and other dependencies
+        %w[.gstrain310 .gstrain311].each do |venv|
+          candidates << File.join(GaussianPoints::PLUGIN_DIR, venv, 'Scripts', 'pythonw.exe')
+          candidates << File.join(GaussianPoints::PLUGIN_DIR, venv, 'Scripts', 'python.exe')
+        end
         if ENV['LOCALAPPDATA']
           candidates.concat(Dir.glob(File.join(ENV['LOCALAPPDATA'], 'Programs', 'Python', 'Python*', 'pythonw.exe')))
           candidates.concat(Dir.glob(File.join(ENV['LOCALAPPDATA'], 'Programs', 'Python', 'Python*', 'python.exe')))
         end
         candidates.concat(%w[pythonw.exe python.exe])
         candidates.find do |candidate|
-          candidate && !candidate.empty? && (candidate.include?('\\') ? File.exist?(candidate) : true)
+          candidate && !candidate.empty? && (candidate.include?(File::SEPARATOR) || candidate.include?('\\') ? File.exist?(candidate) : true)
         end
       end
     end

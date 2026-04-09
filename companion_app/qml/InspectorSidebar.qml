@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Effects
+import Qt5Compat.GraphicalEffects
 
 Rectangle {
     id: root
@@ -73,12 +74,13 @@ Rectangle {
                                 font.pixelSize: 12
                                 font.weight: 700
                                 font.family: "Outfit"
+                                Behavior on color { ColorAnimation { duration: 200 } }
                             }
                         }
 
                         MouseArea {
                             anchors.fill: parent
-                            hoverEnabled: true
+                            hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                             onEntered: parent.hovered = true
                             onExited: parent.hovered = false
                             onClicked: root.currentTab = modelData.index
@@ -97,6 +99,7 @@ Rectangle {
                 id: inspectScroll
                 clip: true
                 contentWidth: availableWidth
+                ScrollBar.vertical.policy: ScrollBar.AlwaysOff
                 leftPadding: 20
                 rightPadding: 20
                 topPadding: 20
@@ -119,110 +122,127 @@ Rectangle {
                         Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#0DFFFFFF" }
                     }
 
-                    Rectangle {
+                    Item {
                         Layout.fillWidth: true
-                        radius: 16
-                        color: "#111116"
-                        border.color: "#0DFFFFFF"
-                        border.width: 1
                         implicitHeight: 176
-                        clip: true
 
                         Rectangle {
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.top: parent.top
-                            height: 4
-                            color: "#0DFFFFFF"
+                            id: progressContent
+                            anchors.fill: parent
+                            radius: 16
+                            color: "#111116"
+                            border.color: "#0DFFFFFF"
+                            border.width: 1
+                            visible: false
+                            layer.enabled: true
 
                             Rectangle {
-                                width: parent.width * ((statusPanel.progress || 0) / 100.0)
-                                height: parent.height
-                                color: (statusPanel.progress || 0) >= 100 ? "#16C784" : "#FF5400"
-                            }
-                        }
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                height: 4
+                                color: "#0DFFFFFF"
 
-                        ColumnLayout {
-                            anchors.fill: parent
-                            anchors.margins: 20
-                            spacing: 0
-                            Item { Layout.preferredHeight: 8 }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Text {
-                                    text: statusPanel.progressLabel || "0%"
-                                    color: "#FFFFFF"
-                                    font.pixelSize: 30
-                                    font.weight: Font.Light
-                                    font.family: "Consolas"
-
-                                }
-                                Item { Layout.fillWidth: true }
                                 Rectangle {
-                                    width: 40
-                                    height: 40
-                                    radius: 20
-                                    color: "#050505"
-                                    border.color: (statusPanel.progress || 0) >= 100 ? "#4D16C784" : "#4DFF5400"
-                                    border.width: 2
-                                    IconImage {
-                                        anchors.centerIn: parent
-                                        iconName: (statusPanel.progress || 0) >= 100 ? "check-circle-2" : "clock-3"
-                                        tone: (statusPanel.progress || 0) >= 100 ? "green" : "accent"
-                                        iconSize: 20
+                                    width: parent.width * ((statusPanel.progress || 0) / 100.0)
+                                    height: parent.height
+                                    color: (statusPanel.progress || 0) >= 100 ? "#16C784" : "#FF5400"
+                                }
+                            }
+
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.margins: 20
+                                spacing: 0
+                                Item { Layout.preferredHeight: 8 }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Text {
+                                        text: statusPanel.progressLabel || "0%"
+                                        color: "#FFFFFF"
+                                        font.pixelSize: 30
+                                        font.weight: Font.Light
+                                        font.family: "Consolas"
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                    Rectangle {
+                                        width: 40
+                                        height: 40
+                                        radius: 20
+                                        color: "#050505"
+                                        border.color: (statusPanel.progress || 0) >= 100 ? "#4D16C784" : "#4DFF5400"
+                                        border.width: 2
+                                        IconImage {
+                                            anchors.centerIn: parent
+                                            iconName: (statusPanel.progress || 0) >= 100 ? "check-circle-2" : "clock-3"
+                                            tone: (statusPanel.progress || 0) >= 100 ? "green" : "accent"
+                                            iconSize: 20
+                                        }
                                     }
                                 }
-                            }
-                            Text {
-                                text: statusPanel.statusText || "Ready"
-                                color: "#A1A1AA"
-                                font.pixelSize: 12
-                                font.family: "DM Sans 36pt"
-                                Layout.topMargin: 2
-                            }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Layout.topMargin: 16
-                                spacing: 10
-                                Repeater {
-                                    model: [
-                                        { label: "Time Total", value: statusPanel.timeTotal || "--" },
-                                        { label: "Final Loss", value: statusPanel.finalLoss || "--" }
-                                    ]
-                                    delegate: Rectangle {
-                                        required property var modelData
-                                        Layout.fillWidth: true
-                                        implicitHeight: 60
-                                        radius: 10
-                                        color: "#80050505"
-                                        border.color: "#0DFFFFFF"
-                                        border.width: 1
-                                        ColumnLayout {
-                                            anchors.fill: parent
-                                            anchors.leftMargin: 10
-                                            anchors.rightMargin: 10
-                                            anchors.topMargin: 10
-                                            anchors.bottomMargin: 10
-                                            spacing: 4
-                                            Text {
-                                                text: modelData.label
-                                                color: "#71717A"
-                                                font.pixelSize: 12
-                                                font.family: "DM Sans 36pt"
-                                                font.weight: 500
-                                            }
-                                            Text {
-                                                text: modelData.value
-                                                color: modelData.label === "Final Loss" ? "#00F0FF" : "#FFFFFF"
-                                                font.pixelSize: 16
-                                                font.weight: 500
-                                                font.family: "Consolas"
-            
+                                Text {
+                                    text: statusPanel.statusText || "Ready"
+                                    color: "#A1A1AA"
+                                    font.pixelSize: 12
+                                    font.family: "DM Sans 36pt"
+                                    Layout.topMargin: 2
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Layout.topMargin: 16
+                                    spacing: 10
+                                    Repeater {
+                                        model: [
+                                            { label: "Time Total", value: statusPanel.timeTotal || "--" },
+                                            { label: "Final Loss", value: statusPanel.finalLoss || "--" }
+                                        ]
+                                        delegate: Rectangle {
+                                            required property var modelData
+                                            Layout.fillWidth: true
+                                            implicitHeight: 60
+                                            radius: 10
+                                            color: "#80050505"
+                                            border.color: "#0DFFFFFF"
+                                            border.width: 1
+                                            ColumnLayout {
+                                                anchors.fill: parent
+                                                anchors.leftMargin: 10
+                                                anchors.rightMargin: 10
+                                                anchors.topMargin: 10
+                                                anchors.bottomMargin: 10
+                                                spacing: 4
+                                                Text {
+                                                    text: modelData.label
+                                                    color: "#71717A"
+                                                    font.pixelSize: 12
+                                                    font.family: "DM Sans 36pt"
+                                                    font.weight: 500
+                                                }
+                                                Text {
+                                                    text: modelData.value
+                                                    color: modelData.label === "Final Loss" ? "#00F0FF" : "#FFFFFF"
+                                                    font.pixelSize: 16
+                                                    font.weight: 500
+                                                    font.family: "Consolas"
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
+                        }
+
+                        Rectangle {
+                            id: progressMask
+                            anchors.fill: parent
+                            radius: 16
+                            visible: false
+                        }
+
+                        OpacityMask {
+                            anchors.fill: parent
+                            source: progressContent
+                            maskSource: progressMask
                         }
                     }
 
@@ -242,6 +262,7 @@ Rectangle {
                             implicitHeight: content.implicitHeight + 8
                             color: hovered ? "#0DFFFFFF" : "transparent"
                             radius: 8
+                            Behavior on color { ColorAnimation { duration: 200 } }
 
                             ColumnLayout {
                                 id: content
@@ -271,6 +292,8 @@ Rectangle {
                                         border.width: 1
                                         implicitWidth: copyRow.implicitWidth + 16
                                         implicitHeight: 26
+                                        Behavior on color { ColorAnimation { duration: 200 } }
+                                        Behavior on border.color { ColorAnimation { duration: 200 } }
 
                                         RowLayout {
                                             id: copyRow
@@ -282,7 +305,7 @@ Rectangle {
 
                                         MouseArea {
                                             anchors.fill: parent
-                                            hoverEnabled: true
+                                            hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                             onEntered: parent.hovered = true
                                             onExited: parent.hovered = false
                                             onClicked: controller.copyText(modelData.value || "")
@@ -301,127 +324,155 @@ Rectangle {
 
                             MouseArea {
                                 anchors.fill: parent
-                                hoverEnabled: true
+                                hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                 onEntered: parent.hovered = true
                                 onExited: parent.hovered = false
                             }
                         }
                     }
 
-                    Rectangle {
+                    Item {
                         Layout.fillWidth: true
-                        property bool hovered: false
-                        clip: true
-                        radius: 16
-                        color: "#751E1618"
-                        border.color: "#14FFFFFF"
-                        border.width: 1
                         implicitHeight: exportCol.implicitHeight + 40
+                        property bool exportHovered: false
 
                         Item {
-                            id: glowContainer
-                            width: 140
-                            height: 140
-                            anchors.top: parent.top
-                            anchors.right: parent.right
-                            anchors.topMargin: -40
-                            anchors.rightMargin: -40
+                            anchors.fill: parent
+                            clip: true
 
-                            Rectangle {
-                                id: glowSource
-                                anchors.centerIn: parent
-                                width: 80
-                                height: 80
-                                radius: 40
-                                color: parent.parent.hovered ? "#00F0FF" : "#FF5400"
-                                opacity: parent.parent.hovered ? 0.15 : 0.05
-                                visible: false
-                            }
-                            MultiEffect {
-                                source: glowSource
-                                anchors.fill: parent
-                                blurEnabled: true
-                                blurMax: 64
-                                blur: 1.0
+                            Item {
+                                id: glowContainer
+                                width: 140
+                                height: 140
+                                anchors.top: parent.top
+                                anchors.right: parent.right
+                                anchors.topMargin: -40
+                                anchors.rightMargin: -40
+
+                                Rectangle {
+                                    id: glowSource
+                                    anchors.centerIn: parent
+                                    width: 80
+                                    height: 80
+                                    radius: 40
+                                    color: exportHovered ? "#00F0FF" : "#FF5400"
+                                    visible: false
+                                    Behavior on color { ColorAnimation { duration: 500 } }
+                                }
+                                MultiEffect {
+                                    source: glowSource
+                                    anchors.fill: parent
+                                    blurEnabled: true
+                                    blurMax: 64
+                                    blur: 1.0
+                                    opacity: exportHovered ? 0.07 : 0.03
+                                    Behavior on opacity { NumberAnimation { duration: 500 } }
+                                }
                             }
                         }
 
-                        ColumnLayout {
-                            id: exportCol
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.top: parent.top
-                            anchors.margins: 20
-                            spacing: 8
-                            RowLayout {
+                        Rectangle {
+                            id: exportContent
+                            anchors.fill: parent
+                            radius: 16
+                            color: "#751E1618"
+                            border.color: "#14FFFFFF"
+                            border.width: 1
+                            visible: false
+                            layer.enabled: true
+
+                            ColumnLayout {
+                                id: exportCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 20
                                 spacing: 8
-                                IconImage { iconName: "download"; tone: "cyan"; iconSize: 16 }
-                                Text { text: "Export Options"; color: "#FFFFFF"; font.pixelSize: 14; font.weight: 700; font.family: "Outfit" }
-                            }
-                            Text {
-                                text: exportPanel.body || ""
-                                color: "#A1A1AA"
-                                font.pixelSize: 12
-                                wrapMode: Text.WordWrap
-                                font.family: "DM Sans 36pt"
-                                lineHeight: 1.4
-                                lineHeightMode: Text.ProportionalHeight
-                                Layout.fillWidth: true
-                                Layout.bottomMargin: 4
-                            }
-
-                            Repeater {
-                                model: [
-                                    { text: "Export to .ply file", accent: false, icon: "download" },
-                                    { text: "Export directly to SketchUp", accent: true, icon: "arrow-up-right" }
-                                ]
-                                delegate: Rectangle {
-                                    required property var modelData
-                                    property bool hovered: false
-                                    radius: 10
-                                    color: modelData.accent ? "transparent" : hovered ? "#14FFFFFF" : "#06FFFFFF"
-                                    border.color: modelData.accent ? "transparent" : hovered ? "#33FFFFFF" : "#0DFFFFFF"
-                                    border.width: 1
-                                    implicitHeight: 38
+                                RowLayout {
+                                    spacing: 8
+                                    IconImage { iconName: "download"; tone: "cyan"; iconSize: 16 }
+                                    Text { text: "Export Options"; color: "#FFFFFF"; font.pixelSize: 14; font.weight: 700; font.family: "Outfit" }
+                                }
+                                Text {
+                                    text: exportPanel.body || ""
+                                    color: "#A1A1AA"
+                                    font.pixelSize: 12
+                                    wrapMode: Text.WordWrap
+                                    font.family: "DM Sans 36pt"
+                                    lineHeight: 1.4
+                                    lineHeightMode: Text.ProportionalHeight
                                     Layout.fillWidth: true
-                                    opacity: ((detail.toolbar || {}).canExport) ? 1.0 : 0.45
+                                    Layout.bottomMargin: 4
+                                }
 
-                                    gradient: Gradient {
-                                        orientation: Gradient.Horizontal
-                                        GradientStop { position: 0.0; color: modelData.accent ? (hovered ? "#FF6A22" : "#FF5400") : "transparent" }
-                                        GradientStop { position: 1.0; color: modelData.accent ? (hovered ? "#FF4AA0" : "#FF2E93") : "transparent" }
-                                    }
+                                Repeater {
+                                    model: [
+                                        { text: "Export to .ply file", accent: false, icon: "download" },
+                                        { text: "Export directly to SketchUp", accent: true, icon: "arrow-up-right" }
+                                    ]
+                                    delegate: Rectangle {
+                                        required property var modelData
+                                        property bool btnHovered: false
+                                        radius: 10
+                                        color: modelData.accent ? "transparent" : btnHovered ? "#14FFFFFF" : "#06FFFFFF"
+                                        border.color: modelData.accent ? "transparent" : btnHovered ? "#33FFFFFF" : "#0DFFFFFF"
+                                        border.width: 1
+                                        implicitHeight: 38
+                                        Layout.fillWidth: true
+                                        opacity: ((detail.toolbar || {}).canExport) ? 1.0 : 0.45
+                                        Behavior on color { ColorAnimation { duration: 200 } }
+                                        Behavior on border.color { ColorAnimation { duration: 200 } }
 
-                                    RowLayout {
-                                        anchors.centerIn: parent
-                                        spacing: 8
-                                        IconImage { iconName: modelData.icon; tone: modelData.accent ? "white" : "muted"; iconSize: 16 }
-                                        Text {
-                                            text: modelData.text
-                                            color: "#FFFFFF"
-                                            font.pixelSize: 13
-                                            font.weight: 700
-                                            font.family: "Outfit"
-                                            verticalAlignment: Text.AlignVCenter
+                                        gradient: Gradient {
+                                            orientation: Gradient.Horizontal
+                                            GradientStop { position: 0.0; color: modelData.accent ? (btnHovered ? "#FF6A22" : "#FF5400") : "transparent" }
+                                            GradientStop { position: 1.0; color: modelData.accent ? (btnHovered ? "#FF4AA0" : "#FF2E93") : "transparent" }
                                         }
-                                    }
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        enabled: ((detail.toolbar || {}).canExport)
-                                        hoverEnabled: true
-                                        onEntered: parent.hovered = true
-                                        onExited: parent.hovered = false
-                                        onClicked: controller.openExportFolder()
+
+                                        RowLayout {
+                                            anchors.centerIn: parent
+                                            spacing: 8
+                                            IconImage { iconName: modelData.icon; tone: modelData.accent ? "white" : "muted"; iconSize: 16 }
+                                            Text {
+                                                text: modelData.text
+                                                color: "#FFFFFF"
+                                                font.pixelSize: 13
+                                                font.weight: 700
+                                                font.family: "Outfit"
+                                                verticalAlignment: Text.AlignVCenter
+                                            }
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            enabled: ((detail.toolbar || {}).canExport)
+                                            hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                            onEntered: parent.btnHovered = true
+                                            onExited: parent.btnHovered = false
+                                            onClicked: controller.openExportFolder()
+                                        }
                                     }
                                 }
                             }
                         }
 
+                        Rectangle {
+                            id: exportMask
+                            anchors.fill: parent
+                            radius: 16
+                            visible: false
+                        }
+
+                        OpacityMask {
+                            anchors.fill: parent
+                            source: exportContent
+                            maskSource: exportMask
+                        }
+
                         MouseArea {
                             anchors.fill: parent
-                            hoverEnabled: true
-                            onEntered: parent.hovered = true
-                            onExited: parent.hovered = false
+                            hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            onEntered: exportHovered = true
+                            onExited: exportHovered = false
                         }
                     }
                 }
@@ -431,6 +482,7 @@ Rectangle {
                 id: consoleScroll
                 clip: true
                 contentWidth: availableWidth
+                ScrollBar.vertical.policy: ScrollBar.AlwaysOff
                 leftPadding: 20
                 rightPadding: 20
                 topPadding: 20
@@ -465,86 +517,117 @@ Rectangle {
 
                     Rectangle {
                         Layout.fillWidth: true
+                        implicitHeight: Math.max(400, consoleScroll.height - 100)
                         clip: true
                         radius: 14
                         color: "#020202"
                         border.color: "#14FFFFFF"
                         border.width: 1
-                        implicitHeight: 580
 
-                        Column {
+                        Flickable {
+                            id: consoleFlick
                             anchors.fill: parent
                             anchors.margins: 16
-                            spacing: 2
+                            contentWidth: width
+                            contentHeight: consoleColumn.implicitHeight
+                            clip: true
+                            boundsBehavior: Flickable.StopAtBounds
+                            flickableDirection: Flickable.VerticalFlick
 
-                            Repeater {
-                                model: consoleRows
-                                delegate: Rectangle {
-                                    required property var modelData
-                                    property bool hovered: false
-                                    clip: true
-                                    width: parent.width
-                                    implicitHeight: rowWrap.implicitHeight + 4
-                                    radius: 4
-                                    color: hovered ? "#0AFFFFFF" : "transparent"
-
-                                    RowLayout {
-                                        id: rowWrap
-                                        anchors.left: parent.left
-                                        anchors.right: parent.right
-                                        anchors.leftMargin: 4
-                                        anchors.rightMargin: 4
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        spacing: 8
-
-                                        Text {
-                                            visible: !!modelData.timestamp
-                                            text: modelData.timestamp
-                                            color: "#52525B"
-                                            font.family: "Consolas"
-                                            font.pixelSize: 11
-        
-                                            Layout.alignment: Qt.AlignTop
-                                        }
-                                        Text {
-                                            Layout.fillWidth: true
-                                            text: modelData.kind === "system" ? "> " + modelData.message : modelData.message
-                                            wrapMode: Text.WrapAnywhere
-                                            color: modelData.kind === "system" ? "#71717A" : modelData.kind === "success" ? "#34D399" : modelData.kind === "metric" ? "#00F0FF" : "#D4D4D8"
-                                            font.family: "Consolas"
-                                            font.pixelSize: 11
-        
-                                            font.italic: modelData.kind === "system"
-                                            lineHeight: 1.9
-                                            lineHeightMode: Text.ProportionalHeight
-                                            Layout.alignment: Qt.AlignTop
-                                        }
-                                    }
-
-                                    MouseArea {
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        onEntered: parent.hovered = true
-                                        onExited: parent.hovered = false
-                                    }
-                                }
+                            onContentHeightChanged: {
+                                if (contentHeight > height)
+                                    contentY = contentHeight - height
                             }
 
-                            Row {
-                                spacing: 4
-                                Text {
-                                    text: "C:\\Users\\illia\\Companion>"
-                                    color: "#52525B"
-                                    font.family: "Consolas"
-                                    font.pixelSize: 11
+                            ScrollBar.vertical: ScrollBar {
+                                policy: ScrollBar.AlwaysOff
+                            }
 
+                            Column {
+                                id: consoleColumn
+                                width: parent.width
+                                spacing: 2
+
+                                Repeater {
+                                    model: consoleRows
+                                    delegate: Rectangle {
+                                        required property var modelData
+                                        property bool hovered: false
+                                        clip: true
+                                        width: parent.width
+                                        implicitHeight: rowWrap.implicitHeight + 4
+                                        radius: 4
+                                        color: hovered ? "#0AFFFFFF" : "transparent"
+                                        Behavior on color { ColorAnimation { duration: 200 } }
+
+                                        RowLayout {
+                                            id: rowWrap
+                                            anchors.left: parent.left
+                                            anchors.right: parent.right
+                                            anchors.leftMargin: 4
+                                            anchors.rightMargin: 4
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            spacing: 8
+
+                                            Text {
+                                                visible: !!modelData.timestamp
+                                                text: modelData.timestamp
+                                                color: "#52525B"
+                                                font.family: "Consolas"
+                                                font.pixelSize: 11
+                                                Layout.alignment: Qt.AlignTop
+                                            }
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: modelData.kind === "system" ? "> " + modelData.message : modelData.message
+                                                wrapMode: Text.WrapAnywhere
+                                                color: modelData.kind === "system" ? "#71717A" : modelData.kind === "success" ? "#34D399" : modelData.kind === "metric" ? "#00F0FF" : "#D4D4D8"
+                                                font.family: "Consolas"
+                                                font.pixelSize: 11
+                                                font.italic: modelData.kind === "system"
+                                                lineHeight: 2.5
+                                                lineHeightMode: Text.ProportionalHeight
+                                                Layout.alignment: Qt.AlignTop
+                                            }
+                                        }
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                            onEntered: parent.hovered = true
+                                            onExited: parent.hovered = false
+                                        }
+                                    }
                                 }
-                                Text {
-                                    text: consoleRunning ? "..." : " "
-                                    color: "#A1A1AA"
-                                    font.family: "Consolas"
-                                    font.pixelSize: 11
 
+                                Row {
+                                    spacing: 4
+                                    Text {
+                                        text: "C:\\Users\\illia\\Companion>"
+                                        color: "#52525B"
+                                        font.family: "Consolas"
+                                        font.pixelSize: 11
+                                    }
+                                    Text {
+                                        visible: consoleRunning
+                                        text: "..."
+                                        color: "#A1A1AA"
+                                        font.family: "Consolas"
+                                        font.pixelSize: 11
+                                    }
+                                    Rectangle {
+                                        visible: !consoleRunning
+                                        width: 6
+                                        height: 12
+                                        color: "#A1A1AA"
+                                        anchors.verticalCenter: parent.verticalCenter
+
+                                        SequentialAnimation on opacity {
+                                            loops: Animation.Infinite
+                                            NumberAnimation { to: 1; duration: 500 }
+                                            NumberAnimation { to: 0; duration: 500 }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -556,6 +639,7 @@ Rectangle {
                 id: datasetScroll
                 clip: true
                 contentWidth: availableWidth
+                ScrollBar.vertical.policy: ScrollBar.AlwaysOff
                 leftPadding: 20
                 rightPadding: 20
                 topPadding: 20
@@ -581,10 +665,11 @@ Rectangle {
                                 color: parent.hovered ? "#FFFFFF" : "#00F0FF"
                                 font.pixelSize: 11
                                 font.family: "Outfit"
+                                Behavior on color { ColorAnimation { duration: 200 } }
                             }
                             MouseArea {
                                 anchors.fill: parent
-                                hoverEnabled: true
+                                hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                 onEntered: parent.hovered = true
                                 onExited: parent.hovered = false
                             }
@@ -613,6 +698,7 @@ Rectangle {
                                     color: "#050505"
                                     border.color: hovered ? "#33FFFFFF" : "#14FFFFFF"
                                     border.width: 1
+                                    Behavior on border.color { ColorAnimation { duration: 200 } }
                                     Image {
                                         anchors.fill: parent
                                         fillMode: Image.PreserveAspectCrop
@@ -620,6 +706,7 @@ Rectangle {
                                         asynchronous: true
                                         cache: false
                                         opacity: hovered ? 1.0 : 0.6
+                                        Behavior on opacity { NumberAnimation { duration: 200 } }
                                     }
                                     Rectangle {
                                         visible: hovered
@@ -652,7 +739,7 @@ Rectangle {
                                     }
                                     MouseArea {
                                         anchors.fill: parent
-                                        hoverEnabled: true
+                                        hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                         onEntered: parent.hovered = true
                                         onExited: parent.hovered = false
                                     }
@@ -710,6 +797,8 @@ Rectangle {
                         color: hovered ? "#0DFFFFFF" : "#05FFFFFF"
                         border.color: hovered ? "#4DFFFFFF" : "#1AFFFFFF"
                         border.width: 1
+                        Behavior on color { ColorAnimation { duration: 200 } }
+                        Behavior on border.color { ColorAnimation { duration: 200 } }
 
                         RowLayout {
                             anchors.centerIn: parent
@@ -718,6 +807,7 @@ Rectangle {
                             Text {
                                 text: "Add Photos or Video"
                                 color: parent.parent.hovered ? "#FFFFFF" : "#A1A1AA"
+                                Behavior on color { ColorAnimation { duration: 200 } }
                                 font.pixelSize: 13
                                 font.weight: 700
                                 font.family: "Outfit"
@@ -725,7 +815,7 @@ Rectangle {
                         }
                         MouseArea {
                             anchors.fill: parent
-                            hoverEnabled: true
+                            hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                             onEntered: parent.hovered = true
                             onExited: parent.hovered = false
                             onClicked: controller.addPhotosDialog()

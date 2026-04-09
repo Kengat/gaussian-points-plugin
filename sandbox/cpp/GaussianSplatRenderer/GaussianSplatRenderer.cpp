@@ -1947,6 +1947,84 @@ static void PanStandalonePreview(float delta_x_pixels, float delta_y_pixels) {
     }
 }
 
+static void DrawBackgroundDotGrid(int width, int height) {
+    const int spacing = 31;
+    const int cols = width / spacing + 1;
+    const int rows = height / spacing + 1;
+    if (cols <= 0 || rows <= 0) return;
+
+    // Save GL state
+    GLboolean depthEnabled, blendEnabled;
+    GLint oldProg = 0;
+    glGetBooleanv(GL_DEPTH_TEST, &depthEnabled);
+    glGetBooleanv(GL_BLEND, &blendEnabled);
+    // glUseProgram is loaded by GLEW; guard against calling before glewInit
+    if (glUseProgram) {
+        glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg);
+        glUseProgram(0);
+    }
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Orthographic screen-space projection
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, (double)width, (double)height, 0.0, -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    // Draw dot grid — opaque dots, color close to background but visible
+    // Background is #050505 (0.0196), dots are slightly brighter
+    const float cx = (float)width * 0.5f;
+    const float cy = (float)height * 0.5f;
+    const float maxR = sqrtf(cx * cx + cy * cy);
+    const float invMaxR = (maxR > 0.0f) ? (1.0f / maxR) : 0.0f;
+    const float radius = 1.8f;  // dot radius in pixels
+    const float dotBright = 0.18f;   // edge dots (~46/255)
+    const float dotDim    = 0.08f;   // center dots (~20/255)
+
+    // Precompute circle vertices (8 segments)
+    const int segs = 8;
+    float circX[segs], circY[segs];
+    for (int s = 0; s < segs; ++s) {
+        float angle = (float)s * (2.0f * 3.14159265f / (float)segs);
+        circX[s] = cosf(angle) * radius;
+        circY[s] = sinf(angle) * radius;
+    }
+
+    for (int gx = 0; gx < cols; ++gx) {
+        const float px = (float)(gx * spacing) + 0.5f;
+        const float dx = px - cx;
+        for (int gy = 0; gy < rows; ++gy) {
+            const float py = (float)(gy * spacing) + 0.5f;
+            const float dy = py - cy;
+            float dist = sqrtf(dx * dx + dy * dy) * invMaxR;
+            if (dist > 1.0f) dist = 1.0f;
+            float val = dotDim + (dotBright - dotDim) * dist;
+            glColor4f(val, val, val, 1.0f);
+            glBegin(GL_TRIANGLE_FAN);
+            glVertex2f(px, py);
+            for (int s = 0; s <= segs; ++s) {
+                glVertex2f(px + circX[s % segs], py + circY[s % segs]);
+            }
+            glEnd();
+        }
+    }
+
+    // Restore GL state
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+
+    if (depthEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (!blendEnabled) glDisable(GL_BLEND);
+    if (glUseProgram) glUseProgram(oldProg);
+}
+
 static void RenderStandalonePreviewFrame() {
     if (!InitializeStandalonePreviewContext()) {
         return;
@@ -1960,6 +2038,7 @@ static void RenderStandalonePreviewFrame() {
     glViewport(0, 0, viewport_width, viewport_height);
     glClearColor(0.0196f, 0.0196f, 0.0196f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    DrawBackgroundDotGrid(viewport_width, viewport_height);
     renderPointCloud();
     SwapBuffers(g_standalonePreview.device_context);
     wglMakeCurrent(nullptr, nullptr);

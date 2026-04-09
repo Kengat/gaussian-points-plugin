@@ -27,9 +27,13 @@ class QmlCompanionWindow(QtWidgets.QMainWindow):
         self.controller = QtStateController(self)
 
         self.setWindowTitle("Gaussian Points Studio")
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.FramelessWindowHint | QtCore.Qt.WindowType.Window
+        )
         self.resize(1600, 980)
         self.setMinimumSize(1440, 860)
         self.setStyleSheet("QMainWindow{background:#050505; color:#FAFAFA;}")
+        self._drag_pos: QtCore.QPoint | None = None
 
         root = QtWidgets.QWidget()
         self.setCentralWidget(root)
@@ -79,15 +83,32 @@ class QmlCompanionWindow(QtWidgets.QMainWindow):
         self.right_sidebar.setFixedWidth(360)
         workspace_layout.addWidget(self.right_sidebar)
 
+        # Full-window dialog overlay (sits on top of everything)
+        self.dialog_overlay = ChromeWidget(qml_dir / "DialogOverlay.qml", self.controller, self)
+        self.dialog_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.dialog_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
+        self.dialog_overlay.setClearColor(QtGui.QColor(0, 0, 0, 0))
+        self.dialog_overlay.setVisible(False)
+        self.dialog_overlay.raise_()
+
         self.controller.stateChanged.connect(self._sync_widgets)
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.timeout.connect(self.controller.refresh)
         self._refresh_timer.start(1200)
         self._sync_widgets()
 
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.dialog_overlay.setGeometry(0, 0, self.width(), self.height())
+
     def _sync_widgets(self) -> None:
         detail = (self.controller.state or {}).get("activeDetail")
         self.viewport.apply_detail(detail)
+        dialog = (self.controller.state or {}).get("dialog", {})
+        dialog_active = dialog.get("kind", "none") != "none"
+        self.dialog_overlay.setVisible(dialog_active)
+        if dialog_active:
+            self.dialog_overlay.raise_()
 
 
 def launch(plugin_root: str | None = None) -> int:

@@ -27,6 +27,7 @@ Rectangle {
                 color: modelData.active ? "#1AFF5400" : hovered ? "#19FFFFFF" : "transparent"
                 border.color: modelData.active ? "#4DFF5400" : "transparent"
                 border.width: 1
+                Behavior on color { ColorAnimation { duration: 200 } }
 
                 IconImage {
                     anchors.centerIn: parent
@@ -35,7 +36,7 @@ Rectangle {
                     iconSize: 16
                 }
 
-                HoverHandler { onHoveredChanged: parent.hovered = hovered }
+                HoverHandler { onHoveredChanged: parent.hovered = hovered; cursorShape: Qt.PointingHandCursor }
             }
         }
 
@@ -62,6 +63,7 @@ Rectangle {
                 color: hovered ? "#19FFFFFF" : "transparent"
                 border.color: "transparent"
                 border.width: 1
+                Behavior on color { ColorAnimation { duration: 200 } }
 
                 IconImage {
                     anchors.centerIn: parent
@@ -70,7 +72,7 @@ Rectangle {
                     iconSize: 16
                 }
 
-                HoverHandler { onHoveredChanged: parent.hovered = hovered }
+                HoverHandler { onHoveredChanged: parent.hovered = hovered; cursorShape: Qt.PointingHandCursor }
             }
         }
 
@@ -83,9 +85,10 @@ Rectangle {
             Layout.preferredHeight: 36
             radius: 10
             color: hovered ? "#19FFFFFF" : "transparent"
+            Behavior on color { ColorAnimation { duration: 200 } }
 
             IconImage { anchors.centerIn: parent; iconName: "settings"; tone: parent.hovered ? "white" : "muted"; iconSize: 16 }
-            HoverHandler { onHoveredChanged: parent.hovered = hovered }
+            HoverHandler { onHoveredChanged: parent.hovered = hovered; cursorShape: Qt.PointingHandCursor }
         }
     }
 }

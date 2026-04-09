@@ -7,10 +7,20 @@ Rectangle {
     border.color: "#14FFFFFF"
     border.width: 1
 
+    // Drag area for frameless window
+    MouseArea {
+        anchors.fill: parent
+        property point clickPos
+        onPressed: function(mouse) { clickPos = Qt.point(mouse.x, mouse.y); controller.startDrag(mapToGlobal(mouse.x, mouse.y).x, mapToGlobal(mouse.x, mouse.y).y) }
+        onPositionChanged: function(mouse) { if (pressed) controller.updateDrag(mapToGlobal(mouse.x, mouse.y).x, mapToGlobal(mouse.x, mouse.y).y) }
+        onReleased: controller.endDrag()
+        onDoubleClicked: controller.maximizeWindow()
+    }
+
     RowLayout {
         anchors.fill: parent
         anchors.leftMargin: 14
-        anchors.rightMargin: 12
+        anchors.rightMargin: 0
         spacing: 14
 
         RowLayout {
@@ -44,9 +54,10 @@ Rectangle {
                     font.pixelSize: 12
                     font.weight: 600
                     font.family: "Outfit"
+                    Behavior on color { ColorAnimation { duration: 200 } }
                 }
 
-                HoverHandler { onHoveredChanged: parent.hovered = hovered }
+                HoverHandler { onHoveredChanged: parent.hovered = hovered; cursorShape: Qt.PointingHandCursor }
             }
         }
 
@@ -64,8 +75,9 @@ Rectangle {
                 font.pixelSize: 12
                 font.weight: 600
                 font.family: "Outfit"
+                Behavior on color { ColorAnimation { duration: 200 } }
             }
-            HoverHandler { onHoveredChanged: parent.hovered = hovered }
+            HoverHandler { onHoveredChanged: parent.hovered = hovered; cursorShape: Qt.PointingHandCursor }
         }
 
         Rectangle {
@@ -91,7 +103,48 @@ Rectangle {
                 }
             }
 
-            HoverHandler { }
+            HoverHandler { cursorShape: Qt.PointingHandCursor }
+        }
+
+        // Window controls
+        RowLayout {
+            spacing: 0
+            Layout.alignment: Qt.AlignVCenter
+
+            Repeater {
+                model: [
+                    { action: "minimize", icon: "minus",    hoverBg: "#19FFFFFF" },
+                    { action: "maximize", icon: "maximize", hoverBg: "#19FFFFFF" },
+                    { action: "close",    icon: "x",        hoverBg: "#E81123"   }
+                ]
+                delegate: Rectangle {
+                    required property var modelData
+                    property bool hovered: false
+                    width: 46
+                    height: 32
+                    color: hovered ? modelData.hoverBg : "transparent"
+                    Behavior on color { ColorAnimation { duration: 150 } }
+
+                    IconImage {
+                        anchors.centerIn: parent
+                        iconName: modelData.icon
+                        tone: parent.hovered && modelData.action === "close" ? "white" : parent.hovered ? "white" : "muted"
+                        iconSize: 14
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                        onEntered: parent.hovered = true
+                        onExited: parent.hovered = false
+                        onClicked: {
+                            if (modelData.action === "minimize") controller.minimizeWindow()
+                            else if (modelData.action === "maximize") controller.maximizeWindow()
+                            else controller.closeWindow()
+                        }
+                    }
+                }
+            }
         }
     }
 }

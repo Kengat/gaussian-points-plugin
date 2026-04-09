@@ -203,6 +203,19 @@ def update_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
     return result
 
 
+def delete_project(project_id: str) -> bool:
+    with _LOCK:
+        state = _load_state()
+        if project_id not in state["projects"]:
+            return False
+        del state["projects"][project_id]
+        job_ids_to_remove = [jid for jid, j in state["jobs"].items() if j["project_id"] == project_id]
+        for jid in job_ids_to_remove:
+            del state["jobs"][jid]
+        _save_state(state)
+    return True
+
+
 def request_job_stop(job_id: str) -> None:
     update_job(job_id, stop_requested=1, message="Stop requested by user.")
 
