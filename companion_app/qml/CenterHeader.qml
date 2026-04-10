@@ -146,37 +146,59 @@ Rectangle {
                     }
                 }
 
-                Repeater {
-                    model: [
-                        { icon: "rotate-ccw", enabled: true, action: function() { controller.startTrainingDialog(true) } },
-                        { icon: "square", enabled: !!toolbar.canStop, action: function() { controller.stopTraining() } }
-                    ]
-                    delegate: Rectangle {
-                        required property var modelData
-                        property bool hovered: false
-                        radius: 8
-                        implicitWidth: 32
-                        implicitHeight: 32
-                        color: hovered ? "#14FFFFFF" : "transparent"
-                        opacity: modelData.enabled ? 1.0 : 0.45
-                        Behavior on color { ColorAnimation { duration: 200 } }
+                Rectangle {
+                    id: restartButton
+                    property bool hovered: false
+                    radius: 8
+                    implicitWidth: 32
+                    implicitHeight: 32
+                    color: hovered ? "#14FFFFFF" : "transparent"
+                    opacity: toolbar.canTrain ? 1.0 : 0.45
+                    Behavior on color { ColorAnimation { duration: 200 } }
 
-                        IconImage {
-                            anchors.centerIn: parent
-                            iconName: modelData.icon
-                            tone: hovered ? "white" : modelData.icon === "square" ? "rose" : "muted"
-                            iconSize: 16
-                        }
+                    IconImage {
+                        anchors.centerIn: parent
+                        iconName: "rotate-ccw"
+                        tone: restartButton.hovered ? "white" : "muted"
+                        iconSize: 16
+                    }
 
-                        MouseArea {
-                            anchors.fill: parent
-                            enabled: modelData.enabled
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onEntered: parent.hovered = true
-                            onExited: parent.hovered = false
-                            onClicked: modelData.action()
-                        }
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: !!toolbar.canTrain
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onEntered: restartButton.hovered = true
+                        onExited: restartButton.hovered = false
+                        onClicked: controller.restartTrainingDialog()
+                    }
+                }
+
+                Rectangle {
+                    id: stopButton
+                    property bool hovered: false
+                    radius: 8
+                    implicitWidth: 32
+                    implicitHeight: 32
+                    color: hovered ? "#14FFFFFF" : "transparent"
+                    opacity: toolbar.canStop ? 1.0 : 0.45
+                    Behavior on color { ColorAnimation { duration: 200 } }
+
+                    IconImage {
+                        anchors.centerIn: parent
+                        iconName: "square"
+                        tone: stopButton.hovered ? "white" : "rose"
+                        iconSize: 16
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: !!toolbar.canStop
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onEntered: stopButton.hovered = true
+                        onExited: stopButton.hovered = false
+                        onClicked: controller.stopTraining()
                     }
                 }
             }

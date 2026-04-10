@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,10 @@ MEDIA_FILE_FILTER = (
 )
 PREVIEW_HIDDEN_X = -10000
 PREVIEW_HIDDEN_Y = -10000
+QUALITY_PRESET_OPTIONS = {"compact", "balanced", "high"}
+SFM_MATCH_OPTIONS = {"auto", "exhaustive", "sequential", "spatial"}
+LIVE_STALE_SECONDS = 120
+LIVE_ASK_STOP_SECONDS = 20 * 60
 
 
 def _preview_debug(message: str) -> None:
@@ -390,11 +394,11 @@ class CompanionApi:
             self._active_project_hint = project["id"]
             return self._success("Sample project created.", state=self._build_state(project["id"]))
 
-    def start_job(self, project_id: str | None, train_steps: int | None = None) -> dict[str, Any]:
-        return self._start_project_job(project_id, force_restart=False, train_steps=train_steps)
+    def start_job(self, project_id: str | None, settings_payload: Any | None = None) -> dict[str, Any]:
+        return self._start_project_job(project_id, force_restart=False, settings_payload=settings_payload)
 
-    def restart_job(self, project_id: str | None, train_steps: int | None = None) -> dict[str, Any]:
-        return self._start_project_job(project_id, force_restart=True, train_steps=train_steps)
+    def restart_job(self, project_id: str | None, settings_payload: Any | None = None) -> dict[str, Any]:
+        return self._start_project_job(project_id, force_restart=True, settings_payload=settings_payload)
 
     def stop_job(self, project_id: str | None) -> dict[str, Any]:
         with self._lock:
@@ -441,12 +445,72 @@ class CompanionApi:
             self._preview_overlay.set_host(form, host_bounds)
             return {"ok": True}
 
+    @staticmethod
+    def _merge_training_settings(
+        base_settings: dict[str, Any],
+        payload: Any,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        settings = dict(base_settings)
+        if payload is None:
+            return settings, None
+
+        if isinstance(payload, dict):
+            if "train_steps" in payload:
+                try:
+                    requested_steps = int(payload.get("train_steps"))
+                except (TypeError, ValueError):
+                    return None, "Training steps must be a whole number."
+                if requested_steps < 200 or requested_steps > 20000:
+                    return None, "Training steps must be between 200 and 20000."
+                settings["train_steps"] = requested_steps
+
+            if "max_gaussians" in payload:
+                try:
+                    max_gaussians = int(payload.get("max_gaussians"))
+                except (TypeError, ValueError):
+                    return None, "Maximum splats must be a whole number."
+                if max_gaussians < 0 or max_gaussians > 5_000_000:
+                    return None, "Maximum splats must be between 0 and 5000000."
+                settings["max_gaussians"] = max_gaussians
+
+            if "quality_preset" in payload:
+                preset = str(payload.get("quality_preset") or "").strip().lower()
+                if preset not in QUALITY_PRESET_OPTIONS:
+                    return None, "Quality preset was not recognized."
+                settings["quality_preset"] = preset
+
+            if "train_resolution" in payload:
+                try:
+                    train_resolution = int(payload.get("train_resolution"))
+                except (TypeError, ValueError):
+                    return None, "Training resolution must be a whole number."
+                if train_resolution < 256 or train_resolution > 2048:
+                    return None, "Training resolution must be between 256 and 2048."
+                settings["train_resolution"] = train_resolution
+
+            if "sfm_match_mode" in payload:
+                sfm_match_mode = str(payload.get("sfm_match_mode") or "").strip().lower()
+                if sfm_match_mode not in SFM_MATCH_OPTIONS:
+                    return None, "SfM matching mode was not recognized."
+                settings["sfm_match_mode"] = sfm_match_mode
+
+            return settings, None
+
+        try:
+            requested_steps = int(payload)
+        except (TypeError, ValueError):
+            return None, "Training steps must be a whole number."
+        if requested_steps < 200 or requested_steps > 20000:
+            return None, "Training steps must be between 200 and 20000."
+        settings["train_steps"] = requested_steps
+        return settings, None
+
     def _start_project_job(
         self,
         project_id: str | None,
         *,
         force_restart: bool,
-        train_steps: int | None = None,
+        settings_payload: Any | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             if not project_id:
@@ -461,20 +525,16 @@ class CompanionApi:
             if existing and existing["status"] == "running":
                 return self._failure("This project already has a running job.")
 
-            settings = store.default_job_settings(force_restart=force_restart)
-            if train_steps is not None:
-                try:
-                    requested_steps = int(train_steps)
-                except (TypeError, ValueError):
-                    return self._failure("Training steps must be a whole number.")
-                if requested_steps < 200 or requested_steps > 20000:
-                    return self._failure("Training steps must be between 200 and 20000.")
-                settings["train_steps"] = requested_steps
+            settings = store.project_training_settings(project_id, force_restart=force_restart)
+            settings, error_message = self._merge_training_settings(settings, settings_payload)
+            if settings is None:
+                return self._failure(error_message or "Training settings are invalid.")
             settings["densify_stop_iter"] = min(
                 int(settings["densify_stop_iter"]),
                 max(int(settings["train_steps"]) - 1, 1),
             )
             settings["refine_scale2d_stop_iter"] = int(settings["train_steps"])
+            store.save_project_training_settings(project_id, settings)
             manifest_status = ensure_project_camera_manifests(project_id)
             job = store.create_job(project_id, settings)
             self._launch_worker(job["id"])
@@ -533,6 +593,7 @@ class CompanionApi:
             "repaired_manifests": 0,
         }
         logs_text = self._read_log_text(latest_job)
+        live_monitor = self._live_monitor_payload(latest_job, logs_text)
         preview = self._preview_payload(project, latest_job, images)
         self._sync_preview_overlay(preview)
 
@@ -553,11 +614,35 @@ class CompanionApi:
         latest_manifest_path = project.get("last_manifest_path")
         point_count = preview.get("pointCount")
         preview_fps = self._preview_overlay.preview_fps()
+        import_summary = project.get("last_import_summary") or {}
+        import_aggregate = import_summary.get("aggregate") or {}
+        training_settings = store.project_training_settings(project["id"], force_restart=False)
         properties = [
             {"label": "Source Directory", "value": project["workspace_dir"], "copyable": True},
             {"label": "Image Count", "value": f"{image_count} frames"},
             {"label": "Resolution", "value": resolution or "Unknown"},
         ]
+        if int(import_aggregate.get("source_videos") or 0) > 0:
+            properties.append({"label": "Video Sources", "value": str(int(import_aggregate["source_videos"]))})
+            properties.append(
+                {
+                    "label": "Video Keyframes",
+                    "value": (
+                        f"{int(import_aggregate.get('video_selected_frames') or 0)} kept / "
+                        f"{int(import_aggregate.get('video_candidate_frames') or 0)} candidates"
+                    ),
+                }
+            )
+            if import_aggregate.get("selected_overlap_mean") is not None:
+                properties.append(
+                    {
+                        "label": "Keyframe Overlap",
+                        "value": (
+                            f"{float(import_aggregate['selected_overlap_mean']) * 100.0:.1f}% avg, "
+                            f"{float(import_aggregate.get('selected_overlap_min') or 0.0) * 100.0:.1f}% min"
+                        ),
+                    }
+                )
         if last_loss:
             properties.append({"label": "Final Loss", "value": last_loss})
         if point_count is not None:
@@ -575,7 +660,7 @@ class CompanionApi:
             },
             "header": {
                 "title": project["name"],
-                "subtitle": f"{image_count} photos | {camera_summary} | {project['status']} | {project['workspace_dir']}",
+                "subtitle": f"{image_count} frames | {camera_summary} | {project['status']} | {project['workspace_dir']}",
             },
             "toolbar": {
                 "canAddPhotos": True,
@@ -611,6 +696,7 @@ class CompanionApi:
                 "canExport": bool(latest_manifest_path),
             },
             "preview": preview,
+            "liveMonitor": live_monitor,
             "logs": logs_text,
             "photos": [
                 {
@@ -624,6 +710,13 @@ class CompanionApi:
                 "inspectLabel": "Inspect",
                 "consoleLabel": "Console",
                 "datasetLabel": f"Dataset ({image_count})",
+            },
+            "trainingSettings": {
+                "trainSteps": int(training_settings.get("train_steps", 3000)),
+                "qualityPreset": str(training_settings.get("quality_preset", "balanced")),
+                "maxGaussians": int(training_settings.get("max_gaussians", 0)),
+                "trainResolution": int(training_settings.get("train_resolution", 640)),
+                "sfmMatchMode": str(training_settings.get("sfm_match_mode", "auto")),
             },
         }
 
@@ -771,6 +864,119 @@ class CompanionApi:
     def _extract_last_loss(self, log_text: str) -> str | None:
         matches = re.findall(r"loss=([0-9]*\.?[0-9]+)", log_text)
         return matches[-1] if matches else None
+
+    def _log_line_datetime(self, line: str) -> datetime | None:
+        if "Worker heartbeat:" in line:
+            return None
+
+        colmap_match = re.match(r"^[IWEF](\d{8})\s+(\d{2}:\d{2}:\d{2})\.", line)
+        if colmap_match:
+            try:
+                parsed = datetime.strptime(
+                    f"{colmap_match.group(1)} {colmap_match.group(2)}",
+                    "%Y%m%d %H:%M:%S",
+                )
+                return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            except ValueError:
+                return None
+
+        bracket_match = re.match(r"^\[(\d{2}:\d{2}:\d{2})\]", line)
+        if not bracket_match:
+            return None
+        try:
+            current = datetime.now().astimezone()
+            hour, minute, second = [int(part) for part in bracket_match.group(1).split(":")]
+            parsed = current.replace(hour=hour, minute=minute, second=second, microsecond=0)
+            if (parsed - current).total_seconds() > 60:
+                parsed = parsed - timedelta(days=1)
+            return parsed
+        except ValueError:
+            return None
+
+    def _latest_non_heartbeat_log_datetime(self, log_text: str) -> datetime | None:
+        for line in reversed(log_text.splitlines()):
+            stripped = line.strip()
+            if not stripped or "Worker heartbeat:" in stripped:
+                continue
+            parsed = self._log_line_datetime(stripped)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _format_monitor_elapsed(seconds: int | None) -> str:
+        if seconds is None:
+            return "unknown"
+        seconds = max(0, int(seconds))
+        minutes, seconds_part = divmod(seconds, 60)
+        hours, minutes_part = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours}h {minutes_part}m ago"
+        if minutes > 0:
+            return f"{minutes}m {seconds_part}s ago"
+        return f"{seconds_part}s ago"
+
+    def _seconds_since_iso(self, value: str | None) -> int | None:
+        parsed = self._parse_iso_datetime(value)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()))
+
+    def _live_monitor_payload(self, latest_job: dict[str, Any] | None, log_text: str) -> dict[str, Any]:
+        if not latest_job:
+            return {
+                "state": "idle",
+                "label": "REST",
+                "detail": "No active worker.",
+                "ageSeconds": None,
+                "showStopPrompt": False,
+            }
+
+        job_status = str(latest_job.get("status") or "idle")
+        if job_status not in {"queued", "running"}:
+            idle_statuses = {"completed", "stopped", "idle"}
+            label = "REST" if job_status in idle_statuses else job_status.upper()
+            return {
+                "state": "idle" if job_status in idle_statuses else job_status,
+                "label": label,
+                "detail": f"Job status: {job_status}.",
+                "ageSeconds": None,
+                "showStopPrompt": False,
+            }
+
+        activity_age = self._seconds_since_iso(str(latest_job.get("monitor_last_activity_at") or ""))
+        if activity_age is None:
+            log_activity = self._latest_non_heartbeat_log_datetime(log_text)
+            if log_activity is not None:
+                activity_age = max(0, int((datetime.now().astimezone() - log_activity).total_seconds()))
+        if activity_age is None:
+            activity_age = self._seconds_since_iso(str(latest_job.get("updated_at") or ""))
+
+        if activity_age is not None and activity_age >= LIVE_ASK_STOP_SECONDS:
+            state = "silent"
+            label = "CHECK"
+            show_stop_prompt = True
+        elif activity_age is not None and activity_age >= LIVE_STALE_SECONDS:
+            state = "stale"
+            label = "QUIET"
+            show_stop_prompt = False
+        else:
+            state = "live"
+            label = "LIVE"
+            show_stop_prompt = False
+
+        activity_kind = str(latest_job.get("monitor_last_activity_kind") or "activity")
+        return {
+            "state": state,
+            "label": label,
+            "detail": f"Last worker {activity_kind}: {self._format_monitor_elapsed(activity_age)}.",
+            "ageSeconds": activity_age,
+            "showStopPrompt": show_stop_prompt,
+            "staleAfterSeconds": LIVE_STALE_SECONDS,
+            "askStopAfterSeconds": LIVE_ASK_STOP_SECONDS,
+        }
 
     def _format_duration(self, started_at: str | None, finished_at: str | None) -> str:
         if not started_at:

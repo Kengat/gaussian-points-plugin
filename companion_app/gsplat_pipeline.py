@@ -23,7 +23,13 @@ from gsplat.strategy.base import Strategy
 from gsplat.strategy.ops import inject_noise_to_position
 
 from . import paths, store
-from .quality import compute_dataset_diagnostics, split_training_views, summarize_registered_views
+from .pipeline import load_project_import_summary
+from .quality import (
+    compute_dataset_diagnostics,
+    merge_video_import_diagnostics,
+    split_training_views,
+    summarize_registered_views,
+)
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -140,8 +146,57 @@ def _prepare_colmap_images(project: dict) -> Path:
     return prepared_dir
 
 
+def _project_is_video_derived(project: dict | None) -> bool:
+    import_summary = (project or {}).get("last_import_summary") if project else None
+    if not isinstance(import_summary, dict):
+        return False
+    aggregate = import_summary.get("aggregate")
+    if not isinstance(aggregate, dict):
+        return False
+    return int(aggregate.get("source_videos") or 0) > 0
+
+
 def _rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     return (rgb - 0.5) / SH_C0
+
+
+def _manifest_intrinsics_matrix(payload: dict[str, object], width: int, height: int) -> torch.Tensor:
+    source_width = float(payload.get("w") or width)
+    source_height = float(payload.get("h") or height)
+    scale_x = float(width) / max(source_width, 1.0)
+    scale_y = float(height) / max(source_height, 1.0)
+
+    fl_x = payload.get("fl_x")
+    fl_y = payload.get("fl_y")
+    cx = payload.get("cx")
+    cy = payload.get("cy")
+
+    focal_x = float(fl_x) * scale_x if fl_x is not None else None
+    focal_y = float(fl_y) * scale_y if fl_y is not None else None
+    principal_x = float(cx) * scale_x if cx is not None else (width * 0.5)
+    principal_y = float(cy) * scale_y if cy is not None else (height * 0.5)
+
+    if focal_x is None:
+        camera_angle_x = payload.get("camera_angle_x")
+        if camera_angle_x is not None:
+            focal_x = 0.5 * width / math.tan(0.5 * float(camera_angle_x))
+        else:
+            focal_x = float(width)
+    if focal_y is None:
+        camera_angle_y = payload.get("camera_angle_y")
+        if camera_angle_y is not None:
+            focal_y = 0.5 * height / math.tan(0.5 * float(camera_angle_y))
+        else:
+            focal_y = focal_x
+
+    return torch.tensor(
+        [
+            [focal_x, 0.0, principal_x],
+            [0.0, focal_y, principal_y],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
 
 
 def _knn_mean_distance(points: torch.Tensor, neighbors: int = 4) -> torch.Tensor:
@@ -471,15 +526,23 @@ def _resolve_rasterize_mode(settings: dict, preset: str) -> str:
     return mode
 
 
-def _resolve_sfm_match_mode(settings: dict, image_count: int) -> str:
+def _resolve_sfm_match_mode(settings: dict, image_count: int, project: dict | None = None) -> str:
     mode = str(settings.get("sfm_match_mode") or "auto").strip().lower()
     if mode not in {"auto", "exhaustive", "sequential", "spatial"}:
         mode = "auto"
     if mode == "auto":
+        import_summary = (project or {}).get("last_import_summary") if project else None
+        aggregate = (import_summary or {}).get("aggregate") if isinstance(import_summary, dict) else {}
+        if int((aggregate or {}).get("source_videos") or 0) > 0:
+            return "sequential"
         if image_count >= 48:
             return "sequential"
         return "exhaustive"
     return mode
+
+
+def _sfm_thread_count(settings: dict) -> int:
+    return max(1, min(_positive_int(settings.get("sfm_num_threads")) or 4, 4))
 
 
 def _auto_gaussian_budget(view_count: int, initial_points: int, train_resolution: int, preset: str) -> int:
@@ -531,6 +594,7 @@ def _resolve_training_profile(settings: dict, view_count: int, initial_points: i
         "strategy_name": strategy_name,
         "rasterize_mode": _resolve_rasterize_mode(settings, preset),
         "max_gaussians": int(max_gaussians),
+        "budget_schedule": str(settings.get("budget_schedule") or "staged").strip().lower(),
         "refine_start_iter": int(refine_start_iter),
         "refine_stop_iter": int(refine_stop_iter),
         "refine_every": int(refine_every),
@@ -578,6 +642,155 @@ def _resolve_training_profile(settings: dict, view_count: int, initial_points: i
         }
     )
     return profile
+
+
+def _resolve_sh_increment_interval(settings: dict, max_steps: int, sh_degree: int) -> int:
+    configured = _positive_int(settings.get("sh_increment_interval"))
+    if configured:
+        return configured
+    if sh_degree <= 0:
+        return max_steps
+    return max(250, min(1000, max_steps // 6))
+
+
+def _active_sh_degree(step: int, max_steps: int, sh_degree: int, settings: dict) -> int:
+    if sh_degree <= 0:
+        return 0
+    interval = _resolve_sh_increment_interval(settings, max_steps, sh_degree)
+    return min(sh_degree, step // max(1, interval))
+
+
+def _scheduled_gaussian_budget(
+    *,
+    step: int,
+    initial_gaussians: int,
+    target_gaussians: int,
+    refine_start_iter: int,
+    refine_stop_iter: int,
+    sh_degree_to_use: int,
+    sh_degree: int,
+    schedule: str,
+) -> int:
+    if target_gaussians <= initial_gaussians:
+        return int(target_gaussians)
+    if schedule not in {"staged", "progressive", "ramped"}:
+        return int(target_gaussians)
+
+    if step <= refine_start_iter:
+        progress = 0.0
+    elif refine_stop_iter <= refine_start_iter:
+        progress = 1.0
+    else:
+        progress = (step - refine_start_iter) / float(refine_stop_iter - refine_start_iter)
+    progress = max(0.0, min(1.0, progress))
+    progress = progress * progress * (3.0 - (2.0 * progress))
+
+    if sh_degree > 0:
+        sh_fraction = max(0.35, min(1.0, 0.40 + (0.60 * (sh_degree_to_use / float(sh_degree)))))
+        progress = min(progress, sh_fraction)
+
+    budget = initial_gaussians + int(round((target_gaussians - initial_gaussians) * progress))
+    return max(int(initial_gaussians), min(int(target_gaussians), budget))
+
+
+def _image_observation_error(image: pycolmap.Image, reconstruction: pycolmap.Reconstruction) -> float | None:
+    errors: list[float] = []
+    for point2d in image.points2D:
+        if not point2d.has_point3D():
+            continue
+        try:
+            point3d = reconstruction.points3D[point2d.point3D_id]
+        except KeyError:
+            continue
+        error = float(point3d.error)
+        if math.isfinite(error):
+            errors.append(error)
+    if not errors:
+        return None
+    return float(np.median(np.asarray(errors, dtype=np.float32)))
+
+
+def _select_registered_training_images(
+    reconstruction: pycolmap.Reconstruction,
+    *,
+    job: dict | None = None,
+) -> set[str] | None:
+    candidates = [image for image in reconstruction.images.values() if image.has_pose]
+    if len(candidates) < 8:
+        return None
+
+    point_counts = np.asarray([float(image.num_points3D) for image in candidates], dtype=np.float32)
+    if point_counts.size == 0:
+        return None
+
+    median_count = float(np.median(point_counts))
+    count_threshold = max(24.0, median_count * 0.18)
+    image_errors = [_image_observation_error(image, reconstruction) for image in candidates]
+    finite_errors = np.asarray([error for error in image_errors if error is not None], dtype=np.float32)
+    error_threshold = None
+    if finite_errors.size >= max(6, len(candidates) // 2):
+        error_threshold = max(2.5, float(np.quantile(finite_errors, 0.85)) * 1.6)
+
+    kept_names: set[str] = set()
+    removed_names: list[str] = []
+    for image, error in zip(candidates, image_errors):
+        weak_track_support = float(image.num_points3D) < count_threshold
+        weak_reprojection = (
+            error_threshold is not None
+            and error is not None
+            and error > error_threshold
+            and float(image.num_points3D) < median_count
+        )
+        if weak_track_support or weak_reprojection:
+            removed_names.append(image.name)
+            continue
+        kept_names.add(image.name)
+
+    minimum_keep = max(6, int(math.ceil(len(candidates) * 0.6)))
+    if len(kept_names) < minimum_keep or len(removed_names) == 0:
+        return None
+
+    if job is not None:
+        _log_line(
+            job,
+            f"Filtered {len(removed_names)} weak COLMAP cameras before training "
+            f"(min_points={count_threshold:.1f}, reproj_limit={error_threshold or 0.0:.2f}).",
+        )
+    return kept_names
+
+
+def _filter_sparse_seed_points(
+    points_tensor: torch.Tensor,
+    rgb_tensor: torch.Tensor,
+    point_errors: np.ndarray,
+    track_lengths: np.ndarray,
+    *,
+    job: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    total = int(len(points_tensor))
+    if total < 64 or point_errors.size != total or track_lengths.size != total:
+        return points_tensor, rgb_tensor
+
+    finite_errors = np.isfinite(point_errors)
+    if int(finite_errors.sum()) < 32:
+        return points_tensor, rgb_tensor
+
+    median_track = float(np.median(track_lengths))
+    min_track_length = 3 if median_track >= 3.0 else 2
+    error_threshold = max(1.5, float(np.quantile(point_errors[finite_errors], 0.90)))
+    keep_mask_np = finite_errors & (track_lengths >= min_track_length) & (point_errors <= error_threshold)
+    kept = int(np.count_nonzero(keep_mask_np))
+    if kept >= total or kept < max(32, int(total * 0.35)):
+        return points_tensor, rgb_tensor
+
+    keep_mask = torch.from_numpy(keep_mask_np.astype(np.bool_))
+    if job is not None:
+        _log_line(
+            job,
+            f"Filtered sparse seed points to {kept:,} / {total:,} "
+            f"(min_track_length={min_track_length}, error_limit={error_threshold:.2f}).",
+        )
+    return points_tensor[keep_mask], rgb_tensor[keep_mask]
 
 
 def _build_target_pixels(
@@ -702,28 +915,63 @@ def _evaluate_splats(
 
 
 @torch.no_grad()
+def _coordinate_outlier_keep_mask(means: torch.Tensor) -> tuple[torch.Tensor | None, dict[str, float]]:
+    if means.ndim != 2 or means.shape[0] < 1024:
+        return None, {}
+
+    center = means.median(dim=0).values
+    distances = torch.linalg.norm(means - center, dim=1)
+    q99_value = float(torch.quantile(distances, 0.99).item())
+    q995_value = float(torch.quantile(distances, 0.995).item())
+    q999_value = float(torch.quantile(distances, 0.999).item())
+    q9999_value = float(torch.quantile(distances, 0.9999).item())
+    max_value = float(distances.max().item())
+    if not all(math.isfinite(value) for value in (q99_value, q995_value, q999_value, q9999_value, max_value)):
+        return None, {}
+
+    extreme_tail_detected = (
+        q9999_value > max(q99_value * 20.0, q995_value * 8.0)
+        or max_value > max(q99_value * 50.0, q999_value * 6.0)
+    )
+    if not extreme_tail_detected:
+        return None, {
+            "q99": q99_value,
+            "q995": q995_value,
+            "q999": q999_value,
+            "q9999": q9999_value,
+            "max": max_value,
+            "threshold": 0.0,
+        }
+
+    prune_threshold = max(q99_value * 3.0, q995_value * 1.75)
+    keep_mask = distances <= prune_threshold
+    removed = int((~keep_mask).sum().item())
+    max_removed = max(1024, int(means.shape[0] * 0.02))
+    if removed > max_removed:
+        prune_threshold = float(torch.quantile(distances, 1.0 - (max_removed / float(means.shape[0]))).item())
+        keep_mask = distances <= prune_threshold
+
+    return keep_mask, {
+        "q99": q99_value,
+        "q995": q995_value,
+        "q999": q999_value,
+        "q9999": q9999_value,
+        "max": max_value,
+        "threshold": prune_threshold,
+    }
+
+
+@torch.no_grad()
 def _prune_coordinate_outliers(
     splats: torch.nn.ParameterDict,
     *,
     job: dict | None = None,
 ) -> int:
     means = splats["means"].detach()
-    if means.ndim != 2 or means.shape[0] < 1024:
+    keep_mask, stats = _coordinate_outlier_keep_mask(means)
+    if keep_mask is None:
         return 0
 
-    center = means.median(dim=0).values
-    distances = torch.linalg.norm(means - center, dim=1)
-    q99_value = float(torch.quantile(distances, 0.99).item())
-    q999_value = float(torch.quantile(distances, 0.999).item())
-    if not math.isfinite(q99_value) or not math.isfinite(q999_value):
-        return 0
-
-    extreme_tail_detected = q999_value > max(250.0, q99_value * 8.0)
-    if not extreme_tail_detected:
-        return 0
-
-    prune_threshold = max(150.0, q99_value * 3.0)
-    keep_mask = distances <= prune_threshold
     removed = int((~keep_mask).sum().item())
     if removed <= 0:
         return 0
@@ -737,7 +985,9 @@ def _prune_coordinate_outliers(
         _log_line(
             job,
             f"Pruned {removed:,} coordinate outlier splats after training "
-            f"(q99={q99_value:.2f}, q999={q999_value:.2f}, threshold={prune_threshold:.2f}).",
+            f"(q99={stats['q99']:.2f}, q995={stats['q995']:.2f}, "
+            f"q999={stats['q999']:.2f}, q9999={stats['q9999']:.2f}, "
+            f"max={stats['max']:.2f}, threshold={stats['threshold']:.2f}).",
         )
     return removed
 
@@ -1159,8 +1409,11 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
     colmap_dir = paths.project_colmap_scratch_dir(project["id"])
     database_path = colmap_dir / "database.db"
     sparse_dir = colmap_dir / "sparse"
+    video_derived = _project_is_video_derived(project)
+    quality_preset = _normalize_quality_preset(settings)
 
-    if settings.get("force_restart"):
+    preserve_sfm_cache = bool(settings.get("preserve_sfm_cache"))
+    if settings.get("force_restart") and not preserve_sfm_cache:
         if colmap_dir.exists():
             shutil.rmtree(colmap_dir)
         colmap_dir.mkdir(parents=True, exist_ok=True)
@@ -1180,23 +1433,50 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
     _log_line(job, f"COLMAP scratch workspace: {colmap_dir}")
     _log_line(job, f"Prepared {len(image_paths)} normalized images for SfM.")
 
+    sfm_threads = _sfm_thread_count(settings)
     _update(job["id"], "COLMAP", 0.08, "Extracting image features.")
     extraction_options = pycolmap.FeatureExtractionOptions()
-    extraction_options.max_image_size = int(settings.get("sfm_max_image_size", 1600))
-    extraction_options.num_threads = int(settings.get("sfm_num_threads", 6))
+    requested_sfm_image_size = int(settings.get("sfm_max_image_size", 1280))
+    if video_derived and len(image_paths) >= 96 and requested_sfm_image_size > 1280:
+        _log_line(
+            job,
+            f"Capping SfM image size from {requested_sfm_image_size} to 1280 for long video matching safety.",
+        )
+        requested_sfm_image_size = 1280
+    extraction_options.max_image_size = requested_sfm_image_size
+    extraction_options.num_threads = sfm_threads
     extraction_options.use_gpu = False
+    if video_derived or quality_preset == "high":
+        default_feature_cap = 8_000 if video_derived and len(image_paths) >= 96 else 12_000 if video_derived else 10_000
+        extraction_options.sift.max_num_features = int(settings.get("sfm_max_num_features", default_feature_cap))
+        extraction_options.sift.domain_size_pooling = True
+    if video_derived:
+        extraction_options.sift.darkness_adaptivity = True
 
     matching_options = pycolmap.FeatureMatchingOptions()
-    matching_options.num_threads = int(settings.get("sfm_num_threads", 6))
+    matching_options.num_threads = sfm_threads
     matching_options.use_gpu = False
     matching_options.guided_matching = True
+    if video_derived:
+        matching_options.max_num_matches = int(settings.get("sfm_max_num_matches", 32_768))
 
     mapping_options = pycolmap.IncrementalPipelineOptions()
     mapping_options.min_model_size = 3
     mapping_options.extract_colors = True
-    mapping_options.num_threads = int(settings.get("sfm_num_threads", 6))
+    mapping_options.num_threads = sfm_threads
 
-    match_mode = _resolve_sfm_match_mode(settings, len(image_paths))
+    match_mode = _resolve_sfm_match_mode(settings, len(image_paths), project)
+
+    _log_line(
+        job,
+        "COLMAP feature setup "
+        f"max_image_size={extraction_options.max_image_size} "
+        f"max_features={extraction_options.sift.max_num_features} "
+        f"max_matches={matching_options.max_num_matches} "
+        f"threads={sfm_threads} "
+        f"dsp={'on' if extraction_options.sift.domain_size_pooling else 'off'} "
+        f"video={'yes' if video_derived else 'no'}",
+    )
 
     pycolmap.extract_features(database_path, image_dir, extraction_options=extraction_options)
     if _should_stop(job["id"]):
@@ -1205,7 +1485,17 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
 
     _update(job["id"], "COLMAP", 0.14, f"Matching image features with {match_mode} mode.")
     if match_mode == "sequential":
-        pycolmap.match_sequential(database_path, matching_options=matching_options)
+        pairing_options = pycolmap.SequentialPairingOptions()
+        default_overlap = 5 if video_derived and len(image_paths) >= 96 else 8 if video_derived else 10
+        pairing_options.overlap = int(settings.get("sfm_sequential_overlap", default_overlap))
+        pairing_options.quadratic_overlap = bool(settings.get("sfm_quadratic_overlap", not video_derived))
+        _log_line(
+            job,
+            "COLMAP sequential matching setup "
+            f"overlap={pairing_options.overlap} "
+            f"quadratic_overlap={'on' if pairing_options.quadratic_overlap else 'off'}",
+        )
+        pycolmap.match_sequential(database_path, matching_options=matching_options, pairing_options=pairing_options)
     elif match_mode == "spatial":
         pycolmap.match_spatial(database_path, matching_options=matching_options)
     else:
@@ -1233,9 +1523,12 @@ def _load_training_views(project: dict, reconstruction: pycolmap.Reconstruction,
 
     image_dir = Path(project["input_dir"])
     target_resolution = int(settings.get("train_resolution", 640))
+    selected_image_names = _select_registered_training_images(reconstruction)
     views: list[TrainingView] = []
 
     for image in reconstruction.images.values():
+        if selected_image_names is not None and image.name not in selected_image_names:
+            continue
         image_path = image_dir / image.name
         if not image_path.exists() or not image.has_pose:
             continue
@@ -1286,16 +1579,7 @@ def _load_training_views_from_transforms(
         if not image_path.exists():
             continue
         rgb_pixels, alpha_pixels, width, height, _scale, has_alpha = _load_image_tensor(image_path, target_resolution)
-        camera_angle_x = float(payload["camera_angle_x"])
-        focal = 0.5 * width / math.tan(0.5 * camera_angle_x)
-        K = torch.tensor(
-            [
-                [focal, 0.0, width * 0.5],
-                [0.0, focal, height * 0.5],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=torch.float32,
-        )
+        K = _manifest_intrinsics_matrix(payload, width, height)
 
         views.append(
             TrainingView(
@@ -1354,11 +1638,22 @@ def _train_gaussians(
             raise RuntimeError("Sparse reconstruction is required when known-camera initialization is unavailable.")
         points = []
         colors = []
+        point_errors = []
+        track_lengths = []
         for point in reconstruction.points3D.values():
             points.append(point.xyz)
             colors.append([channel / 255.0 for channel in point.color])
+            point_errors.append(float(point.error) if math.isfinite(float(point.error)) else float("inf"))
+            track_lengths.append(int(point.track.length()))
         points_tensor = torch.from_numpy(np.asarray(points, dtype=np.float32))
         rgb_tensor = torch.from_numpy(np.asarray(colors, dtype=np.float32))
+        points_tensor, rgb_tensor = _filter_sparse_seed_points(
+            points_tensor,
+            rgb_tensor,
+            np.asarray(point_errors, dtype=np.float32),
+            np.asarray(track_lengths, dtype=np.int32),
+            job=job,
+        )
         filtered_points, filtered_colors = _filter_sparse_points_with_masks(
             points_tensor,
             rgb_tensor,
@@ -1409,6 +1704,7 @@ def _train_gaussians(
     rasterize_mode = str(training_profile["rasterize_mode"])
     strategy_name = str(training_profile["strategy_name"])
     target_gaussian_budget = int(training_profile["max_gaussians"])
+    budget_schedule = str(training_profile.get("budget_schedule") or "staged")
     if strategy_name == "mcmc":
         torch_extensions_dir = _ensure_torch_extensions_dir()
         _log_line(job, f"Using torch extensions cache at {torch_extensions_dir}")
@@ -1495,6 +1791,7 @@ def _train_gaussians(
         f"preset={training_profile['preset']} strategy={strategy_name} "
         f"runtime={mcmc_runtime_mode if strategy_name == 'mcmc' else 'default'} "
         f"budget={target_gaussian_budget:,} init={initial_gaussian_count:,} "
+        f"budget_schedule={budget_schedule} "
         f"refine={training_profile['refine_start_iter']}..{training_profile['refine_stop_iter']} "
         f"every={training_profile['refine_every']} rasterize={rasterize_mode} "
         f"train_views={len(train_views)} val_views={len(validation_views)} "
@@ -1513,19 +1810,39 @@ def _train_gaussians(
     exposure_regularization = float(settings.get("exposure_regularization", 1.0e-3))
     random_background = bool(settings.get("random_background", True))
     budget_pause_logged = False
+    budget_resume_logged = False
+    train_view_order = list(range(len(train_views)))
+    random.shuffle(train_view_order)
+    train_view_cursor = 0
 
     for step in range(max_steps):
         if _should_stop(job["id"]):
             raise RuntimeError("Stopped during Gaussian Splat training.")
 
-        view = random.choice(train_views)
+        if train_view_cursor >= len(train_view_order):
+            random.shuffle(train_view_order)
+            train_view_cursor = 0
+        view = train_views[train_view_order[train_view_cursor]]
+        train_view_cursor += 1
         _target_rgb, target_alpha, backgrounds, pixels = _build_target_pixels(
             view,
             device,
             random_background=random_background,
         )
 
-        sh_degree_to_use = min(sh_degree, step // max(1, max_steps // max(1, sh_degree + 1)))
+        sh_degree_to_use = _active_sh_degree(step, max_steps, sh_degree, settings)
+        current_budget_cap = _scheduled_gaussian_budget(
+            step=step,
+            initial_gaussians=initial_gaussian_count,
+            target_gaussians=target_gaussian_budget,
+            refine_start_iter=int(training_profile["refine_start_iter"]),
+            refine_stop_iter=int(training_profile["refine_stop_iter"]),
+            sh_degree_to_use=sh_degree_to_use,
+            sh_degree=sh_degree,
+            schedule=budget_schedule,
+        )
+        if strategy_name == "mcmc":
+            strategy.cap_max = current_budget_cap
         colors_pred, alpha_pred, info = _render_view(
             splats,
             view,
@@ -1537,13 +1854,16 @@ def _train_gaussians(
         )
         colors_pred = _apply_exposure_compensation(colors_pred, view, exposure_params)
 
-        budget_paused = strategy_name == "default" and len(splats["means"]) >= target_gaussian_budget
+        budget_paused = strategy_name == "default" and len(splats["means"]) >= current_budget_cap
         if budget_paused and not budget_pause_logged:
             budget_pause_logged = True
             _log_line(
                 job,
-                f"Reached gaussian budget at step {step + 1}; pausing further densification at {len(splats['means']):,} splats.",
+                f"Reached scheduled gaussian budget at step {step + 1}; pausing densification at {len(splats['means']):,}/{current_budget_cap:,} splats.",
             )
+        elif not budget_paused and budget_pause_logged and not budget_resume_logged:
+            budget_resume_logged = True
+            _log_line(job, f"Scheduled gaussian budget opened again at step {step + 1}; cap={current_budget_cap:,}.")
 
         if strategy_name == "default" and not budget_paused:
             strategy.step_pre_backward(
@@ -1611,11 +1931,11 @@ def _train_gaussians(
                 job["id"],
                 "Training",
                 progress,
-                f"Training step {step + 1}/{max_steps} | loss={loss_value:.4f} | l1={l1_value:.4f} | ssim={ssim_value:.4f} | gaussians={len(splats['means'])}",
+                f"Training step {step + 1}/{max_steps} | loss={loss_value:.4f} | l1={l1_value:.4f} | ssim={ssim_value:.4f} | gaussians={len(splats['means'])}/{current_budget_cap}",
             )
             _log_line(
                 job,
-                f"Train step {step + 1}/{max_steps}: loss={loss_value:.5f}, l1={l1_value:.5f}, ssim={ssim_value:.5f}, sh_degree={sh_degree_to_use}, gaussians={len(splats['means'])}",
+                f"Train step {step + 1}/{max_steps}: loss={loss_value:.5f}, l1={l1_value:.5f}, ssim={ssim_value:.5f}, sh_degree={sh_degree_to_use}, gaussians={len(splats['means'])}, budget_cap={current_budget_cap}",
             )
 
     pruned_outliers = _prune_coordinate_outliers(splats, job=job)
@@ -1762,6 +2082,10 @@ def _export_handoff(
 def run_gsplat_job(project: dict, job: dict, settings: dict) -> dict:
     dataset_images = _list_project_images(project["id"])
     dataset_diagnostics = compute_dataset_diagnostics(dataset_images)
+    dataset_diagnostics = merge_video_import_diagnostics(
+        dataset_diagnostics,
+        load_project_import_summary(project["id"]) or project.get("last_import_summary"),
+    )
     _log_line(
         job,
         "Dataset diagnostics "
@@ -1770,6 +2094,13 @@ def run_gsplat_job(project: dict, job: dict, settings: dict) -> dict:
         f"brightness_std={dataset_diagnostics['brightness_std']:.5f} "
         f"duplicates={dataset_diagnostics['duplicate_like_pairs']}",
     )
+    if dataset_diagnostics.get("selected_overlap_mean") is not None:
+        _log_line(
+            job,
+            "Video import overlap "
+            f"mean={float(dataset_diagnostics['selected_overlap_mean']):.3f} "
+            f"min={float(dataset_diagnostics.get('selected_overlap_min') or 0.0):.3f}",
+        )
     for warning in dataset_diagnostics.get("warnings", []):
         _log_line(job, f"Dataset warning: {warning}")
 

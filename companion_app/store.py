@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,9 @@ from . import paths
 
 
 _LOCK = threading.RLock()
+_FILE_LOCK_DEPTH = threading.local()
+_STORE_READ_RETRIES = 6
+_STORE_READ_RETRY_DELAY_SECONDS = 0.035
 
 
 def utc_now() -> str:
@@ -26,11 +32,78 @@ def _default_state() -> dict[str, Any]:
     return {"projects": {}, "jobs": {}}
 
 
+@contextmanager
+def _state_file_lock():
+    depth = int(getattr(_FILE_LOCK_DEPTH, "value", 0))
+    if depth > 0:
+        _FILE_LOCK_DEPTH.value = depth + 1
+        try:
+            yield
+        finally:
+            _FILE_LOCK_DEPTH.value = depth
+        return
+
+    lock_path = _store_path().with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:  # pragma: no cover - developer convenience outside Windows.
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+        _FILE_LOCK_DEPTH.value = 1
+        try:
+            yield
+        finally:
+            _FILE_LOCK_DEPTH.value = 0
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:  # pragma: no cover - developer convenience outside Windows.
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+@contextmanager
+def _state_lock():
+    with _LOCK:
+        with _state_file_lock():
+            yield
+
+
 def _read_state_file() -> dict[str, Any]:
     path = _store_path()
     if not path.exists():
         return _default_state()
-    return json.loads(path.read_text(encoding="utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(_STORE_READ_RETRIES):
+        try:
+            raw_state = path.read_text(encoding="utf-8")
+            if not raw_state.strip():
+                raise json.JSONDecodeError("Empty state file", raw_state, 0)
+            return json.loads(raw_state)
+        except (OSError, json.JSONDecodeError) as error:
+            last_error = error
+            if attempt + 1 >= _STORE_READ_RETRIES:
+                break
+            time.sleep(_STORE_READ_RETRY_DELAY_SECONDS * (attempt + 1))
+    raise RuntimeError(f"Companion state file is temporarily unreadable: {last_error}") from last_error
 
 
 def _pid_exists(pid: Any) -> bool:
@@ -127,11 +200,25 @@ def _load_state() -> dict[str, Any]:
 def _save_state(state: dict[str, Any]) -> None:
     path = _store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    payload = json.dumps(state, indent=2)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except PermissionError:
+        # Some sandboxes and overly eager filesystem guards deny atomic renames.
+        # The interprocess state lock still prevents companion readers from
+        # observing a half-written file, so fall back to a guarded direct write.
+        path.write_text(payload, encoding="utf-8")
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
 
 def init_db() -> None:
-    with _LOCK:
+    with _state_lock():
         if not _store_path().exists():
             _save_state(_default_state())
 
@@ -153,11 +240,12 @@ def create_project(name: str, backend: str = "gsplat_colmap", note: str | None =
         "result_dir": str(paths.project_result_dir(project_id)),
         "last_result_ply": None,
         "last_manifest_path": None,
+        "last_import_summary": None,
         "last_training_summary": None,
         "training_settings": initial_training_settings,
         "note": note,
     }
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         state["projects"][project_id] = payload
         _save_state(state)
@@ -165,21 +253,21 @@ def create_project(name: str, backend: str = "gsplat_colmap", note: str | None =
 
 
 def list_projects() -> list[dict[str, Any]]:
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         projects = list(state["projects"].values())
     return sorted(projects, key=lambda item: (item["updated_at"], item["created_at"]), reverse=True)
 
 
 def get_project(project_id: str) -> dict[str, Any] | None:
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         project = state["projects"].get(project_id)
     return dict(project) if project else None
 
 
 def update_project(project_id: str, **updates: Any) -> dict[str, Any] | None:
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         project = state["projects"].get(project_id)
         if not project:
@@ -199,11 +287,13 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "rasterize_mode": "auto",
         "sfm_match_mode": "auto",
         "max_gaussians": 0,
+        "budget_schedule": "staged",
         "train_steps": 3000,
         "train_resolution": 640,
         "validation_fraction": 0.18,
         "min_validation_views": 2,
         "sh_degree": 3,
+        "sh_increment_interval": 0,
         "init_opacity": 0.10,
         "lambda_dssim": 0.20,
         "means_lr": 1.6e-4,
@@ -212,8 +302,9 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "quats_lr": 1.0e-3,
         "sh0_lr": 2.5e-3,
         "shN_lr": 1.25e-4,
-        "sfm_max_image_size": 1600,
-        "sfm_num_threads": 6,
+        "sfm_max_image_size": 1280,
+        "sfm_num_threads": 4,
+        "preserve_sfm_cache": False,
         "densify_start_iter": 0,
         "densify_stop_iter": 0,
         "densify_interval": 0,
@@ -250,7 +341,7 @@ def sanitize_training_settings(settings: dict[str, Any] | None) -> dict[str, Any
     sanitized: dict[str, Any] = {}
     source = settings or {}
     for key, default_value in defaults.items():
-        if key == "force_restart":
+        if key in {"force_restart", "preserve_sfm_cache"}:
             continue
         sanitized[key] = source.get(key, default_value)
     return sanitized
@@ -293,7 +384,7 @@ def create_job(project_id: str, settings: dict[str, Any]) -> dict[str, Any]:
         "finished_at": None,
         "updated_at": now,
     }
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         state["jobs"][job_id] = payload
         _save_state(state)
@@ -306,14 +397,14 @@ def create_job(project_id: str, settings: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         job = state["jobs"].get(job_id)
     return dict(job) if job else None
 
 
 def list_jobs(project_id: str) -> list[dict[str, Any]]:
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         jobs = [dict(job) for job in state["jobs"].values() if job["project_id"] == project_id]
     return sorted(jobs, key=lambda item: item["created_at"], reverse=True)
@@ -325,7 +416,7 @@ def latest_job(project_id: str) -> dict[str, Any] | None:
 
 
 def update_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         job = state["jobs"].get(job_id)
         if not job:
@@ -342,7 +433,7 @@ def update_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
 
 
 def delete_project(project_id: str) -> bool:
-    with _LOCK:
+    with _state_lock():
         state = _load_state()
         if project_id not in state["projects"]:
             return False
@@ -355,7 +446,7 @@ def delete_project(project_id: str) -> bool:
 
 
 def request_job_stop(job_id: str) -> None:
-    with _LOCK:
+    with _state_lock():
         state = _read_state_file()
         job = state["jobs"].get(job_id)
         if not job:

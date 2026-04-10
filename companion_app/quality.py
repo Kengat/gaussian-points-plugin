@@ -146,6 +146,44 @@ def summarize_registered_views(diagnostics: dict[str, Any], registered_views: in
     return updated
 
 
+def merge_video_import_diagnostics(
+    diagnostics: dict[str, Any],
+    import_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not import_summary:
+        return diagnostics
+
+    aggregate = import_summary.get("aggregate") or {}
+    source_videos = int(aggregate.get("source_videos") or 0)
+    if source_videos <= 0:
+        return diagnostics
+
+    updated = dict(diagnostics)
+    warnings = list(updated.get("warnings") or [])
+    updated["source_videos"] = source_videos
+    updated["video_candidate_frames"] = int(aggregate.get("video_candidate_frames") or 0)
+    updated["video_selected_frames"] = int(aggregate.get("video_selected_frames") or 0)
+    updated["video_rejected_frames"] = int(aggregate.get("video_rejected_frames") or 0)
+    updated["video_bridge_inserts"] = int(aggregate.get("video_bridge_inserts") or 0)
+
+    overlap_mean = aggregate.get("selected_overlap_mean")
+    overlap_min = aggregate.get("selected_overlap_min")
+    if overlap_mean is not None:
+        updated["selected_overlap_mean"] = round(float(overlap_mean), 5)
+    if overlap_min is not None:
+        updated["selected_overlap_min"] = round(float(overlap_min), 5)
+
+    if overlap_min is not None and float(overlap_min) < 0.18:
+        warnings.append("Video keyframes have weak geometric overlap in some spans; COLMAP registration may drop views.")
+    if overlap_mean is not None and float(overlap_mean) < 0.28:
+        warnings.append("Average overlap between selected video keyframes is modest; denser bridging frames may help.")
+    if int(aggregate.get("video_rejected_frames") or 0) > max(20, int(aggregate.get("video_selected_frames") or 0)):
+        warnings.append("Video import discarded many candidate frames, which usually indicates blur, cuts, or repeated views.")
+
+    updated["warnings"] = warnings
+    return updated
+
+
 def split_training_views(
     views: Sequence[Any],
     validation_fraction: float,

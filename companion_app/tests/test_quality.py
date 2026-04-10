@@ -6,8 +6,17 @@ from pathlib import Path
 import uuid
 
 from PIL import Image
+import torch
 
-from companion_app.gsplat_pipeline import _resolve_rasterize_mode, _resolve_sfm_match_mode
+from companion_app.gsplat_pipeline import (
+    _active_sh_degree,
+    _coordinate_outlier_keep_mask,
+    _manifest_intrinsics_matrix,
+    _resolve_rasterize_mode,
+    _resolve_sfm_match_mode,
+    _scheduled_gaussian_budget,
+    _sfm_thread_count,
+)
 from companion_app.quality import compute_dataset_diagnostics, split_training_views
 
 
@@ -33,6 +42,76 @@ class TrainingQualityTest(unittest.TestCase):
         self.assertEqual("exhaustive", _resolve_sfm_match_mode({"sfm_match_mode": "auto"}, 22))
         self.assertEqual("sequential", _resolve_sfm_match_mode({"sfm_match_mode": "auto"}, 64))
         self.assertEqual("spatial", _resolve_sfm_match_mode({"sfm_match_mode": "spatial"}, 64))
+
+    def test_sfm_threads_are_capped_for_laptop_safety(self) -> None:
+        self.assertEqual(4, _sfm_thread_count({"sfm_num_threads": 12}))
+        self.assertEqual(2, _sfm_thread_count({"sfm_num_threads": 2}))
+
+    def test_sh_degree_reaches_full_before_late_refinement(self) -> None:
+        self.assertEqual(0, _active_sh_degree(999, 6000, 3, {}))
+        self.assertEqual(1, _active_sh_degree(1000, 6000, 3, {}))
+        self.assertEqual(2, _active_sh_degree(2500, 6000, 3, {}))
+        self.assertEqual(3, _active_sh_degree(3000, 6000, 3, {}))
+
+    def test_staged_budget_reserves_splats_for_later_training(self) -> None:
+        early_cap = _scheduled_gaussian_budget(
+            step=3300,
+            initial_gaussians=98_383,
+            target_gaussians=1_200_000,
+            refine_start_iter=720,
+            refine_stop_iter=5400,
+            sh_degree_to_use=3,
+            sh_degree=3,
+            schedule="staged",
+        )
+        final_cap = _scheduled_gaussian_budget(
+            step=5400,
+            initial_gaussians=98_383,
+            target_gaussians=1_200_000,
+            refine_start_iter=720,
+            refine_stop_iter=5400,
+            sh_degree_to_use=3,
+            sh_degree=3,
+            schedule="staged",
+        )
+
+        self.assertLess(early_cap, 850_000)
+        self.assertEqual(1_200_000, final_cap)
+
+    def test_coordinate_outlier_mask_catches_tiny_extreme_tail(self) -> None:
+        generator = torch.Generator().manual_seed(7)
+        core = torch.randn((20_000, 3), generator=generator) * 2.0
+        outliers = torch.tensor(
+            [
+                [120_000.0, 0.0, 0.0],
+                [-160_000.0, 20.0, 0.0],
+                [0.0, 140_000.0, -220_000.0],
+            ],
+            dtype=torch.float32,
+        )
+        keep_mask, stats = _coordinate_outlier_keep_mask(torch.cat([core, outliers], dim=0))
+
+        self.assertIsNotNone(keep_mask)
+        self.assertEqual(3, int((~keep_mask).sum().item()))
+        self.assertGreater(stats["max"], stats["q99"] * 50.0)
+
+    def test_manifest_intrinsics_rescale_full_resolution_parameters(self) -> None:
+        K = _manifest_intrinsics_matrix(
+            {
+                "fl_x": 1200.0,
+                "fl_y": 1000.0,
+                "cx": 540.0,
+                "cy": 960.0,
+                "w": 1080,
+                "h": 1920,
+            },
+            135,
+            240,
+        )
+        self.assertAlmostEqual(150.0, float(K[0, 0].item()))
+        self.assertAlmostEqual(125.0, float(K[1, 1].item()))
+        self.assertAlmostEqual(67.5, float(K[0, 2].item()))
+        self.assertAlmostEqual(120.0, float(K[1, 2].item()))
 
     def test_dataset_diagnostics_detect_duplicates_and_low_sharpness(self) -> None:
         temp_dir = Path("companion_app") / "tests" / f"_tmp_quality_{uuid.uuid4().hex}"

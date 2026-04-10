@@ -217,34 +217,82 @@
       );
     };
 
-    const TrainingStepsModal = ({ open, value, onChange, onCancel, onConfirm, restartMode, valid }) => {
+    const TrainingSetupModal = ({ open, form, onChange, onCancel, onConfirm, restartMode, valid }) => {
       if (!open) return null;
       return (
         <div className="absolute inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-md">
-          <div className="w-[440px] rounded-2xl border border-white/10 bg-[#101016] p-6 shadow-[0_24px_80px_rgba(0,0,0,0.6)]">
+          <div className="w-[520px] rounded-2xl border border-white/10 bg-[#101016] p-6 shadow-[0_24px_80px_rgba(0,0,0,0.6)]">
             <div className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-3">
               {restartMode ? 'Restart Training' : 'Training Setup'}
             </div>
             <div className="text-2xl font-semibold text-white tracking-tight mb-3">
-              {restartMode ? 'Restart with custom steps' : 'Choose training steps'}
+              {restartMode ? 'Restart with custom limits' : 'Choose training settings'}
             </div>
             <p className="text-sm text-zinc-400 leading-relaxed mb-5">
-              Set how many optimization steps this run should use. The current pipeline supports values from 200 to 20000.
+              Tune the main quality knobs before launch. Leave maximum splats at 0 to keep the automatic budget.
             </p>
-            <input
-              autoFocus
-              value={value}
-              onChange={(event) => onChange(event.target.value.replace(/[^\d]/g, ''))}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  onConfirm();
-                }
-              }}
-              placeholder="3000"
-              className="w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-white outline-none focus:border-[#FF5400]/40"
-            />
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Training Steps</div>
+                <input
+                  autoFocus
+                  value={form.trainSteps}
+                  onChange={(event) => onChange('trainSteps', event.target.value.replace(/[^\d]/g, ''))}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && valid) {
+                      onConfirm();
+                    }
+                  }}
+                  placeholder="3000"
+                  className="w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-white outline-none focus:border-[#FF5400]/40"
+                />
+              </div>
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Max Splats</div>
+                <input
+                  value={form.maxGaussians}
+                  onChange={(event) => onChange('maxGaussians', event.target.value.replace(/[^\d]/g, ''))}
+                  placeholder="0"
+                  className="w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-white outline-none focus:border-[#FF5400]/40"
+                />
+              </div>
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Quality Preset</div>
+                <select
+                  value={form.qualityPreset}
+                  onChange={(event) => onChange('qualityPreset', event.target.value)}
+                  className="w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-white outline-none focus:border-[#FF5400]/40"
+                >
+                  <option value="compact">Compact</option>
+                  <option value="balanced">Balanced</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+              <div>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Train Resolution</div>
+                <input
+                  value={form.trainResolution}
+                  onChange={(event) => onChange('trainResolution', event.target.value.replace(/[^\d]/g, ''))}
+                  placeholder="640"
+                  className="w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-white outline-none focus:border-[#FF5400]/40"
+                />
+              </div>
+              <div className="col-span-2">
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">SfM Matching</div>
+                <select
+                  value={form.sfmMatchMode}
+                  onChange={(event) => onChange('sfmMatchMode', event.target.value)}
+                  className="w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-white outline-none focus:border-[#FF5400]/40"
+                >
+                  <option value="auto">Auto</option>
+                  <option value="exhaustive">Exhaustive</option>
+                  <option value="sequential">Sequential</option>
+                  <option value="spatial">Spatial</option>
+                </select>
+              </div>
+            </div>
             <div className={`mt-3 text-xs ${valid ? 'text-zinc-500' : 'text-rose-400'}`}>
-              {valid ? 'Default recommendation: 3000 steps' : 'Enter a whole number from 200 to 20000.'}
+              {valid ? 'Recommended starting point for video: Balanced, 768-960 resolution, max splats 800000-1200000.' : 'Check the numeric fields: steps 200-20000, max splats 0-5000000, train resolution 256-2048.'}
             </div>
             <div className="mt-5 flex justify-end gap-3">
               <button onClick={onCancel} className="px-4 py-2.5 rounded-xl border border-white/10 bg-white/[0.03] text-sm font-semibold text-zinc-200 hover:bg-white/[0.06]">
@@ -260,13 +308,20 @@
     };
 
     const App = () => {
+      const emptyTrainingForm = {
+        trainSteps: '3000',
+        maxGaussians: '0',
+        qualityPreset: 'balanced',
+        trainResolution: '640',
+        sfmMatchMode: 'auto'
+      };
       const [appState, setAppState] = useState(null);
       const [activeProjectId, setActiveProjectId] = useState(null);
       const [activeTab, setActiveTab] = useState('overview');
       const [newProjectOpen, setNewProjectOpen] = useState(false);
       const [newProjectName, setNewProjectName] = useState('');
       const [trainingModalOpen, setTrainingModalOpen] = useState(false);
-      const [trainingSteps, setTrainingSteps] = useState('3000');
+      const [trainingForm, setTrainingForm] = useState(emptyTrainingForm);
       const [trainingRestartMode, setTrainingRestartMode] = useState(false);
       const logsEndRef = useRef(null);
       const previewHostRef = useRef(null);
@@ -280,6 +335,48 @@
       const liveLoss = activeDetail?.statusPanel?.finalLoss || '0.02583';
       const elapsedTime = activeDetail?.statusPanel?.timeTotal || '01h 42m';
       const previewHasScene = Boolean(activeDetail?.preview?.hasScene);
+      const liveMonitor = activeDetail?.liveMonitor || { state: 'idle', label: 'REST', detail: 'No active worker.', showStopPrompt: false };
+      const liveStyles = {
+        live: {
+          text: 'text-emerald-400',
+          border: 'border-emerald-500/20',
+          dot: 'bg-emerald-400 shadow-[0_0_6px_#34d399]',
+          panel: 'bg-emerald-500/10'
+        },
+        stale: {
+          text: 'text-amber-300',
+          border: 'border-amber-400/25',
+          dot: 'bg-amber-300 shadow-[0_0_6px_#fbbf24]',
+          panel: 'bg-amber-400/10'
+        },
+        silent: {
+          text: 'text-rose-400',
+          border: 'border-rose-500/30',
+          dot: 'bg-rose-400 shadow-[0_0_7px_#fb7185]',
+          panel: 'bg-rose-500/10'
+        },
+        failed: {
+          text: 'text-rose-400',
+          border: 'border-rose-500/30',
+          dot: 'bg-rose-400 shadow-[0_0_7px_#fb7185]',
+          panel: 'bg-rose-500/10'
+        },
+        idle: {
+          text: 'text-zinc-200',
+          border: 'border-white/15',
+          dot: 'bg-zinc-300 shadow-[0_0_6px_#e4e4e7]',
+          panel: 'bg-white/[0.045]'
+        }
+      };
+      const liveStyle = liveStyles[liveMonitor.state] || liveStyles.idle;
+      const liveLabelFallbacks = {
+        idle: 'REST',
+        stale: 'QUIET',
+        silent: 'CHECK',
+        failed: 'FAILED',
+        live: 'LIVE'
+      };
+      const liveLabel = liveMonitor.label || liveLabelFallbacks[liveMonitor.state] || 'REST';
 
       const refresh = async (projectId = activeProjectId) => {
         if (!pyApi()) return;
@@ -356,20 +453,47 @@
 
       const openTrainingModal = (restartMode = false) => {
         if (!activeProjectId) return;
+        const defaults = activeDetail?.trainingSettings || {};
         setTrainingRestartMode(restartMode);
-        setTrainingSteps('3000');
+        setTrainingForm({
+          trainSteps: String(defaults.trainSteps || 3000),
+          maxGaussians: String(defaults.maxGaussians || 0),
+          qualityPreset: defaults.qualityPreset || 'balanced',
+          trainResolution: String(defaults.trainResolution || 640),
+          sfmMatchMode: defaults.sfmMatchMode || 'auto'
+        });
         setTrainingModalOpen(true);
+      };
+
+      const updateTrainingForm = (key, value) => {
+        setTrainingForm((current) => ({ ...current, [key]: value }));
       };
 
       const handleStartTraining = async () => {
         if (!activeProjectId) return;
-        const parsed = Number(trainingSteps || '0');
-        if (!Number.isInteger(parsed) || parsed < 200 || parsed > 20000) {
+        const parsedSteps = Number(trainingForm.trainSteps || '0');
+        const parsedMaxGaussians = Number(trainingForm.maxGaussians || '0');
+        const parsedTrainResolution = Number(trainingForm.trainResolution || '0');
+        if (
+          !Number.isInteger(parsedSteps) || parsedSteps < 200 || parsedSteps > 20000 ||
+          !Number.isInteger(parsedMaxGaussians) || parsedMaxGaussians < 0 || parsedMaxGaussians > 5000000 ||
+          !Number.isInteger(parsedTrainResolution) || parsedTrainResolution < 256 || parsedTrainResolution > 2048
+        ) {
           return;
         }
         setActiveTab('logs');
         setTrainingModalOpen(false);
-        await handleAction(trainingRestartMode ? 'restart_job' : 'start_job', activeProjectId, parsed);
+        await handleAction(
+          trainingRestartMode ? 'restart_job' : 'start_job',
+          activeProjectId,
+          {
+            train_steps: parsedSteps,
+            max_gaussians: parsedMaxGaussians,
+            quality_preset: trainingForm.qualityPreset || 'balanced',
+            train_resolution: parsedTrainResolution,
+            sfm_match_mode: trainingForm.sfmMatchMode || 'auto'
+          }
+        );
       };
 
       const handleStopTraining = async () => {
@@ -395,8 +519,13 @@
         }
       };
 
-      const trainingStepsValue = Number(trainingSteps || '0');
-      const trainingStepsValid = Number.isInteger(trainingStepsValue) && trainingStepsValue >= 200 && trainingStepsValue <= 20000;
+      const trainingStepsValue = Number(trainingForm.trainSteps || '0');
+      const trainingMaxGaussiansValue = Number(trainingForm.maxGaussians || '0');
+      const trainingResolutionValue = Number(trainingForm.trainResolution || '0');
+      const trainingSettingsValid =
+        Number.isInteger(trainingStepsValue) && trainingStepsValue >= 200 && trainingStepsValue <= 20000 &&
+        Number.isInteger(trainingMaxGaussiansValue) && trainingMaxGaussiansValue >= 0 && trainingMaxGaussiansValue <= 5000000 &&
+        Number.isInteger(trainingResolutionValue) && trainingResolutionValue >= 256 && trainingResolutionValue <= 2048;
 
       return (
         <div className="h-screen w-full flex flex-col bg-[#050505] text-white overflow-hidden relative font-sans">
@@ -777,9 +906,23 @@
                        <h3 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
                           Live Output <span className="w-12 h-px bg-white/5"></span>
                        </h3>
-                       <div className="glass-panel px-2 py-1 rounded inline-flex items-center gap-1.5 text-[10px] uppercase font-bold text-emerald-400 border border-emerald-500/20">
-                         <span className={`w-1.5 h-1.5 rounded-full ${isTraining ? 'bg-[#FF5400] shadow-[0_0_5px_#FF5400]' : 'bg-emerald-400 shadow-[0_0_5px_#34d399]'} animate-pulse`} />
-                         {isTraining ? 'Training' : 'Live'}
+                       <div className="flex items-center gap-2">
+                         {liveMonitor.showStopPrompt && (
+                           <button
+                             onClick={handleStopTraining}
+                             title="The worker has been quiet for a long time. Click only if you want to stop it."
+                             className="px-2 py-1 rounded border border-rose-500/25 bg-rose-500/10 text-[10px] uppercase font-bold text-rose-300 hover:bg-rose-500/20 hover:text-white transition-colors"
+                           >
+                             Stop?
+                           </button>
+                         )}
+                         <div
+                           title={liveMonitor.detail}
+                           className={`glass-panel px-2 py-1 rounded inline-flex items-center gap-1.5 text-[10px] uppercase font-bold border ${liveStyle.text} ${liveStyle.border} ${liveStyle.panel}`}
+                         >
+                           <span className={`w-1.5 h-1.5 rounded-full ${liveStyle.dot} ${isTraining ? 'animate-pulse' : ''}`} />
+                           {liveLabel}
+                         </div>
                        </div>
                     </div>
                     
@@ -839,17 +982,17 @@
             }}
             onConfirm={handleCreateProject}
           />
-          <TrainingStepsModal
+          <TrainingSetupModal
             open={trainingModalOpen}
-            value={trainingSteps}
-            onChange={setTrainingSteps}
+            form={trainingForm}
+            onChange={updateTrainingForm}
             onCancel={() => {
               setTrainingModalOpen(false);
-              setTrainingSteps('3000');
+              setTrainingForm(emptyTrainingForm);
             }}
             onConfirm={handleStartTraining}
             restartMode={trainingRestartMode}
-            valid={trainingStepsValid}
+            valid={trainingSettingsValid}
           />
         </div>
       );

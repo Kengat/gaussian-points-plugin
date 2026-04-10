@@ -16,9 +16,48 @@ Rectangle {
     readonly property var exportPanel: detail.exportPanel || ({})
     readonly property var photos: detail.photos || []
     readonly property var videoTile: detail.videoTile || ({})
+    readonly property var liveMonitor: detail.liveMonitor || ({ state: "idle", label: "REST", detail: "No active worker.", showStopPrompt: false })
     readonly property var consoleRows: detail.consoleRows || []
     readonly property bool consoleRunning: !!detail.consoleRunning
+    readonly property string liveState: liveMonitor.state || "idle"
+    readonly property string liveLabel: liveMonitor.label || liveLabelFallback(liveState)
     property int currentTab: 0
+
+    function liveLabelFallback(state) {
+        if (state === "live") return "LIVE"
+        if (state === "stale") return "QUIET"
+        if (state === "silent") return "CHECK"
+        if (state === "failed") return "FAILED"
+        return "REST"
+    }
+
+    function liveTextColor(state) {
+        if (state === "live") return "#34D399"
+        if (state === "stale") return "#FBBF24"
+        if (state === "silent" || state === "failed") return "#FB7185"
+        return "#E4E4E7"
+    }
+
+    function liveDotColor(state) {
+        if (state === "live") return "#34D399"
+        if (state === "stale") return "#FBBF24"
+        if (state === "silent" || state === "failed") return "#FB7185"
+        return "#D4D4D8"
+    }
+
+    function livePanelColor(state) {
+        if (state === "live") return "#1A10B981"
+        if (state === "stale") return "#1AFBBF24"
+        if (state === "silent" || state === "failed") return "#1AFB7185"
+        return "#0CFFFFFF"
+    }
+
+    function liveBorderColor(state) {
+        if (state === "live") return "#3334D399"
+        if (state === "stale") return "#40FBBF24"
+        if (state === "silent" || state === "failed") return "#4DFB7185"
+        return "#26FFFFFF"
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -499,9 +538,35 @@ Rectangle {
                         Rectangle { Layout.preferredWidth: 48; Layout.preferredHeight: 1; color: "#0DFFFFFF" }
                         Item { Layout.fillWidth: true }
                         Rectangle {
+                            visible: !!liveMonitor.showStopPrompt
                             radius: 8
-                            color: "#101720"
-                            border.color: "#214D3D"
+                            color: "#1AFB7185"
+                            border.color: "#4DFB7185"
+                            border.width: 1
+                            implicitWidth: stopText.implicitWidth + 16
+                            implicitHeight: 28
+
+                            Text {
+                                id: stopText
+                                anchors.centerIn: parent
+                                text: "Stop?"
+                                color: "#FDA4AF"
+                                font.pixelSize: 11
+                                font.weight: 800
+                                font.family: "Outfit"
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: controller.stopTraining()
+                            }
+                        }
+                        Rectangle {
+                            radius: 8
+                            color: livePanelColor(liveState)
+                            border.color: liveBorderColor(liveState)
                             border.width: 1
                             implicitWidth: liveRow.implicitWidth + 16
                             implicitHeight: 28
@@ -509,8 +574,8 @@ Rectangle {
                                 id: liveRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Rectangle { width: 6; height: 6; radius: 3; color: "#34D399" }
-                                Text { text: "LIVE"; color: "#34D399"; font.pixelSize: 11; font.weight: 700; font.family: "Outfit" }
+                                Rectangle { width: 6; height: 6; radius: 3; color: liveDotColor(liveState) }
+                                Text { text: liveLabel; color: liveTextColor(liveState); font.pixelSize: 11; font.weight: 700; font.family: "Outfit" }
                             }
                         }
                     }
@@ -749,7 +814,7 @@ Rectangle {
                             Rectangle {
                                 width: mediaFlow.tileSize
                                 height: mediaFlow.tileSize
-                                visible: photos.length > 0
+                                visible: (videoTile.url || "").length > 0
                                 clip: true
                                 radius: 8
                                 color: "#050505"
@@ -765,7 +830,7 @@ Rectangle {
                                     anchors.centerIn: parent
                                     spacing: 4
                                     IconImage { iconName: "film"; tone: "white"; iconSize: 20 }
-                                    Text { text: videoTile.fps || "30 FPS"; color: "#FFFFFF"; font.pixelSize: 9; font.weight: 700; font.family: "Outfit" }
+                                    Text { text: videoTile.fps || ""; color: "#FFFFFF"; font.pixelSize: 9; font.weight: 700; font.family: "Outfit" }
                                 }
                                 Rectangle {
                                     anchors.left: parent.left
@@ -778,7 +843,7 @@ Rectangle {
                                     Text {
                                         id: videoName
                                         anchors.centerIn: parent
-                                        text: videoTile.name || "GOPR0042.MP4"
+                                        text: videoTile.name || ""
                                         color: "#00F0FF"
                                         font.pixelSize: 8
                                         font.family: "Consolas"

@@ -54,6 +54,57 @@ class StoreStaleJobTest(unittest.TestCase):
         self.assertEqual("Stopped", updated["stage"])
         self.assertIn("Stopped after the worker process exited", updated["message"])
 
+    def test_save_project_training_settings_persists_known_fields(self) -> None:
+        project = store.create_project("Saved Settings")
+        settings = store.project_training_settings(project["id"], force_restart=False)
+        settings["train_steps"] = 4200
+        settings["max_gaussians"] = 900000
+        settings["quality_preset"] = "high"
+        settings["train_resolution"] = 960
+        settings["sfm_match_mode"] = "sequential"
+        settings["force_restart"] = True
+
+        store.save_project_training_settings(project["id"], settings)
+        restored = store.project_training_settings(project["id"], force_restart=False)
+
+        self.assertEqual(4200, restored["train_steps"])
+        self.assertEqual(900000, restored["max_gaussians"])
+        self.assertEqual("high", restored["quality_preset"])
+        self.assertEqual(960, restored["train_resolution"])
+        self.assertEqual("sequential", restored["sfm_match_mode"])
+        self.assertFalse(bool(restored["force_restart"]))
+
+    def test_preserve_sfm_cache_is_runtime_only(self) -> None:
+        project = store.create_project("Preserve SfM")
+        settings = store.project_training_settings(project["id"], force_restart=True)
+        settings["preserve_sfm_cache"] = True
+
+        store.save_project_training_settings(project["id"], settings)
+        restored = store.project_training_settings(project["id"], force_restart=False)
+
+        self.assertFalse(bool(restored["preserve_sfm_cache"]))
+        self.assertFalse(bool(restored["force_restart"]))
+
+    def test_worker_heartbeat_does_not_refresh_live_activity(self) -> None:
+        from companion_app.worker_entry import _mark_monitor_activity
+
+        project = store.create_project("Heartbeat")
+        job = store.create_job(project["id"], store.default_job_settings())
+        original_activity = "2026-04-10T00:00:00+00:00"
+        store.update_job(
+            job["id"],
+            monitor_last_activity_at=original_activity,
+            monitor_last_activity_kind="output",
+        )
+
+        _mark_monitor_activity(job["id"], "heartbeat")
+        heartbeat_job = store.get_job(job["id"])
+
+        self.assertIsNotNone(heartbeat_job)
+        self.assertEqual(original_activity, heartbeat_job["monitor_last_activity_at"])
+        self.assertEqual("output", heartbeat_job["monitor_last_activity_kind"])
+        self.assertIsNotNone(heartbeat_job.get("monitor_last_heartbeat_at"))
+
 
 if __name__ == "__main__":
     unittest.main()

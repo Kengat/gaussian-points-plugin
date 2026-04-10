@@ -65,10 +65,12 @@ class ViewportWidget(QtWidgets.QWidget):
         self._footer.setText(footer)
         self._splat_value.setText(f"{int(preview.get('pointCount') or 0):,}")
         if preview.get("hasScene") and preview.get("path"):
+            self._host.show()
             self._placeholder.hide()
             self._host.load_scene(preview["path"])
         else:
             self._host.clear_scene()
+            self._host.hide()
             self._placeholder.setText(preview.get("emptyTitle") or "Scene preview will appear here")
             self._placeholder.show()
         hud = (detail or {}).get("hud") or {}

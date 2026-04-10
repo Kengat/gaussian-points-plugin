@@ -13,6 +13,7 @@ from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 try:
@@ -22,6 +23,7 @@ except ImportError:  # pragma: no cover - optional dependency in some UI runtime
 
 from . import paths, store
 from .ply import write_gaussian_ply
+from .video_import import extract_representative_video_frames, video_runtime_summary
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -39,7 +41,19 @@ class ViewConfig:
     height: int
 
 
-def copy_input_images(project_id: str, image_paths: list[str]) -> list[Path]:
+@dataclass
+class MediaImportGroup:
+    paths: list[Path]
+    source_kind: str
+    summary: dict[str, object] | None = None
+
+
+def copy_input_images(
+    project_id: str,
+    image_paths: list[str],
+    *,
+    source_name_mapping: dict[str, str] | None = None,
+) -> list[Path]:
     paths.ensure_project_dirs(project_id)
     target_dir = paths.project_input_dir(project_id)
     copied: list[Path] = []
@@ -52,6 +66,8 @@ def copy_input_images(project_id: str, image_paths: list[str]) -> list[Path]:
         shutil.copy2(source_path, destination)
         copied.append(destination)
         source_to_destination[source_path.name] = destination.name
+        if source_name_mapping is not None:
+            source_name_mapping[source_path.name] = destination.name
     _copy_matching_transforms(project_id, image_paths, source_to_destination)
     return copied
 
@@ -64,6 +80,7 @@ def ingest_media_sources(project_id: str, media_paths: list[str]) -> dict[str, o
             "source_images": 0,
             "source_videos": 0,
             "video_frames": 0,
+            "video_candidates": 0,
             "source_archives": 0,
             "source_directories": 0,
         }
@@ -72,12 +89,13 @@ def ingest_media_sources(project_id: str, media_paths: list[str]) -> dict[str, o
     import_root = stage_file(project_id, "imports")
     import_root.mkdir(parents=True, exist_ok=True)
 
-    groups: list[list[Path]] = []
+    groups: list[MediaImportGroup] = []
     seen_sources: set[str] = set()
     stats = {
         "source_images": 0,
         "source_videos": 0,
         "video_frames": 0,
+        "video_candidates": 0,
         "source_archives": 0,
         "source_directories": 0,
     }
@@ -87,18 +105,32 @@ def ingest_media_sources(project_id: str, media_paths: list[str]) -> dict[str, o
         groups.extend(_expand_media_source(project_id, source_path, import_root, seen_sources, stats))
 
     copied: list[Path] = []
+    video_summaries: list[dict[str, object]] = []
     for group in groups:
-        if group:
-            copied.extend(copy_input_images(project_id, [str(path) for path in group]))
+        if not group.paths:
+            continue
+        name_mapping: dict[str, str] = {}
+        copied.extend(
+            copy_input_images(
+                project_id,
+                [str(path) for path in group.paths],
+                source_name_mapping=name_mapping,
+            )
+        )
+        if group.summary:
+            video_summaries.append(_remap_video_summary_to_project_inputs(project_id, group.summary, name_mapping))
 
     if not copied:
         raise RuntimeError("No supported media files were found. Use images, videos, folders, or .zip datasets.")
 
-    return {
+    summary = _build_project_import_summary(project_id, stats, copied, video_summaries)
+    payload = {
         "copied_files": [str(path) for path in copied],
         "image_count": len(copied),
         **stats,
     }
+    payload["import_summary"] = summary
+    return payload
 
 
 def _expand_media_source(
@@ -107,7 +139,7 @@ def _expand_media_source(
     import_root: Path,
     seen_sources: set[str],
     stats: dict[str, int],
-) -> list[list[Path]]:
+) -> list[MediaImportGroup]:
     if not source_path.exists():
         return []
 
@@ -126,12 +158,13 @@ def _expand_media_source(
     suffix = source_path.suffix.lower()
     if suffix in IMAGE_SUFFIXES:
         stats["source_images"] += 1
-        return [[source_path]]
+        return [MediaImportGroup(paths=[source_path], source_kind="image")]
     if suffix in VIDEO_SUFFIXES:
         stats["source_videos"] += 1
-        frames = _extract_video_frames(project_id, source_path, import_root)
+        frames, summary = _extract_video_frames(project_id, source_path, import_root)
         stats["video_frames"] += len(frames)
-        return [frames] if frames else []
+        stats["video_candidates"] += int(summary.get("candidate_count", 0))
+        return [MediaImportGroup(paths=frames, source_kind="video", summary=summary)] if frames else []
     if suffix in ARCHIVE_SUFFIXES:
         stats["source_archives"] += 1
         extracted_dir = _extract_archive(source_path, import_root)
@@ -145,9 +178,9 @@ def _collect_directory_media(
     import_root: Path,
     seen_sources: set[str],
     stats: dict[str, int],
-) -> list[list[Path]]:
+) -> list[MediaImportGroup]:
     image_groups: dict[Path, list[Path]] = {}
-    nested_groups: list[list[Path]] = []
+    nested_groups: list[MediaImportGroup] = []
 
     for file_path in sorted(path for path in directory.rglob("*") if path.is_file()):
         suffix = file_path.suffix.lower()
@@ -164,7 +197,7 @@ def _collect_directory_media(
         elif suffix in VIDEO_SUFFIXES or suffix in ARCHIVE_SUFFIXES:
             nested_groups.extend(_expand_media_source(project_id, file_path, import_root, seen_sources, stats))
 
-    grouped_images = [image_groups[parent] for parent in sorted(image_groups)]
+    grouped_images = [MediaImportGroup(paths=image_groups[parent], source_kind="images") for parent in sorted(image_groups)]
     return grouped_images + nested_groups
 
 
@@ -189,47 +222,15 @@ def _extract_archive(archive_path: Path, import_root: Path) -> Path:
     return extract_dir
 
 
-def _extract_video_frames(project_id: str, video_path: Path, import_root: Path) -> list[Path]:
-    if cv2 is None:
-        raise RuntimeError("Video import requires OpenCV (cv2), but it is not available in this runtime.")
-
+def _extract_video_frames(project_id: str, video_path: Path, import_root: Path) -> tuple[list[Path], dict[str, object]]:
     target_dir = import_root / f"video_{_safe_media_name(video_path)}"
     if target_dir.exists():
         shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open video file {video_path.name}.")
-
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    desired_frames = 16
-    if frame_count > 0:
-        desired_frames = min(24, max(8, frame_count // 24))
-        frame_indices = sorted(
-            {
-                int(round(((frame_count - 1) * index) / max(1, desired_frames - 1)))
-                for index in range(desired_frames)
-            }
-        )
-    else:
-        frame_indices = list(range(desired_frames))
-
-    frames: list[Path] = []
-    for output_index, frame_index in enumerate(frame_indices):
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        ok, frame = capture.read()
-        if not ok or frame is None:
-            continue
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_path = target_dir / f"{output_index:03d}_{video_path.stem}.jpg"
-        Image.fromarray(rgb_frame).save(frame_path, format="JPEG", quality=92)
-        frames.append(frame_path)
-
-    capture.release()
+    summary = extract_representative_video_frames(video_path, target_dir)
+    frames = [Path(entry["image_path"]) for entry in summary.get("selected_frames", [])]
     if not frames:
         raise RuntimeError(f"No usable frames were extracted from {video_path.name}.")
-    return frames
+    return frames, summary
 
 
 def _normalized_source_name(name: str) -> str:
@@ -349,8 +350,89 @@ def list_project_images(project_id: str) -> list[Path]:
     return sorted(path for path in input_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
 
 
+def load_project_import_summary(project_id: str) -> dict[str, object] | None:
+    path = _project_import_summary_path(project_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def stage_file(project_id: str, name: str) -> Path:
     return paths.project_stage_dir(project_id) / name
+
+
+def _project_import_summary_path(project_id: str) -> Path:
+    return stage_file(project_id, "media_import_summary.json")
+
+
+def _remap_video_summary_to_project_inputs(
+    project_id: str,
+    summary: dict[str, object],
+    source_name_mapping: dict[str, str],
+) -> dict[str, object]:
+    remapped = dict(summary)
+    remapped_frames: list[dict[str, object]] = []
+    for frame in summary.get("selected_frames", []):
+        source_name = str(frame.get("image_name") or Path(frame.get("image_path", "")).name)
+        destination_name = source_name_mapping.get(source_name)
+        if not destination_name:
+            continue
+        updated = dict(frame)
+        updated["source_name"] = source_name
+        updated["image_name"] = destination_name
+        updated["image_path"] = str(paths.project_input_dir(project_id) / destination_name)
+        remapped_frames.append(updated)
+    remapped["selected_frames"] = remapped_frames
+    remapped["selected_count"] = len(remapped_frames)
+    return remapped
+
+
+def _build_project_import_summary(
+    project_id: str,
+    stats: dict[str, int],
+    copied: list[Path],
+    video_summaries: list[dict[str, object]],
+) -> dict[str, object]:
+    runtime = video_runtime_summary()
+    image_metadata = {
+        str(frame["image_name"]): frame
+        for summary in video_summaries
+        for frame in summary.get("selected_frames", [])
+    }
+    overlap_means = [
+        float(summary["selected_overlap_mean"])
+        for summary in video_summaries
+        if summary.get("selected_overlap_mean") is not None
+    ]
+    overlap_mins = [
+        float(summary["selected_overlap_min"])
+        for summary in video_summaries
+        if summary.get("selected_overlap_min") is not None
+    ]
+    aggregate = {
+        "project_image_count": len(copied),
+        "source_images": int(stats.get("source_images", 0)),
+        "source_videos": int(stats.get("source_videos", 0)),
+        "source_archives": int(stats.get("source_archives", 0)),
+        "source_directories": int(stats.get("source_directories", 0)),
+        "video_candidate_frames": int(stats.get("video_candidates", 0)),
+        "video_selected_frames": int(stats.get("video_frames", 0)),
+        "video_rejected_frames": max(0, int(stats.get("video_candidates", 0)) - int(stats.get("video_frames", 0))),
+        "video_bridge_inserts": int(sum(int(summary.get("bridge_inserts", 0)) for summary in video_summaries)),
+        "selected_overlap_mean": round(float(np.mean(overlap_means)), 5) if overlap_means else None,
+        "selected_overlap_min": round(float(np.min(overlap_mins)), 5) if overlap_mins else None,
+        "ffmpeg_available": bool(runtime.get("ffmpeg_path")),
+        "ffmpeg_path": runtime.get("ffmpeg_path"),
+        "opencv_available": bool(runtime.get("opencv_available")),
+    }
+    summary = {
+        "aggregate": aggregate,
+        "videos": video_summaries,
+        "images": image_metadata,
+    }
+    save_stage_json(_project_import_summary_path(project_id), summary)
+    store.update_project(project_id, last_import_summary=summary)
+    return summary
 
 
 def result_ply_path(project_id: str) -> Path:
@@ -762,7 +844,10 @@ def run_job(job_id: str) -> int:
     try:
         if settings.get("force_restart"):
             clear_stage_outputs(project["id"])
-            log_line(job, "Cleared cached stage outputs for a full rebuild.")
+            if settings.get("preserve_sfm_cache"):
+                log_line(job, "Cleared training stage outputs while preserving cached COLMAP reconstruction.")
+            else:
+                log_line(job, "Cleared cached stage outputs for a full rebuild.")
 
         if settings.get("trainer_backend") == "gsplat_colmap" or project.get("backend") == "gsplat_colmap":
             manifest_status = ensure_project_camera_manifests(project["id"])

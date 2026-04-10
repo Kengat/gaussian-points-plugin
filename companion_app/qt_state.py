@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import html
 import os
+import re
 import subprocess
 import sys
+import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,10 @@ from . import paths, store
 from .native_preview import preview_runtime_available, preview_runtime_error
 from .pipeline import ensure_project_camera_manifests, ingest_media_sources, list_project_images
 from .ply import read_preview_points
+
+
+LIVE_STALE_SECONDS = 120
+LIVE_ASK_STOP_SECONDS = 20 * 60
 
 
 class ThemedDialog(QtWidgets.QDialog):
@@ -263,6 +270,7 @@ class TrainModelDialog(ThemedDialog):
         settings: dict[str, Any],
         *,
         restart: bool,
+        can_preserve_sfm_cache: bool = False,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__("Restart Training" if restart else "Train Model", parent)
@@ -316,7 +324,7 @@ class TrainModelDialog(ThemedDialog):
         self.sfm_image_size_input = QtWidgets.QSpinBox()
         self.sfm_image_size_input.setRange(640, 4096)
         self.sfm_image_size_input.setSingleStep(160)
-        self.sfm_image_size_input.setValue(int(settings.get("sfm_max_image_size", 1600)))
+        self.sfm_image_size_input.setValue(int(settings.get("sfm_max_image_size", 1280)))
 
         self.sh_degree_input = QtWidgets.QSpinBox()
         self.sh_degree_input.setRange(0, 4)
@@ -325,7 +333,8 @@ class TrainModelDialog(ThemedDialog):
         self.max_gaussians_input = QtWidgets.QSpinBox()
         self.max_gaussians_input.setRange(0, 5_000_000)
         self.max_gaussians_input.setSingleStep(10_000)
-        self.max_gaussians_input.setSpecialValueText("Auto")
+        self.max_gaussians_input.setSpecialValueText("Auto (0)")
+        self.max_gaussians_input.setToolTip("0 keeps the automatic splat budget. Type a number like 800000 or 1200000 to cap growth manually.")
         self.max_gaussians_input.setValue(int(settings.get("max_gaussians", 0)))
 
         self.validation_fraction_input = QtWidgets.QDoubleSpinBox()
@@ -343,10 +352,18 @@ class TrainModelDialog(ThemedDialog):
         self.exposure_compensation_checkbox = QtWidgets.QCheckBox("Exposure compensation")
         self.exposure_compensation_checkbox.setChecked(bool(settings.get("enable_exposure_compensation", True)))
 
+        self.preserve_sfm_cache_checkbox = QtWidgets.QCheckBox("Reuse cached COLMAP cameras")
+        self.preserve_sfm_cache_checkbox.setChecked(bool(settings.get("preserve_sfm_cache")) and can_preserve_sfm_cache)
+        self.preserve_sfm_cache_checkbox.setEnabled(can_preserve_sfm_cache)
+        self.preserve_sfm_cache_checkbox.setToolTip(
+            "Keeps the recovered camera poses and sparse points, then restarts only Gaussian training. "
+            "Turn this off for a full SfM rebuild."
+        )
+
         self._add_field(grid, 0, 0, "Training steps", self.steps_input)
         self._add_field(grid, 0, 1, "Quality preset", self.preset_combo)
         self._add_field(grid, 1, 0, "Strategy", self.strategy_combo)
-        self._add_field(grid, 1, 1, "Gaussian budget", self.max_gaussians_input)
+        self._add_field(grid, 1, 1, "Max splats (0 = Auto)", self.max_gaussians_input)
         self._add_field(grid, 2, 0, "Train resolution", self.resolution_input)
         self._add_field(grid, 2, 1, "SfM image size", self.sfm_image_size_input)
         self._add_field(grid, 3, 0, "SH degree", self.sh_degree_input)
@@ -362,10 +379,20 @@ class TrainModelDialog(ThemedDialog):
         options_layout.addWidget(self.exposure_compensation_checkbox)
         options_layout.addWidget(self.random_background_checkbox)
         options_layout.addWidget(self.revised_opacity_checkbox)
+        if restart:
+            options_layout.addWidget(self.preserve_sfm_cache_checkbox)
+            cache_note = QtWidgets.QLabel(
+                "On: skip feature extraction/matching and reuse recovered cameras. Off: full restart, including COLMAP."
+                if can_preserve_sfm_cache
+                else "No cached COLMAP reconstruction was found, so this restart will rebuild SfM."
+            )
+            cache_note.setWordWrap(True)
+            cache_note.setStyleSheet("font-size:11px; color:#71717A;")
+            options_layout.addWidget(cache_note)
         grid.addWidget(options_box, 5, 0, 1, 2)
 
         note = QtWidgets.QLabel(
-            "Tip: use Auto + Balanced + Antialiased for real captures. Keep Gaussian budget on Auto and reserve 10-20% of views for validation."
+            "Tip: use Auto + Balanced + Antialiased for real captures. For video, keep SfM image size near 1280 and type a Max splats cap such as 800000 or 1200000; 0 means Auto."
         )
         note.setWordWrap(True)
         note.setStyleSheet("font-size:12px; color:#71717A;")
@@ -426,6 +453,7 @@ class TrainModelDialog(ThemedDialog):
                 "random_background": bool(self.random_background_checkbox.isChecked()),
                 "revised_opacity": bool(self.revised_opacity_checkbox.isChecked()),
                 "enable_exposure_compensation": bool(self.exposure_compensation_checkbox.isChecked()),
+                "preserve_sfm_cache": bool(self.preserve_sfm_cache_checkbox.isChecked()),
             }
         )
         return settings
@@ -578,6 +606,17 @@ class QtStateController(QtCore.QObject):
 
     @QtCore.Slot(bool)
     def startTrainingDialog(self, restart: bool = False) -> None:
+        try:
+            self._start_training_dialog(bool(restart))
+        except Exception as error:
+            traceback.print_exc()
+            self._show_training_start_error(error)
+
+    @QtCore.Slot()
+    def restartTrainingDialog(self) -> None:
+        QtCore.QTimer.singleShot(0, lambda: self.startTrainingDialog(True))
+
+    def _start_training_dialog(self, restart: bool = False) -> None:
         if not self._active_project_id:
             return
         project = store.get_project(self._active_project_id)
@@ -590,25 +629,67 @@ class QtStateController(QtCore.QObject):
         if latest and latest["status"] == "running":
             return
         settings = store.project_training_settings(self._active_project_id, force_restart=restart)
+        preserve_sfm_cache = bool(
+            restart
+            and latest
+            and str(latest.get("status") or "").lower() in {"failed", "stopped"}
+            and self._has_cached_colmap_reconstruction(self._active_project_id)
+        )
+        if preserve_sfm_cache:
+            settings["preserve_sfm_cache"] = True
+        if self._project_is_video_derived(project) and len(images) >= 96:
+            settings["sfm_max_image_size"] = min(int(settings.get("sfm_max_image_size", 1280)), 1280)
+            settings["sfm_num_threads"] = min(int(settings.get("sfm_num_threads", 4)), 4)
+            settings["sfm_sequential_overlap"] = min(int(settings.get("sfm_sequential_overlap", 5)), 5)
+            settings["sfm_quadratic_overlap"] = False
         dialog = TrainModelDialog(
             project["name"],
             settings,
             restart=restart,
+            can_preserve_sfm_cache=preserve_sfm_cache,
             parent=self._app_window(),
         )
         if dialog.run() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         settings = dialog.training_settings
         settings["force_restart"] = bool(restart)
+        settings["preserve_sfm_cache"] = bool(restart and settings.get("preserve_sfm_cache"))
         settings["densify_stop_iter"] = min(
             int(settings.get("densify_stop_iter", 0)),
             max(int(settings["train_steps"]) - 1, 1),
         )
         settings["refine_scale2d_stop_iter"] = int(settings["train_steps"])
+        store.save_project_training_settings(self._active_project_id, settings)
         ensure_project_camera_manifests(self._active_project_id)
         job = store.create_job(self._active_project_id, settings)
         self._launch_worker(job["id"])
         self.refresh()
+
+    def _show_training_start_error(self, error: Exception) -> None:
+        parent = self._app_window()
+        QtWidgets.QMessageBox.warning(
+            parent,
+            "Training could not start",
+            f"{type(error).__name__}: {error}",
+        )
+
+    @staticmethod
+    def _has_cached_colmap_reconstruction(project_id: str) -> bool:
+        sparse_dir = paths.project_colmap_scratch_dir(project_id) / "sparse"
+        if not sparse_dir.exists():
+            return False
+        for reconstruction_dir in sparse_dir.iterdir():
+            if not reconstruction_dir.is_dir():
+                continue
+            if all((reconstruction_dir / name).exists() for name in ("cameras.bin", "images.bin", "points3D.bin")):
+                return True
+        return False
+
+    @staticmethod
+    def _project_is_video_derived(project: dict[str, Any] | None) -> bool:
+        import_summary = (project or {}).get("last_import_summary") if project else None
+        aggregate = (import_summary or {}).get("aggregate") if isinstance(import_summary, dict) else {}
+        return int((aggregate or {}).get("source_videos") or 0) > 0
 
     @QtCore.Slot()
     def stopTraining(self) -> None:
@@ -664,11 +745,15 @@ class QtStateController(QtCore.QObject):
         images = list_project_images(project_id)
         manifest = ensure_project_camera_manifests(project_id) if images else {"mode": "sfm", "usable_views": 0}
         logs = self._read_logs(latest)
+        live_monitor = self._live_monitor_payload(latest, logs)
         preview = self._preview_payload(project, latest, images)
         resolution = self._detect_resolution(images) or "Unknown"
         percent = int(round(float(latest["progress"]) * 100)) if latest else 0
         last_loss = self._extract_last_loss(logs) or "--"
         camera = f"camera manifest: {int(manifest['usable_views'])} views" if manifest["mode"] == "manifest" else "SfM-only cameras"
+        import_summary = project.get("last_import_summary") or {}
+        import_aggregate = import_summary.get("aggregate") or {}
+        import_videos = import_summary.get("videos") or []
         training_summary = project.get("last_training_summary") or {}
         train_metrics = training_summary.get("metrics") or {}
         validation_metrics = training_summary.get("validation_metrics") or {}
@@ -678,6 +763,27 @@ class QtStateController(QtCore.QObject):
             {"label": "Image Count", "value": f"{len(images)} Frames"},
             {"label": "Resolution", "value": resolution},
         ]
+        if int(import_aggregate.get("source_videos") or 0) > 0:
+            properties.append({"label": "Video Sources", "value": str(int(import_aggregate["source_videos"]))})
+            properties.append(
+                {
+                    "label": "Video Keyframes",
+                    "value": (
+                        f"{int(import_aggregate.get('video_selected_frames') or 0)} kept / "
+                        f"{int(import_aggregate.get('video_candidate_frames') or 0)} candidates"
+                    ),
+                }
+            )
+            if import_aggregate.get("selected_overlap_mean") is not None:
+                properties.append(
+                    {
+                        "label": "Keyframe Overlap",
+                        "value": (
+                            f"{float(import_aggregate['selected_overlap_mean']) * 100.0:.1f}% avg, "
+                            f"{float(import_aggregate.get('selected_overlap_min') or 0.0) * 100.0:.1f}% min"
+                        ),
+                    }
+                )
         if train_metrics.get("psnr") is not None:
             properties.append({"label": "Train PSNR", "value": f"{float(train_metrics['psnr']):.3f}"})
         if validation_metrics.get("psnr") is not None:
@@ -686,24 +792,45 @@ class QtStateController(QtCore.QObject):
             properties.append({"label": "Val SSIM", "value": f"{float(validation_metrics['ssim']):.4f}"})
         if diagnostics.get("quality_score") is not None:
             properties.append({"label": "Dataset Score", "value": f"{float(diagnostics['quality_score']):.1f}/100"})
+        if diagnostics.get("selected_overlap_mean") is not None:
+            properties.append(
+                {
+                    "label": "Dataset Overlap",
+                    "value": (
+                        f"{float(diagnostics['selected_overlap_mean']) * 100.0:.1f}% avg, "
+                        f"{float(diagnostics.get('selected_overlap_min') or 0.0) * 100.0:.1f}% min"
+                    ),
+                }
+            )
         if diagnostics.get("registered_view_ratio") is not None:
             properties.append({"label": "Registered Views", "value": f"{float(diagnostics['registered_view_ratio']) * 100.0:.1f}%"})
+        first_video = import_videos[0] if import_videos else {}
+        first_video_frame = (first_video.get("selected_frames") or [{}])[0] if first_video else {}
+        video_tile_url = ""
+        if first_video_frame.get("image_path"):
+            video_tile_url = QtCore.QUrl.fromLocalFile(str(first_video_frame["image_path"])).toString()
         return {
-            "header": {"title": project["name"], "status": project["status"], "subtitle": f"{len(images)} photos | {camera} | {project['workspace_dir']}"},
+            "header": {"title": project["name"], "status": project["status"], "subtitle": f"{len(images)} frames | {camera} | {project['workspace_dir']}"},
             "toolbar": {"canTrain": bool(images) and not (latest and latest["status"] == "running"), "canStop": bool(latest and latest["status"] == "running"), "canExport": bool(project.get("last_manifest_path"))},
             "preview": preview,
             "statusPanel": {"progress": percent, "progressLabel": f"{percent}%", "statusText": latest["status"].capitalize() if latest else "Ready", "stage": latest["stage"] if latest else "Ready", "timeTotal": self._job_duration(latest), "finalLoss": last_loss},
             "propertiesPanel": {"items": properties},
             "exportPanel": {"body": "Trained splats are compiled and ready. Choose a destination format to export the geometry." if project.get("last_manifest_path") else "Run a project first to generate the exported splat package."},
             "logs": logs,
+            "liveMonitor": live_monitor,
             "consoleRows": self._console_rows(logs),
             "consoleRunning": bool(latest and latest["status"] == "running"),
             "consoleHtml": self._console_html(logs, running=bool(latest and latest["status"] == "running")),
             "photos": [{"name": image.name, "path": str(image), "url": QtCore.QUrl.fromLocalFile(str(image)).toString()} for image in images],
             "videoTile": {
-                "name": "GOPR0042.MP4",
-                "fps": "30 FPS",
-                "url": QtCore.QUrl.fromLocalFile(str(images[0])).toString() if images else "",
+                "name": str(first_video.get("video_name") or ""),
+                "fps": (
+                    f"{float(first_video.get('fps') or 0.0):.1f} FPS · "
+                    f"{int(first_video.get('selected_count') or 0)} kept"
+                    if first_video
+                    else ""
+                ),
+                "url": video_tile_url,
             },
         }
 
@@ -739,6 +866,123 @@ class QtStateController(QtCore.QObject):
     def _extract_last_loss(self, logs: str) -> str | None:
         matches = [line.split("loss=", 1)[1].split(",", 1)[0] for line in logs.splitlines() if "loss=" in line]
         return matches[-1] if matches else None
+
+    def _log_line_datetime(self, line: str) -> datetime | None:
+        if "Worker heartbeat:" in line:
+            return None
+
+        colmap_match = re.match(r"^[IWEF](\d{8})\s+(\d{2}:\d{2}:\d{2})\.", line)
+        if colmap_match:
+            try:
+                parsed = datetime.strptime(
+                    f"{colmap_match.group(1)} {colmap_match.group(2)}",
+                    "%Y%m%d %H:%M:%S",
+                )
+                return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            except ValueError:
+                return None
+
+        bracket_match = re.match(r"^\[(\d{2}:\d{2}:\d{2})\]", line)
+        if not bracket_match:
+            return None
+        try:
+            current = datetime.now().astimezone()
+            hour, minute, second = [int(part) for part in bracket_match.group(1).split(":")]
+            parsed = current.replace(hour=hour, minute=minute, second=second, microsecond=0)
+            if (parsed - current).total_seconds() > 60:
+                parsed = parsed - timedelta(days=1)
+            return parsed
+        except ValueError:
+            return None
+
+    def _latest_non_heartbeat_log_datetime(self, log_text: str) -> datetime | None:
+        for line in reversed(log_text.splitlines()):
+            stripped = line.strip()
+            if not stripped or "Worker heartbeat:" in stripped:
+                continue
+            parsed = self._log_line_datetime(stripped)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _format_monitor_elapsed(seconds: int | None) -> str:
+        if seconds is None:
+            return "unknown"
+        seconds = max(0, int(seconds))
+        minutes, seconds_part = divmod(seconds, 60)
+        hours, minutes_part = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours}h {minutes_part}m ago"
+        if minutes > 0:
+            return f"{minutes}m {seconds_part}s ago"
+        return f"{seconds_part}s ago"
+
+    @staticmethod
+    def _seconds_since_iso(value: str | None) -> int | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()))
+
+    def _live_monitor_payload(self, latest: dict[str, Any] | None, logs: str) -> dict[str, Any]:
+        if not latest:
+            return {
+                "state": "idle",
+                "label": "REST",
+                "detail": "No active worker.",
+                "ageSeconds": None,
+                "showStopPrompt": False,
+            }
+
+        job_status = str(latest.get("status") or "idle").lower()
+        if job_status not in {"queued", "running"}:
+            idle_statuses = {"completed", "stopped", "idle"}
+            label = "REST" if job_status in idle_statuses else job_status.upper()
+            return {
+                "state": "idle" if job_status in idle_statuses else job_status,
+                "label": label,
+                "detail": f"Job status: {job_status}.",
+                "ageSeconds": None,
+                "showStopPrompt": False,
+            }
+
+        activity_age = self._seconds_since_iso(str(latest.get("monitor_last_activity_at") or ""))
+        if activity_age is None:
+            log_activity = self._latest_non_heartbeat_log_datetime(logs)
+            if log_activity is not None:
+                activity_age = max(0, int((datetime.now().astimezone() - log_activity).total_seconds()))
+        if activity_age is None:
+            activity_age = self._seconds_since_iso(str(latest.get("updated_at") or ""))
+
+        if activity_age is not None and activity_age >= LIVE_ASK_STOP_SECONDS:
+            state = "silent"
+            label = "CHECK"
+            show_stop_prompt = True
+        elif activity_age is not None and activity_age >= LIVE_STALE_SECONDS:
+            state = "stale"
+            label = "QUIET"
+            show_stop_prompt = False
+        else:
+            state = "live"
+            label = "LIVE"
+            show_stop_prompt = False
+
+        activity_kind = str(latest.get("monitor_last_activity_kind") or "activity")
+        return {
+            "state": state,
+            "label": label,
+            "detail": f"Last worker {activity_kind}: {self._format_monitor_elapsed(activity_age)}.",
+            "ageSeconds": activity_age,
+            "showStopPrompt": show_stop_prompt,
+            "staleAfterSeconds": LIVE_STALE_SECONDS,
+            "askStopAfterSeconds": LIVE_ASK_STOP_SECONDS,
+        }
 
     def _job_duration(self, latest: dict[str, Any] | None) -> str:
         if not latest or not latest.get("started_at"):

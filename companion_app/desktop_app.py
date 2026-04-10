@@ -581,7 +581,9 @@ class CompanionApp:
         self._create_project_from_paths("Sample Lego 12 Views", media_paths, note="bundled_sample:nerf_synthetic_lego_12")
 
     def _prompt_job_settings(self, force_restart: bool) -> dict | None:
-        settings = store.default_job_settings(force_restart=force_restart)
+        if not self.selected_project_id:
+            return None
+        settings = store.project_training_settings(self.selected_project_id, force_restart=force_restart)
         steps = simpledialog.askinteger(
             "Training Steps",
             "How many training steps should this run use?",
@@ -617,6 +619,7 @@ class CompanionApp:
         settings = self._prompt_job_settings(force_restart=force_restart)
         if settings is None:
             return
+        store.save_project_training_settings(self.selected_project_id, settings)
         job = store.create_job(self.selected_project_id, settings)
         if manifest_status["mode"] == "manifest":
             repaired_count = int(manifest_status["repaired_manifests"])
