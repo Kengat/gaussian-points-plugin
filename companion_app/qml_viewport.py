@@ -12,6 +12,7 @@ class ViewportWidget(QtWidgets.QWidget):
     def __init__(self, controller: QtCore.QObject, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._controller = controller
+        self._last_project_id: str | None = None
         self.setMouseTracking(True)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet("background:#050505;")
@@ -65,14 +66,22 @@ class ViewportWidget(QtWidgets.QWidget):
         self._footer.setText(footer)
         self._splat_value.setText(f"{int(preview.get('pointCount') or 0):,}")
         if preview.get("hasScene") and preview.get("path"):
+            project_id = str(preview.get("projectId") or "")
+            force_reload = bool(project_id and project_id != self._last_project_id)
             self._host.show()
             self._placeholder.hide()
-            self._host.load_scene(preview["path"])
+            self._host.load_scene(preview["path"], force_reload=force_reload)
+            if self._host.last_load_succeeded:
+                self._last_project_id = project_id or self._last_project_id
+            else:
+                self._placeholder.setText("Preview load failed")
+                self._placeholder.show()
         else:
             self._host.clear_scene()
             self._host.hide()
             self._placeholder.setText(preview.get("emptyTitle") or "Scene preview will appear here")
             self._placeholder.show()
+            self._last_project_id = None
         hud = (detail or {}).get("hud") or {}
         self._refresh_fps(fallback_text=hud.get("performance"))
         self._reposition()

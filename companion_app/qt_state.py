@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
 from . import paths, store
+from .gaussian_gasp import read_gaussian_gasp_metadata
 from .native_preview import preview_runtime_available, preview_runtime_error
 from .pipeline import ensure_project_camera_manifests, ingest_media_sources, list_project_images
 from .ply import read_preview_points
+from .preview_scene import preview_scene_path
+from .scene_import import IMPORT_MODE_CONVERT, IMPORT_MODE_DIRECT, import_gaussian_scene_file
 
 
 LIVE_STALE_SECONDS = 120
@@ -241,6 +244,273 @@ class DeleteProjectDialog(ThemedDialog):
         self.delete_button.clicked.connect(self.accept)
 
 
+class SplatImportModeDialog(ThemedDialog):
+    def __init__(self, filename: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__("Import Gaussian Scene", parent)
+        self.setMinimumWidth(560)
+        self.header_badge.setStyleSheet("QFrame{background:rgba(255,84,0,0.12); border-radius:8px;}")
+        self.set_header_icon("box", "accent")
+        self.mode: str | None = None
+
+        file_label = QtWidgets.QLabel(Path(filename).name)
+        file_label.setWordWrap(True)
+        file_label.setStyleSheet("font-size:14px; font-weight:700; color:#FFFFFF;")
+        self.body.insertWidget(0, file_label)
+
+        message = QtWidgets.QLabel(
+            "Choose how to load this splat file. GASP creates a fast cache for instant reloads; direct load keeps the selected file as the preview source."
+        )
+        message.setWordWrap(True)
+        message.setStyleSheet("font-size:13px; color:#A1A1AA; line-height:1.35;")
+        self.body.insertWidget(1, message)
+
+        self.cancel_button = self.add_button("Cancel")
+        self.direct_button = self.add_button("Load Directly")
+        self.convert_button = self.add_button("Create / Use GASP", accent="primary")
+        self.cancel_button.clicked.connect(self.reject)
+        self.direct_button.clicked.connect(lambda: self._accept_mode(IMPORT_MODE_DIRECT))
+        self.convert_button.clicked.connect(lambda: self._accept_mode(IMPORT_MODE_CONVERT))
+
+    def _accept_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.accept()
+
+
+class PopupMenuItemFrame(QtWidgets.QFrame):
+    hovered = QtCore.Signal(object, object)
+    activated = QtCore.Signal(object)
+
+    def __init__(self, controller: "QtStateController", spec: dict[str, Any], parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._controller = controller
+        self.spec = spec
+        self._hovered = False
+        self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.setMouseTracking(True)
+        self.setObjectName("menuItemFrame")
+        self.setFixedHeight(28)
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(12, 5, 12, 5)
+        layout.setSpacing(10)
+
+        self.icon_label = QtWidgets.QLabel()
+        self.icon_label.setFixedSize(14, 14)
+        self.icon_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(self.icon_label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        self.text_label = QtWidgets.QLabel(str(spec.get("label") or ""))
+        self.text_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.text_label.setStyleSheet("background:transparent;")
+        text_font = QtGui.QFont("Outfit")
+        text_font.setPixelSize(12)
+        text_font.setWeight(QtGui.QFont.Weight.Medium)
+        self.text_label.setFont(text_font)
+        layout.addWidget(self.text_label, 1, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        self.shortcut_label = QtWidgets.QLabel(str(spec.get("shortcut") or ""))
+        self.shortcut_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        shortcut_font = QtGui.QFont("JetBrains Mono")
+        shortcut_font.setPixelSize(9)
+        shortcut_font.setWeight(QtGui.QFont.Weight.Medium)
+        self.shortcut_label.setFont(shortcut_font)
+        layout.addWidget(self.shortcut_label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        self.arrow_label = QtWidgets.QLabel("›" if spec.get("submenu") else "")
+        self.arrow_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        arrow_font = QtGui.QFont("Outfit")
+        arrow_font.setPixelSize(13)
+        arrow_font.setWeight(QtGui.QFont.Weight.Medium)
+        self.arrow_label.setFont(arrow_font)
+        self.arrow_label.setFixedWidth(10)
+        self.arrow_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.arrow_label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        self._update_visual()
+
+    def set_hovered(self, hovered: bool) -> None:
+        hovered = bool(hovered)
+        if self._hovered == hovered:
+            return
+        self._hovered = hovered
+        self._update_visual()
+
+    def _update_visual(self) -> None:
+        bg = "rgba(255,255,255,0.08)" if self._hovered else "transparent"
+        self.setStyleSheet(f"QFrame#menuItemFrame{{background:{bg}; border:none; border-radius:6px;}}")
+        self.text_label.setStyleSheet(
+            f"background:transparent; color:{'#FFFFFF' if self._hovered else '#D4D4D8'};"
+        )
+        self.shortcut_label.setStyleSheet(
+            f"background:transparent; color:{'#71717A' if self.spec.get('shortcut') else 'transparent'};"
+        )
+        self.arrow_label.setStyleSheet(
+            f"background:transparent; color:{'#FFFFFF' if self._hovered else '#71717A'};"
+        )
+        icon_name = str(self.spec.get("icon") or "")
+        if icon_name:
+            pixmap = self._controller._menu_icon_pixmap(
+                icon_name,
+                "#00F0FF" if self._hovered else "#A1A1AA",
+                14,
+            )
+            self.icon_label.setPixmap(pixmap)
+        else:
+            self.icon_label.clear()
+
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        self.set_hovered(True)
+        self.hovered.emit(self, self.spec)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self.set_hovered(False)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.activated.emit(self.spec)
+        super().mouseReleaseEvent(event)
+
+
+class PopupMenuWindow(QtWidgets.QWidget):
+    def __init__(
+        self,
+        controller: "QtStateController",
+        menu_name: str,
+        items: list[dict[str, Any]],
+        *,
+        root_menu_name: str,
+        parent_popup: "PopupMenuWindow | None" = None,
+    ) -> None:
+        window_parent = controller._app_window()
+        super().__init__(window_parent)
+        self._controller = controller
+        self._menu_name = menu_name
+        self._root_menu_name = root_menu_name
+        self._parent_popup = parent_popup
+        self._child_popup: PopupMenuWindow | None = None
+        self._item_widgets: list[PopupMenuItemFrame] = []
+
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.Tool
+            | QtCore.Qt.WindowType.FramelessWindowHint
+            | QtCore.Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.card = QtWidgets.QFrame()
+        self.card.setObjectName("menuCard")
+        self.card.setStyleSheet(
+            "QFrame#menuCard{"
+            "background:rgba(14,14,18,242);"
+            "border:1px solid rgba(255,255,255,0.10);"
+            "border-radius:12px;"
+            "}"
+        )
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self.card)
+        shadow.setBlurRadius(50)
+        shadow.setOffset(0, 20)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 204))
+        self.card.setGraphicsEffect(shadow)
+        root_layout.addWidget(self.card)
+
+        card_layout = QtWidgets.QVBoxLayout(self.card)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        card_layout.setSpacing(0)
+
+        self.setMinimumWidth(268 if parent_popup is None else 190)
+
+        for spec in items:
+            if spec.get("type") == "separator":
+                separator = QtWidgets.QFrame()
+                separator.setFixedHeight(14)
+                sep_layout = QtWidgets.QVBoxLayout(separator)
+                sep_layout.setContentsMargins(12, 6, 12, 6)
+                sep_layout.setSpacing(0)
+                line = QtWidgets.QFrame()
+                line.setFixedHeight(1)
+                line.setStyleSheet("background:rgba(255,255,255,0.10); border:none;")
+                sep_layout.addWidget(line)
+                card_layout.addWidget(separator)
+                continue
+
+            item = PopupMenuItemFrame(controller, spec, self.card)
+            item.hovered.connect(self._on_item_hovered)
+            item.activated.connect(self._on_item_activated)
+            self._item_widgets.append(item)
+            card_layout.addWidget(item)
+
+        self.adjustSize()
+
+    def open_at(self, global_pos: QtCore.QPoint) -> None:
+        self.adjustSize()
+        self.move(global_pos)
+        self.show()
+        self.raise_()
+
+    def contains_global_pos(self, global_pos: QtCore.QPoint) -> bool:
+        if self.isVisible() and self.frameGeometry().contains(global_pos):
+            return True
+        if self._child_popup and self._child_popup.contains_global_pos(global_pos):
+            return True
+        return False
+
+    def close_chain(self) -> None:
+        if self._child_popup is not None:
+            self._child_popup.close_chain()
+            self._child_popup.deleteLater()
+            self._child_popup = None
+        self.hide()
+
+    def _open_submenu(self, spec: dict[str, Any], source_item: PopupMenuItemFrame) -> None:
+        submenu = spec.get("submenu")
+        if not submenu:
+            self._close_submenu()
+            return
+        submenu_name = str(spec.get("label") or "submenu")
+        if self._child_popup is not None and self._child_popup._menu_name == submenu_name:
+            point = source_item.mapToGlobal(QtCore.QPoint(source_item.width() - 4, 0))
+            self._child_popup.open_at(point)
+            return
+        self._close_submenu()
+        child = PopupMenuWindow(
+            self._controller,
+            submenu_name,
+            list(submenu),
+            root_menu_name=self._root_menu_name,
+            parent_popup=self,
+        )
+        self._child_popup = child
+        point = source_item.mapToGlobal(QtCore.QPoint(source_item.width() - 4, 0))
+        child.open_at(point)
+
+    def _close_submenu(self) -> None:
+        if self._child_popup is None:
+            return
+        self._child_popup.close_chain()
+        self._child_popup.deleteLater()
+        self._child_popup = None
+
+    def _on_item_hovered(self, source_item: PopupMenuItemFrame, spec: dict[str, Any]) -> None:
+        submenu = spec.get("submenu")
+        if submenu:
+            self._open_submenu(spec, source_item)
+        else:
+            self._close_submenu()
+
+    def _on_item_activated(self, spec: dict[str, Any]) -> None:
+        submenu = spec.get("submenu")
+        if submenu:
+            return
+        self._controller._execute_menu_action(str(spec.get("action") or ""))
+
+
 class TrainModelDialog(ThemedDialog):
     PRESET_OPTIONS = [
         ("compact", "Compact"),
@@ -461,6 +731,8 @@ class TrainModelDialog(ThemedDialog):
 
 class QtStateController(QtCore.QObject):
     stateChanged = QtCore.Signal()
+    menuPopupVisibleChanged = QtCore.Signal()
+    activeMenuNameChanged = QtCore.Signal()
 
     def __init__(self, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
@@ -471,11 +743,24 @@ class QtStateController(QtCore.QObject):
         self._preview_path: str | None = None
         self._preview_stamp: int | None = None
         self._preview_stats: dict[str, Any] | None = None
+        self._menu_popup_visible = False
+        self._active_menu_name = ""
+        self._menu_definitions: dict[str, list[dict[str, Any]]] = {}
+        self._menu_root_popup: PopupMenuWindow | None = None
+        self._menu_icon_cache: dict[tuple[str, str, int], QtGui.QPixmap] = {}
         self.refresh()
 
     @QtCore.Property("QVariantMap", notify=stateChanged)
     def state(self) -> dict[str, Any]:
         return self._state
+
+    @QtCore.Property(bool, notify=menuPopupVisibleChanged)
+    def menuPopupVisible(self) -> bool:
+        return self._menu_popup_visible
+
+    @QtCore.Property(str, notify=activeMenuNameChanged)
+    def activeMenuName(self) -> str:
+        return self._active_menu_name
 
     @QtCore.Slot()
     def minimizeWindow(self) -> None:
@@ -523,6 +808,212 @@ class QtStateController(QtCore.QObject):
         while p and not isinstance(p, QtWidgets.QMainWindow):
             p = p.parent()
         return p
+
+    def _set_menu_popup_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._menu_popup_visible == visible:
+            return
+        self._menu_popup_visible = visible
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            if visible:
+                app.installEventFilter(self)
+            else:
+                app.removeEventFilter(self)
+        self.menuPopupVisibleChanged.emit()
+
+    def _set_active_menu_name(self, menu_name: str) -> None:
+        menu_name = menu_name or ""
+        if self._active_menu_name == menu_name:
+            return
+        self._active_menu_name = menu_name
+        self.activeMenuNameChanged.emit()
+
+    def _icon_path(self, name: str) -> Path | None:
+        if not name:
+            return None
+        path = Path(__file__).resolve().parent / "assets" / "icons" / f"{name}.svg"
+        return path if path.exists() else None
+
+    def _menu_icon_pixmap(self, name: str, color_hex: str, size: int) -> QtGui.QPixmap:
+        cache_key = (name, color_hex, int(size))
+        cached = self._menu_icon_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        icon_path = self._icon_path(name)
+        if icon_path is None:
+            return QtGui.QPixmap()
+
+        image = QtGui.QImage(int(size), int(size), QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QtCore.Qt.GlobalColor.transparent)
+        renderer = QtSvg.QSvgRenderer(str(icon_path))
+        painter = QtGui.QPainter(image)
+        renderer.render(painter)
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(image.rect(), QtGui.QColor(color_hex))
+        painter.end()
+        pixmap = QtGui.QPixmap.fromImage(image)
+        self._menu_icon_cache[cache_key] = pixmap
+        return pixmap
+
+    def _menu_separator(self) -> dict[str, Any]:
+        return {"type": "separator"}
+
+    def _menu_item(
+        self,
+        label: str,
+        *,
+        icon: str = "",
+        shortcut: str = "",
+        action: str = "",
+        submenu: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "type": "item",
+            "label": label,
+            "icon": icon,
+            "shortcut": shortcut,
+            "action": action,
+            "submenu": list(submenu or []),
+        }
+
+    def _ensure_menus(self) -> None:
+        if self._menu_definitions:
+            return
+
+        export_menu = [
+            self._menu_item("Export as .ply", icon="download"),
+            self._menu_item("Export to SketchUp", icon="arrow-up-right"),
+            self._menu_separator(),
+            self._menu_item("Export Sequence", icon="film"),
+        ]
+        appearance_menu = [
+            self._menu_item("Dark Mode"),
+            self._menu_item("Light Mode"),
+            self._menu_separator(),
+            self._menu_item("High Contrast"),
+        ]
+        camera_menu = [
+            self._menu_item("Fly Mode"),
+            self._menu_item("Orbit Mode"),
+            self._menu_item("Walk Mode"),
+        ]
+        transform_menu = [
+            self._menu_item("Translate"),
+            self._menu_item("Rotate"),
+            self._menu_item("Scale"),
+        ]
+        workspace_layout_menu = [
+            self._menu_item("Default"),
+            self._menu_item("Training Focused"),
+            self._menu_item("Inspection Focused"),
+        ]
+
+        self._menu_definitions = {
+            "file": [
+                self._menu_item("New Project...", icon="folder", shortcut="CTRL+N"),
+                self._menu_item("Open Project...", icon="folder", shortcut="CTRL+O", action="importScene"),
+                self._menu_separator(),
+                self._menu_item("Save", icon="copy", shortcut="CTRL+S"),
+                self._menu_item("Save As...", shortcut="CTRL+SHIFT+S"),
+                self._menu_separator(),
+                self._menu_item("Export", icon="arrow-up-right", submenu=export_menu),
+                self._menu_separator(),
+                self._menu_item("Exit", shortcut="ALT+F4"),
+            ],
+            "edit": [
+                self._menu_item("Undo", icon="rotate-ccw", shortcut="CTRL+Z"),
+                self._menu_item("Redo", icon="rotate-ccw", shortcut="CTRL+Y"),
+                self._menu_separator(),
+                self._menu_item("Cut", shortcut="CTRL+X"),
+                self._menu_item("Copy", icon="copy", shortcut="CTRL+C"),
+                self._menu_item("Paste", shortcut="CTRL+V"),
+                self._menu_separator(),
+                self._menu_item("Preferences", icon="settings", shortcut="CTRL+,"),
+            ],
+            "view": [
+                self._menu_item("Reset Viewport", icon="maximize", shortcut="SPACE"),
+                self._menu_separator(),
+                self._menu_item("Appearance", submenu=appearance_menu),
+                self._menu_item("Show grid", icon="activity"),
+                self._menu_item("Toggle Bounding Box", icon="box-select"),
+            ],
+            "tools": [
+                self._menu_item("Camera Tools", icon="camera", submenu=camera_menu),
+                self._menu_item("Transform", icon="move", submenu=transform_menu),
+                self._menu_separator(),
+                self._menu_item("Point Selection", icon="mouse-pointer-2"),
+                self._menu_item("Color Picker", icon="pipette"),
+            ],
+            "window": [
+                self._menu_item("Project Explorer"),
+                self._menu_item("Properties"),
+                self._menu_item("Console", icon="terminal"),
+                self._menu_separator(),
+                self._menu_item("Workspace Layout", submenu=workspace_layout_menu),
+            ],
+            "help": [
+                self._menu_item("Documentation"),
+                self._menu_item("Tutorials"),
+                self._menu_separator(),
+                self._menu_item("About Gaussian Studio", icon="box"),
+            ],
+        }
+
+    def _execute_menu_action(self, action_key: str) -> None:
+        if action_key == "importScene":
+            self.closeAllMenus()
+            self.importGaussianSceneDialog()
+            return
+        self.closeAllMenus()
+
+    @QtCore.Slot()
+    def closeAllMenus(self) -> None:
+        if self._menu_root_popup is not None:
+            self._menu_root_popup.close_chain()
+            self._menu_root_popup.deleteLater()
+            self._menu_root_popup = None
+        self._set_menu_popup_visible(False)
+        self._set_active_menu_name("")
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if not self._menu_popup_visible or self._menu_root_popup is None:
+            return super().eventFilter(obj, event)
+        if event.type() == QtCore.QEvent.Type.KeyPress:
+            key_event = event if isinstance(event, QtGui.QKeyEvent) else None
+            if key_event is not None and key_event.key() == QtCore.Qt.Key.Key_Escape:
+                self.closeAllMenus()
+                return True
+        if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+            mouse_event = event if isinstance(event, QtGui.QMouseEvent) else None
+            if mouse_event is not None:
+                global_pos = mouse_event.globalPosition().toPoint()
+                if not self._menu_root_popup.contains_global_pos(global_pos):
+                    self.closeAllMenus()
+        return super().eventFilter(obj, event)
+
+    @QtCore.Slot(str, float, float)
+    def showMenu(self, menu_name: str, gx: float, gy: float) -> None:
+        self._ensure_menus()
+        menu_key = (menu_name or "").lower()
+        menu_items = self._menu_definitions.get(menu_key)
+        if menu_items is None:
+            return
+        if self._menu_root_popup is not None:
+            self._menu_root_popup.close_chain()
+            self._menu_root_popup.deleteLater()
+            self._menu_root_popup = None
+        self._menu_root_popup = PopupMenuWindow(
+            self,
+            menu_key,
+            list(menu_items),
+            root_menu_name=menu_key,
+            parent_popup=None,
+        )
+        self._set_active_menu_name(menu_key)
+        self._set_menu_popup_visible(True)
+        self._menu_root_popup.open_at(QtCore.QPoint(int(gx), int(gy)))
 
     @QtCore.Slot(str)
     def selectProject(self, project_id: str) -> None:
@@ -591,6 +1082,35 @@ class QtStateController(QtCore.QObject):
         if not files:
             return
         ingest_media_sources(self._active_project_id, list(files))
+        self.refresh()
+
+    @QtCore.Slot()
+    def importGaussianSceneDialog(self) -> None:
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._app_window(),
+            "Import Gaussian scene",
+            "",
+            "Gaussian Scenes (*.gasp *.ply);;Gaussian GASP (*.gasp);;Gaussian PLY (*.ply)",
+        )
+        if not filename:
+            return
+        mode = IMPORT_MODE_DIRECT if Path(filename).suffix.lower() == ".gasp" else None
+        if mode is None:
+            dialog = SplatImportModeDialog(filename, self._app_window())
+            if dialog.run() != QtWidgets.QDialog.DialogCode.Accepted or not dialog.mode:
+                return
+            mode = dialog.mode
+        try:
+            result = import_gaussian_scene_file(filename, mode=mode)
+        except Exception as error:
+            traceback.print_exc()
+            QtWidgets.QMessageBox.warning(
+                self._app_window(),
+                "Import failed",
+                f"{type(error).__name__}: {error}",
+            )
+            return
+        self._active_project_id = result["project"]["id"]
         self.refresh()
 
     @QtCore.Slot()
@@ -835,7 +1355,7 @@ class QtStateController(QtCore.QObject):
         }
 
     def _preview_payload(self, project: dict[str, Any], latest: dict[str, Any] | None, images: list[Path]) -> dict[str, Any]:
-        preview_path = project.get("last_result_ply")
+        preview_path = self._project_preview_path(project)
         if not preview_runtime_available():
             return {"hasScene": False, "path": "", "pointCount": 0, "emptyTitle": "Native preview unavailable", "footer": preview_runtime_error() or "Build the preview runtime to enable the embedded renderer."}
         if not preview_path or not Path(preview_path).exists():
@@ -843,12 +1363,22 @@ class QtStateController(QtCore.QObject):
             footer = "No photos have been added yet." if not images else "Training is running. Logs update live in the right panel." if latest and latest["status"] == "running" else f"{len(images)} photos loaded. Press Train Model to build the scene."
             return {"hasScene": False, "path": "", "pointCount": 0, "emptyTitle": title, "footer": footer}
         stats = self._preview_scene_stats(preview_path)
-        return {"hasScene": True, "path": preview_path, "pointCount": int(stats["point_count"]), "emptyTitle": "", "footer": f"Bounds: {stats['bounds']['min']} -> {stats['bounds']['max']}"}
+        return {"hasScene": True, "path": preview_path, "projectId": project["id"], "pointCount": int(stats["point_count"]), "emptyTitle": "", "footer": f"Bounds: {stats['bounds']['min']} -> {stats['bounds']['max']}"}
+
+    def _project_preview_path(self, project: dict[str, Any]) -> str | None:
+        return preview_scene_path(project)
 
     def _preview_scene_stats(self, preview_path: str) -> dict[str, Any]:
         stamp = Path(preview_path).stat().st_mtime_ns
         if preview_path != self._preview_path or stamp != self._preview_stamp:
-            _points, self._preview_stats = read_preview_points(preview_path, sample_limit=64)
+            if Path(preview_path).suffix.lower() == ".gasp":
+                metadata = read_gaussian_gasp_metadata(preview_path)
+                self._preview_stats = {
+                    "point_count": int(metadata.get("vertex_count") or metadata.get("point_count") or 0),
+                    "bounds": metadata.get("bounds") or {"min": "unknown", "max": "unknown"},
+                }
+            else:
+                _points, self._preview_stats = read_preview_points(preview_path, sample_limit=64)
             self._preview_path = preview_path
             self._preview_stamp = stamp
         return dict(self._preview_stats or {})

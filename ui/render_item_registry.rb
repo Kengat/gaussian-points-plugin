@@ -81,7 +81,7 @@ module GaussianPoints
       def register_gaussian_file(name:, filename:)
         id = next_id('gs')
         GaussianPoints::GaussianSplats.clear_splat_objects if gaussian_items.empty?
-        initial_state = GaussianPoints::GaussianSplats.load_ply_splats_file_as_object(id, filename)
+        initial_state = GaussianPoints::GaussianSplats.load_gaussian_splats_file_as_object(id, filename)
         return nil unless initial_state
 
         items[id] = {

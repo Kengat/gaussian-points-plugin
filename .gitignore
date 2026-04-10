@@ -8,6 +8,9 @@ cpp/libE57/build/
 sandbox/cpp/build/
 build_out/
 external/SketchUpSDK/
+_tmp_*/
+_tmp_*
+tmp_*.js
 
 # IDE and compiler cache
 **/.vs/
@@ -19,10 +22,13 @@ external/SketchUpSDK/
 *.ipdb
 *.obj
 *.pdb
+*.exp
+*.lib
 *.ilk
 *.tlog
 *.recipe
 *.lastbuildstate
+*.bak
 
 # Source artwork backups
 ui/icons_originals/
@@ -42,7 +48,15 @@ companion_app/tests/__pycache__/
 companion_app/tests/_tmp_*/
 companion_app/tests/_smoke_*/
 companion_app/tests/_smoke_assets/
+scripts/__pycache__/
 
 # Temporary dataset fetch worktrees and probes
 sample_datasets/_hf_lego_repo/
 sample_datasets/_probe_*
+sample_datasets/MyRoom/
+sample_datasets/OldHouse/
+sample_datasets/nerfstudio_poster_video/
+
+# Local agent scratch files
+.claude/
+.codex_tmp_*.png

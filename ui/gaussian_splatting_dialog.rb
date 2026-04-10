@@ -159,9 +159,9 @@ module GaussianPoints
                 </h3>
                 
                 <div class="flex items-center gap-2 mb-2 relative z-10 w-full">
-                  <button class="flex-1 py-2 rounded-full bg-gradient-to-r from-accent to-[#FF2E93] hover:opacity-90 text-white shadow-[0_0_10px_rgba(255,84,0,0.2)] text-xs font-bold transition-all flex items-center justify-center gap-1.5" data-action="load_ply">
+                  <button class="flex-1 py-2 rounded-full bg-gradient-to-r from-accent to-[#FF2E93] hover:opacity-90 text-white shadow-[0_0_10px_rgba(255,84,0,0.2)] text-xs font-bold transition-all flex items-center justify-center gap-1.5" data-action="load_scene">
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
-                    Load PLY
+                    Load GASP/PLY
                   </button>
                   <button class="w-[70px] py-2 rounded-full bg-white/5 hover:bg-white/10 text-zinc-300 text-[10px] font-semibold transition-all flex items-center justify-center border border-white/10" title="Check PLY without loading" data-action="analyze_ply">
                     Analyze
@@ -306,7 +306,7 @@ module GaussianPoints
         @@dialog.add_action_callback('set_up_axis_mode') do |_ctx, value|
           mode = GaussianPoints::GaussianSplats.set_up_axis_mode(value)
           label = GaussianPoints::GaussianSplats.orientation_label(mode)
-          push_state("Gaussian import orientation set to #{label}. Reload the same PLY and tell me which variant is correct.", 'ok')
+          push_state("Gaussian import orientation set to #{label}. Reload the same GASP/PLY and tell me which variant is correct.", 'ok')
         end
 
         @@dialog.add_action_callback('set_sh_render_degree') do |_ctx, value|
@@ -335,16 +335,14 @@ module GaussianPoints
           push_state(ok ? 'PLY analysis completed successfully.' : 'PLY analysis was cancelled or failed.', ok ? 'ok' : 'warn')
         end
 
-        @@dialog.add_action_callback('load_ply') do |_ctx|
-          filename = UI.openpanel('Choose a Gaussian PLY file', '', 'PLY Files|*.ply||')
-          item =
-            if filename
-              GaussianPoints::UIparts::RenderItemRegistry.register_gaussian_file(
-                name: File.basename(filename),
-                filename: filename
-              )
-            end
-          push_state(item ? 'Gaussian splats loaded into the current scene.' : 'PLY load was cancelled or failed.', item ? 'ok' : 'warn')
+        @@dialog.add_action_callback('load_scene') do |_ctx|
+          filename = UI.openpanel('Choose a Gaussian scene file', '', 'Gaussian Scenes|*.gasp;*.ply|Gaussian GASP|*.gasp|Gaussian PLY|*.ply||')
+          if filename
+            GaussianPoints::IO::GaussianSceneImporter.load_with_mode_prompt(filename)
+            push_state('Choose how to load the selected Gaussian scene.', 'ok')
+          else
+            push_state('Gaussian scene load was cancelled.', 'warn')
+          end
         end
 
         @@dialog.add_action_callback('render_now') do |_ctx|

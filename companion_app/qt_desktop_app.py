@@ -10,6 +10,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import APP_VERSION, store
 from .native_preview import preview_bridge, preview_runtime_available
+from .qt_state import SplatImportModeDialog
 from .web_desktop_app import CompanionApi
 
 
@@ -50,6 +51,25 @@ class QtStateApi(CompanionApi):
             "Supported Media (*.bmp *.jpg *.jpeg *.png *.tif *.tiff *.webp *.mp4 *.mov *.m4v *.avi *.mkv *.webm *.zip);;All files (*.*)",
         )
         return tuple(files) if files else None
+
+    def _pick_scene_file(self) -> str | None:
+        parent = self._window if isinstance(self._window, QtWidgets.QWidget) else None
+        filename, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            parent,
+            "Import Gaussian scene",
+            "",
+            "Gaussian Scenes (*.gasp *.ply);;Gaussian GASP (*.gasp);;Gaussian PLY (*.ply)",
+        )
+        return filename or None
+
+    def _choose_scene_import_mode(self, filename: str) -> str | None:
+        if Path(filename).suffix.lower() == ".gasp":
+            return "direct"
+        parent = self._window if isinstance(self._window, QtWidgets.QWidget) else None
+        dialog = SplatImportModeDialog(filename, parent)
+        if dialog.run() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        return dialog.mode
 
 
 class NativePreviewWidget(QtWidgets.QWidget):
@@ -133,9 +153,9 @@ class NativePreviewWidget(QtWidgets.QWidget):
         if not scene_path.exists():
             self.clear_scene()
             return
-        self.bridge.load_ply(scene_path)
+        loaded = self.bridge.load_scene(scene_path)
         self.bridge.request_redraw()
-        self._current_path = str(scene_path)
+        self._current_path = str(scene_path) if loaded else None
 
     def preview_fps(self) -> float:
         if not self.available or not self._window_created:
@@ -235,6 +255,7 @@ class DotViewport(QtWidgets.QWidget):
         super().__init__(parent)
         self.preview = NativePreviewWidget(self)
         self._last_fps = 0.0
+        self._last_project_id: str | None = None
         self.preview.setStyleSheet("background:#07070A; border-radius:28px;")
         self.hud = QtWidgets.QFrame(self)
         self.hud.setStyleSheet(
@@ -281,12 +302,16 @@ class DotViewport(QtWidgets.QWidget):
         splats = preview.get("pointCount")
         self.splats_value.setText(f"{int(splats):,}" if isinstance(splats, int) else "0")
         if preview.get("hasScene") and preview.get("path"):
+            project_id = str(preview.get("projectId") or "")
+            force_reload = bool(project_id and project_id != self._last_project_id)
             self.placeholder.hide()
-            self.preview.load_scene(preview["path"], force_reload=False)
+            self.preview.load_scene(preview["path"], force_reload=force_reload)
+            self._last_project_id = project_id or self._last_project_id
         else:
             self.preview.clear_scene()
             self.placeholder.setText(preview.get("emptyTitle") or "Scene preview will appear here")
             self.placeholder.show()
+            self._last_project_id = None
         self._refresh_fps(fallback_text=performance_text)
 
     def _refresh_fps(self, fallback_text: str | None = None) -> None:
@@ -443,6 +468,16 @@ class QtCompanionWindow(QtWidgets.QMainWindow):
                 "QPushButton{background:transparent; border:none; color:#A1A1AA; font-size:12px; font-weight:600;}"
                 "QPushButton:hover{color:#FFFFFF;}"
             )
+            if name == "File":
+                menu = QtWidgets.QMenu(button)
+                menu.setStyleSheet(
+                    "QMenu{background:#111116; color:#FAFAFA; border:1px solid rgba(255,255,255,0.12); padding:6px;}"
+                    "QMenu::item{padding:7px 24px 7px 12px; border-radius:6px;}"
+                    "QMenu::item:selected{background:#FF5400; color:#FFFFFF;}"
+                )
+                import_action = menu.addAction("Import...")
+                import_action.triggered.connect(self._import_scene)
+                button.setMenu(menu)
             layout.addWidget(button)
         layout.addStretch(1)
         community = QtWidgets.QPushButton("Community Gallery")
@@ -888,6 +923,9 @@ class QtCompanionWindow(QtWidgets.QMainWindow):
 
     def _add_photos(self) -> None:
         self._consume_result(self.api.add_photos(self.active_project_id))
+
+    def _import_scene(self) -> None:
+        self._consume_result(self.api.import_scene())
 
     def _start_training(self) -> None:
         dialog = TrainStepsDialog(self)

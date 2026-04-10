@@ -15,14 +15,22 @@ from typing import Any
 from PIL import Image
 
 from . import APP_VERSION, paths, store
+from .gaussian_gasp import read_gaussian_gasp_metadata
 from .native_preview import preview_bridge, preview_runtime_available, preview_runtime_error
 from .pipeline import ensure_project_camera_manifests, ingest_media_sources, list_project_images
 from .ply import read_preview_points
+from .preview_scene import preview_scene_path
+from .scene_import import import_gaussian_scene_file
 
 
 MEDIA_FILE_FILTER = (
     "Media Files (*.bmp;*.jpg;*.jpeg;*.png;*.tif;*.tiff;*.webp;*.mp4;*.mov;*.m4v;*.avi;*.mkv;*.webm;*.zip)",
     "All files (*.*)",
+)
+SCENE_FILE_FILTER = (
+    "Gaussian Scenes (*.gasp;*.ply)",
+    "Gaussian GASP (*.gasp)",
+    "Gaussian PLY (*.ply)",
 )
 PREVIEW_HIDDEN_X = -10000
 PREVIEW_HIDDEN_Y = -10000
@@ -215,9 +223,11 @@ class NativePreviewOverlay:
             return
         if self._current_path != self._pending_path:
             _preview_debug(f"overlay.apply_pending_scene loading {scene_path}")
-            self._invoke_on_form_thread(lambda: self.bridge.load_ply(scene_path))
+            loaded = bool(self._invoke_on_form_thread(lambda: self.bridge.load_scene(scene_path), default=False))
             self._invoke_on_form_thread(lambda: self.bridge.fit_camera())
-            self._current_path = self._pending_path
+            self._current_path = self._pending_path if loaded else None
+            if not loaded:
+                _preview_debug(f"overlay.apply_pending_scene load failed {scene_path}")
         self._invoke_on_form_thread(lambda: self.bridge.request_redraw())
 
     def _destroy_window(self) -> None:
@@ -337,6 +347,7 @@ class CompanionApi:
         self._preview_cache_stamp: int | None = None
         self._preview_cache_stats: dict[str, Any] | None = None
         self._active_project_hint: str | None = None
+        self._preview_project_hint: str | None = None
         self._preview_host = PreviewHostBounds()
 
         paths.ensure_runtime_dirs()
@@ -379,6 +390,36 @@ class CompanionApi:
             ingest_media_sources(project_id, list(files))
             self._active_project_hint = project_id
             return self._success("Media added.", state=self._build_state(project_id))
+
+    def import_scene(self) -> dict[str, Any]:
+        with self._lock:
+            filename = self._pick_scene_file()
+            if not filename:
+                return self._failure("Import cancelled.", cancelled=True)
+            mode = self._choose_scene_import_mode(filename)
+            if not mode:
+                return self._failure("Import cancelled.", cancelled=True)
+            return self._import_scene_path(filename, mode)
+
+    def pick_scene_file(self) -> dict[str, Any]:
+        with self._lock:
+            filename = self._pick_scene_file()
+            if not filename:
+                return self._failure("Import cancelled.", cancelled=True)
+            return self._success(filePath=filename, fileName=Path(filename).name)
+
+    def import_scene_path(self, filename: str, mode: str = "convert") -> dict[str, Any]:
+        with self._lock:
+            return self._import_scene_path(filename, mode)
+
+    def _import_scene_path(self, filename: str, mode: str = "convert") -> dict[str, Any]:
+        try:
+            result = import_gaussian_scene_file(filename, mode=mode)
+        except Exception as error:
+            return self._failure(f"Import failed: {type(error).__name__}: {error}")
+        project = result["project"]
+        self._active_project_hint = project["id"]
+        return self._success("Scene imported.", state=self._build_state(project["id"]))
 
     def create_sample_project(self) -> dict[str, Any]:
         with self._lock:
@@ -721,7 +762,7 @@ class CompanionApi:
         }
 
     def _preview_payload(self, project: dict[str, Any], latest_job: dict[str, Any] | None, images: list[Path]) -> dict[str, Any]:
-        preview_path = project.get("last_result_ply")
+        preview_path = self._project_preview_path(project)
         if not preview_runtime_available():
             return {
                 "title": "Scene Preview (Native Gaussian)",
@@ -784,6 +825,7 @@ class CompanionApi:
             "hasScene": True,
             "emptyTitle": "",
             "emptyBody": "",
+            "projectId": project["id"],
             "pointCount": point_count,
             "path": preview_path,
         }
@@ -792,18 +834,32 @@ class CompanionApi:
         path = Path(preview_path)
         stamp = path.stat().st_mtime_ns
         if preview_path != self._preview_cache_path or stamp != self._preview_cache_stamp:
-            _points, stats = read_preview_points(preview_path, sample_limit=64)
+            if path.suffix.lower() == ".gasp":
+                metadata = read_gaussian_gasp_metadata(path)
+                stats = {
+                    "point_count": int(metadata.get("vertex_count") or metadata.get("point_count") or 0),
+                    "bounds": metadata.get("bounds") or {"min": "unknown", "max": "unknown"},
+                }
+            else:
+                _points, stats = read_preview_points(preview_path, sample_limit=64)
             self._preview_cache_path = preview_path
             self._preview_cache_stamp = stamp
             self._preview_cache_stats = stats
         return dict(self._preview_cache_stats or {})
 
+    def _project_preview_path(self, project: dict[str, Any]) -> str | None:
+        return preview_scene_path(project)
+
     def _sync_preview_overlay(self, preview: dict[str, Any]) -> None:
         self._preview_overlay.set_host(self._resolve_preview_form(), self._preview_host_bounds())
         if preview.get("hasScene") and preview.get("path"):
-            self._preview_overlay.load_scene(preview["path"], force_reload=False)
+            project_id = str(preview.get("projectId") or "")
+            force_reload = bool(project_id and project_id != self._preview_project_hint)
+            self._preview_overlay.load_scene(preview["path"], force_reload=force_reload)
+            self._preview_project_hint = project_id or self._preview_project_hint
         else:
             self._preview_overlay.clear_scene()
+            self._preview_project_hint = None
 
     def _resolve_active_project_id(self, projects: list[dict[str, Any]], requested_id: str | None) -> str | None:
         project_ids = {project["id"] for project in projects}
@@ -1013,6 +1069,21 @@ class CompanionApi:
         )
         return tuple(result) if result else None
 
+    def _pick_scene_file(self) -> str | None:
+        if not self._window or not self._webview:
+            return None
+        result = self._window.create_file_dialog(
+            self._webview.OPEN_DIALOG,
+            allow_multiple=False,
+            file_types=SCENE_FILE_FILTER,
+        )
+        return str(result[0]) if result else None
+
+    def _choose_scene_import_mode(self, filename: str) -> str | None:
+        if Path(filename).suffix.lower() == ".gasp":
+            return "direct"
+        return "convert"
+
     def _launch_worker(self, job_id: str) -> None:
         creationflags = 0
         if os.name == "nt":
@@ -1036,12 +1107,13 @@ class CompanionApi:
             return
         raise RuntimeError(f"Opening paths is only implemented for Windows right now: {path}")
 
-    def _success(self, message: str | None = None, *, state: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _success(self, message: str | None = None, *, state: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
         payload = {"ok": True}
         if message:
             payload["message"] = message
         if state is not None:
             payload["state"] = state
+        payload.update(extra)
         return payload
 
     def _failure(self, message: str, *, cancelled: bool = False) -> dict[str, Any]:

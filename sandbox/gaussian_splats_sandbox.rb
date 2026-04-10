@@ -285,6 +285,21 @@ module GaussianPoints
           @load_splats_from_ply_with_up_axis = nil
         end
         begin
+          @load_splats_from_gasp = Fiddle::Function.new(
+            @renderer_dll['LoadSplatsFromGASP'],
+            [Fiddle::TYPE_VOIDP],
+            Fiddle::TYPE_VOID
+          )
+          @load_splats_from_gasp_with_up_axis = Fiddle::Function.new(
+            @renderer_dll['LoadSplatsFromGASPWithUpAxis'],
+            [Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+            Fiddle::TYPE_VOID
+          )
+        rescue Fiddle::DLError
+          @load_splats_from_gasp = nil
+          @load_splats_from_gasp_with_up_axis = nil
+        end
+        begin
           @load_splat_object_from_ply = Fiddle::Function.new(
             @renderer_dll['LoadSplatObjectFromPLY'],
             [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
@@ -298,6 +313,21 @@ module GaussianPoints
             )
           rescue Fiddle::DLError
             @load_splat_object_from_ply_with_up_axis = nil
+          end
+          begin
+            @load_splat_object_from_gasp = Fiddle::Function.new(
+              @renderer_dll['LoadSplatObjectFromGASP'],
+              [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
+              Fiddle::TYPE_INT
+            )
+            @load_splat_object_from_gasp_with_up_axis = Fiddle::Function.new(
+              @renderer_dll['LoadSplatObjectFromGASPWithUpAxis'],
+              [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+              Fiddle::TYPE_INT
+            )
+          rescue Fiddle::DLError
+            @load_splat_object_from_gasp = nil
+            @load_splat_object_from_gasp_with_up_axis = nil
           end
           @set_splat_object_transform = Fiddle::Function.new(
             @renderer_dll['SetSplatObjectTransform'],
@@ -322,6 +352,8 @@ module GaussianPoints
         rescue Fiddle::DLError
           @load_splat_object_from_ply = nil
           @load_splat_object_from_ply_with_up_axis = nil
+          @load_splat_object_from_gasp = nil
+          @load_splat_object_from_gasp_with_up_axis = nil
           @set_splat_object_transform = nil
           @set_splat_object_highlight = nil
           @remove_splat_object = nil
@@ -476,6 +508,27 @@ module GaussianPoints
       true
     end
 
+    def self.load_gaussian_splats_file(filename, up_axis_mode: self.up_axis_mode)
+      return load_gasp_splats_file(filename, up_axis_mode: up_axis_mode) if File.extname(filename.to_s).downcase == '.gasp'
+
+      load_ply_splats_file(filename, up_axis_mode: up_axis_mode)
+    end
+
+    def self.load_gasp_splats_file(filename, up_axis_mode: self.up_axis_mode)
+      return false unless ensure_initialized
+      return false unless @renderer_dll_loaded
+      return false unless @load_splats_from_gasp
+
+      c_filename = to_c_string(filename.tr('/', '\\'))
+      if @load_splats_from_gasp_with_up_axis
+        @load_splats_from_gasp_with_up_axis.call(c_filename, up_axis_mode_native_value(up_axis_mode))
+      else
+        @load_splats_from_gasp.call(c_filename)
+      end
+      sync_bounds_proxy_from_renderer
+      true
+    end
+
     def self.load_ply_splats_file_as_object(id, filename, up_axis_mode: self.up_axis_mode)
       return nil unless ensure_initialized
       return nil unless @renderer_dll_loaded
@@ -497,6 +550,59 @@ module GaussianPoints
           )
         else
           @load_splat_object_from_ply.call(
+            to_c_string(id),
+            to_c_string(filename.tr('/', '\\')),
+            center_buffer,
+            half_buffer
+          )
+        end
+      return nil if result == 0
+
+      center = center_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE].unpack('d3')
+      half_extents = half_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE].unpack('d3')
+
+      {
+        center: Geom::Point3d.new(*center),
+        half_extents: {
+          x: half_extents[0],
+          y: half_extents[1],
+          z: half_extents[2]
+        },
+        axes: {
+          x: Geom::Vector3d.new(1, 0, 0),
+          y: Geom::Vector3d.new(0, 1, 0),
+          z: Geom::Vector3d.new(0, 0, 1)
+        }
+      }
+    end
+
+    def self.load_gaussian_splats_file_as_object(id, filename, up_axis_mode: self.up_axis_mode)
+      return load_gasp_splats_file_as_object(id, filename, up_axis_mode: up_axis_mode) if File.extname(filename.to_s).downcase == '.gasp'
+
+      load_ply_splats_file_as_object(id, filename, up_axis_mode: up_axis_mode)
+    end
+
+    def self.load_gasp_splats_file_as_object(id, filename, up_axis_mode: self.up_axis_mode)
+      return nil unless ensure_initialized
+      return nil unless @renderer_dll_loaded
+      return nil unless @load_splat_object_from_gasp
+
+      center_buffer = Fiddle::Pointer.malloc(3 * Fiddle::SIZEOF_DOUBLE)
+      half_buffer = Fiddle::Pointer.malloc(3 * Fiddle::SIZEOF_DOUBLE)
+      center_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE] = [0.0, 0.0, 0.0].pack('d3')
+      half_buffer[0, 3 * Fiddle::SIZEOF_DOUBLE] = [0.0, 0.0, 0.0].pack('d3')
+
+      result =
+        if @load_splat_object_from_gasp_with_up_axis
+          @load_splat_object_from_gasp_with_up_axis.call(
+            to_c_string(id),
+            to_c_string(filename.tr('/', '\\')),
+            center_buffer,
+            half_buffer,
+            up_axis_mode_native_value(up_axis_mode)
+          )
+        else
+          @load_splat_object_from_gasp.call(
             to_c_string(id),
             to_c_string(filename.tr('/', '\\')),
             center_buffer,

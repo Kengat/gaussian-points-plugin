@@ -15,6 +15,7 @@
 #include <mutex>
 #include <numeric>
 #include <cstdint>
+#include <limits>
 
 #define NOMINMAX
 #undef min
@@ -3840,6 +3841,189 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     RefreshWorldSplatsFromObjects();
     LogRenderer("CHK: RefreshWorldSplatsFromObjects finished");
     return 1;
+}
+
+static const uint32_t GAUSSIAN_GASP_VERSION = 3;
+
+#pragma pack(push, 1)
+struct GaussianGaspHeader {
+    char magic[4];
+    uint32_t version;
+    uint32_t flags;
+    uint64_t point_count;
+    uint64_t ply_size;
+    uint32_t manifest_size;
+    uint32_t point_stride;
+    unsigned char ply_sha256[32];
+};
+#pragma pack(pop)
+
+static bool TryOpenBinaryStreamWithCodePage(std::ifstream& stream, const char* filename, UINT code_page, const char* label) {
+    int wide_length = MultiByteToWideChar(code_page, 0, filename, -1, nullptr, 0);
+    if (wide_length <= 0) {
+        return false;
+    }
+
+    std::vector<wchar_t> wide_buffer(static_cast<size_t>(wide_length));
+    if (MultiByteToWideChar(code_page, 0, filename, -1, wide_buffer.data(), wide_length) <= 0) {
+        return false;
+    }
+
+    stream.open(static_cast<const wchar_t*>(wide_buffer.data()), std::ios::binary);
+    if (stream.is_open()) {
+        LogRenderer("Opened binary stream using %s path decoding.", label);
+        return true;
+    }
+    return false;
+}
+
+static std::ifstream OpenBinaryStream(const char* filename) {
+    std::ifstream stream;
+    if (!filename || !filename[0]) {
+        return stream;
+    }
+
+    stream.open(filename, std::ios::binary);
+    if (stream.is_open()) {
+        LogRenderer("Opened binary stream using native narrow path.");
+        return stream;
+    }
+
+    stream.clear();
+    if (TryOpenBinaryStreamWithCodePage(stream, filename, CP_UTF8, "UTF-8")) {
+        return stream;
+    }
+
+    stream.clear();
+    TryOpenBinaryStreamWithCodePage(stream, filename, CP_ACP, "ACP");
+    return stream;
+}
+
+static bool LoadGaussianGaspPoints(const char* filename, std::vector<PLYGaussianPoint>& out_points) {
+    out_points.clear();
+    if (!filename || filename[0] == '\0') {
+        LogRenderer("ERR: Empty GASP filename.");
+        return false;
+    }
+
+    std::ifstream stream = OpenBinaryStream(filename);
+    if (!stream) {
+        LogRenderer("ERR: Could not open GASP file: %s", filename);
+        return false;
+    }
+
+    GaussianGaspHeader header = {};
+    stream.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!stream || stream.gcount() != static_cast<std::streamsize>(sizeof(header))) {
+        LogRenderer("ERR: GASP header is truncated: %s", filename);
+        return false;
+    }
+
+    if (std::memcmp(header.magic, "GASP", 4) != 0 || header.version != GAUSSIAN_GASP_VERSION) {
+        LogRenderer(
+            "ERR: Unsupported Gaussian GASP file magic/version (version=%u): %s",
+            header.version,
+            filename
+        );
+        return false;
+    }
+
+    const uint32_t expected_stride = static_cast<uint32_t>(sizeof(PLYGaussianPoint));
+    if (header.point_stride != expected_stride) {
+        LogRenderer(
+            "ERR: Gaussian GASP point stride mismatch file=%u renderer=%u.",
+            header.point_stride,
+            expected_stride
+        );
+        return false;
+    }
+
+    if (header.point_count == 0 || header.point_count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        LogRenderer("ERR: Gaussian GASP point count is out of range: %llu.", static_cast<unsigned long long>(header.point_count));
+        return false;
+    }
+
+    stream.seekg(static_cast<std::streamoff>(header.manifest_size), std::ios::cur);
+    if (!stream) {
+        LogRenderer("ERR: Gaussian GASP manifest is truncated.");
+        return false;
+    }
+
+    const size_t point_count = static_cast<size_t>(header.point_count);
+    const size_t point_bytes = point_count * sizeof(PLYGaussianPoint);
+    out_points.resize(point_count);
+    stream.read(reinterpret_cast<char*>(out_points.data()), static_cast<std::streamsize>(point_bytes));
+    if (!stream || stream.gcount() != static_cast<std::streamsize>(point_bytes)) {
+        LogRenderer("ERR: Gaussian GASP point payload is truncated.");
+        out_points.clear();
+        return false;
+    }
+
+    LogRenderer(
+        "Loaded Gaussian GASP %s points=%llu ply_bytes=%llu manifest_bytes=%u",
+        filename,
+        static_cast<unsigned long long>(header.point_count),
+        static_cast<unsigned long long>(header.ply_size),
+        header.manifest_size
+    );
+    return true;
+}
+
+extern "C" EXPORT void LoadSplatsFromGASPWithUpAxis(const char* filename, int up_axis_mode) {
+    LogRenderer("Loading Gaussian GASP: %s", filename ? filename : "(null)");
+    std::vector<PLYGaussianPoint> points;
+    if (!LoadGaussianGaspPoints(filename, points)) {
+        return;
+    }
+    ResetSplatObjects();
+    BuildSplatObjectFromPLYData("__legacy__", points.data(), static_cast<int>(points.size()), nullptr, nullptr, up_axis_mode);
+    UpdateStandalonePreviewBounds();
+    FitStandalonePreviewCameraInternal(true);
+    InvalidateStandalonePreview();
+    LogRenderer("Gaussian GASP load finished.");
+}
+
+extern "C" EXPORT void LoadSplatsFromGASP(const char* filename) {
+    LoadSplatsFromGASPWithUpAxis(filename, IMPORT_ORIENTATION_SWAP_B);
+}
+
+extern "C" EXPORT int LoadSplatObjectFromGASPWithUpAxis(
+    const char* object_id,
+    const char* filename,
+    double* out_center_xyz,
+    double* out_half_extents_xyz,
+    int up_axis_mode) {
+    LogRenderer("Loading Gaussian GASP object '%s': %s", object_id ? object_id : "(null)", filename ? filename : "(null)");
+    if (!object_id || !filename) {
+        return 0;
+    }
+
+    std::vector<PLYGaussianPoint> points;
+    if (!LoadGaussianGaspPoints(filename, points)) {
+        return 0;
+    }
+    return BuildSplatObjectFromPLYData(
+        object_id,
+        points.data(),
+        static_cast<int>(points.size()),
+        out_center_xyz,
+        out_half_extents_xyz,
+        up_axis_mode
+    );
+}
+
+extern "C" EXPORT int LoadSplatObjectFromGASP(
+    const char* object_id,
+    const char* filename,
+    double* out_center_xyz,
+    double* out_half_extents_xyz) {
+    return LoadSplatObjectFromGASPWithUpAxis(
+        object_id,
+        filename,
+        out_center_xyz,
+        out_half_extents_xyz,
+        IMPORT_ORIENTATION_SWAP_B
+    );
 }
 
 extern "C" EXPORT void LoadSplatsFromPLYWithUpAxis(const char* filename, int up_axis_mode) { LogRenderer("Loading PLY: %s", filename); HMODULE plyDLL = LoadRendererAdjacentLibrary("PlyImporter.dll"); if (!plyDLL) { LogRenderer("ERR Load PlyImporter %lu", GetLastError()); return; } char plyPath[MAX_PATH] = {}; if (GetModuleFileNameA(plyDLL, plyPath, MAX_PATH) > 0) { LogRenderer("CHK: Loaded PlyImporter from %s", plyPath); } typedef int(*LPD)(const char*, PLYGaussianPoint**); typedef void(*FPD)(PLYGaussianPoint*); typedef int(*GPS)(); LPD load = (LPD)GetProcAddress(plyDLL, "LoadPLYData"); FPD free = (FPD)GetProcAddress(plyDLL, "FreePLYData"); GPS getSize = (GPS)GetProcAddress(plyDLL, "GetPLYGaussianPointSize"); if (!load || !free) { LogRenderer("ERR Find funcs PlyImporter"); FreeLibrary(plyDLL); return; } if (getSize) { const int importerPointSize = getSize(); const int rendererPointSize = static_cast<int>(sizeof(PLYGaussianPoint)); LogRenderer("CHK: PLYGaussianPoint size importer=%d renderer=%d", importerPointSize, rendererPointSize); if (importerPointSize != rendererPointSize) { LogRenderer("ERR: PLYGaussianPoint ABI mismatch, aborting load."); FreeLibrary(plyDLL); return; } } else { LogRenderer("WARN: GetPLYGaussianPointSize not found in PlyImporter.dll"); } PLYGaussianPoint* pts = nullptr; int cnt = load(filename, &pts); if (cnt <= 0 || !pts) { LogRenderer("ERR: PLY load failed (count=%d).", cnt); } else { LogRenderer("Loaded %d pts.", cnt); ResetSplatObjects(); BuildSplatObjectFromPLYData("__legacy__", pts, cnt, nullptr, nullptr, up_axis_mode); UpdateStandalonePreviewBounds(); FitStandalonePreviewCameraInternal(true); } if (pts) free(pts); if (plyDLL) FreeLibrary(plyDLL); InvalidateStandalonePreview(); LogRenderer("PLY load finished."); }

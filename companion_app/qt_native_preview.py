@@ -22,6 +22,7 @@ class NativePreviewHost(QtWidgets.QWidget):
         self._pending_path: str | None = None
         self._current_path: str | None = None
         self._up_axis_mode = DEFAULT_UP_AXIS_MODE
+        self._last_load_succeeded = False
         self._redraw_timer = QtCore.QTimer(self)
         self._redraw_timer.setInterval(120)
         self._redraw_timer.timeout.connect(self._heartbeat_redraw)
@@ -50,6 +51,7 @@ class NativePreviewHost(QtWidgets.QWidget):
     def clear_scene(self) -> None:
         self._pending_path = None
         self._current_path = None
+        self._last_load_succeeded = False
         if not self.available:
             return
         self._ensure_window()
@@ -89,6 +91,10 @@ class NativePreviewHost(QtWidgets.QWidget):
             return float(self._bridge.get_preview_fps())
         except Exception:
             return 0.0
+
+    @property
+    def last_load_succeeded(self) -> bool:
+        return self._last_load_succeeded
 
     def _ensure_window(self) -> None:
         if not self.available or self._window_created or not self.isVisible():
@@ -135,9 +141,15 @@ class NativePreviewHost(QtWidgets.QWidget):
         if not scene_path.exists():
             self.clear_scene()
             return
-        self._bridge.load_ply(scene_path, self._up_axis_mode)
+        loaded = bool(self._bridge.load_scene(scene_path, self._up_axis_mode))
+        if loaded:
+            self._bridge.fit_camera()
+            self._current_path = str(scene_path)
+        else:
+            self._bridge.clear_splats()
+            self._current_path = None
+        self._last_load_succeeded = loaded
         self._bridge.request_redraw()
-        self._current_path = str(scene_path)
 
     def _destroy_window(self) -> None:
         if self.available and self._window_created:

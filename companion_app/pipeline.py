@@ -22,6 +22,12 @@ except ImportError:  # pragma: no cover - optional dependency in some UI runtime
     cv2 = None
 
 from . import paths, store
+from .gaussian_gasp import (
+    export_ply_from_gaussian_gasp,
+    result_gasp_path,
+    safe_export_stem,
+    write_gaussian_gasp_from_ply,
+)
 from .ply import write_gaussian_ply
 from .video_import import extract_representative_video_frames, video_runtime_summary
 
@@ -439,6 +445,10 @@ def result_ply_path(project_id: str) -> Path:
     return paths.project_result_dir(project_id) / "scene.ply"
 
 
+def result_temp_ply_path(project_id: str) -> Path:
+    return paths.project_result_dir(project_id) / "_gaussian_export_tmp.ply"
+
+
 def result_manifest_path(project_id: str) -> Path:
     return paths.project_result_dir(project_id) / "scene_manifest.json"
 
@@ -475,9 +485,15 @@ def clear_stage_outputs(project_id: str) -> None:
         candidate = stage_file(project_id, file_name)
         if candidate.exists():
             candidate.unlink()
-    for candidate in (result_ply_path(project_id), result_manifest_path(project_id)):
+    for candidate in (
+        result_ply_path(project_id),
+        result_temp_ply_path(project_id),
+        result_manifest_path(project_id),
+    ):
         if candidate.exists():
             candidate.unlink()
+    for candidate in paths.project_result_dir(project_id).glob("*.gasp"):
+        candidate.unlink()
     for directory_name in ("normalized", "masks"):
         directory = stage_file(project_id, directory_name)
         if directory.exists():
@@ -765,18 +781,30 @@ def build_colored_splats(
 
 
 def export_result(project: dict, job: dict, splats: list[dict]) -> dict:
-    update_progress(job["id"], "Exporting", 0.85, "Writing the Gaussian PLY and SketchUp handoff package.")
-    ply_path = write_gaussian_ply(splats, result_ply_path(project["id"]))
-
+    update_progress(job["id"], "Exporting", 0.85, "Writing the Gaussian project and SketchUp handoff package.")
+    temp_ply_path = write_gaussian_ply(splats, result_temp_ply_path(project["id"]))
     xs = [point["position"][0] for point in splats]
     ys = [point["position"][1] for point in splats]
     zs = [point["position"][2] for point in splats]
+    bounds = {
+        "min": [min(xs), min(ys), min(zs)],
+        "max": [max(xs), max(ys), max(zs)],
+    }
+    workspace_gasp = write_gaussian_gasp_from_ply(
+        temp_ply_path,
+        result_gasp_path(project["id"], project["name"]),
+        project=project,
+        extra_manifest={"bounds": bounds},
+    )
 
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    export_dir = paths.exports_root() / f"{project['name'].replace(' ', '_')}_{timestamp}"
+    export_stem = safe_export_stem(project["name"])
+    export_dir = paths.exports_root()
     export_dir.mkdir(parents=True, exist_ok=True)
-    exported_ply = export_dir / "scene.ply"
-    shutil.copy2(ply_path, exported_ply)
+    exported_ply = export_dir / f"{export_stem}.ply"
+    exported_gasp = export_dir / f"{export_stem}.gasp"
+    shutil.copy2(workspace_gasp, exported_gasp)
+    export_ply_from_gaussian_gasp(workspace_gasp, exported_ply)
+    temp_ply_path.unlink(missing_ok=True)
 
     manifest = {
         "version": 1,
@@ -786,23 +814,24 @@ def export_result(project: dict, job: dict, splats: list[dict]) -> dict:
         "created_at": store.utc_now(),
         "point_count": len(splats),
         "scene_ply": str(exported_ply),
-        "workspace_scene_ply": str(ply_path),
-        "bounds": {
-            "min": [min(xs), min(ys), min(zs)],
-            "max": [max(xs), max(ys), max(zs)],
-        },
+        "scene_gasp": str(exported_gasp),
+        "workspace_scene_gasp": str(workspace_gasp),
+        "workspace_scene_ply": None,
+        "bounds": bounds,
         "sketchup_import": {
             "type": "gaussian_ply",
             "path": str(exported_ply),
+            "source_gasp": str(exported_gasp),
         },
     }
-    manifest_path = export_dir / "scene_manifest.json"
+    manifest_path = export_dir / f"{export_stem}_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    package_path = export_dir / "scene_package.gspkg"
+    package_path = export_dir / f"{export_stem}.gspkg"
     with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(exported_ply, arcname="scene.ply")
-        archive.write(manifest_path, arcname="scene_manifest.json")
+        archive.write(exported_ply, arcname=f"{export_stem}.ply")
+        archive.write(exported_gasp, arcname=f"{export_stem}.gasp")
+        archive.write(manifest_path, arcname=f"{export_stem}_manifest.json")
 
     paths.write_latest_export(
         {
@@ -810,6 +839,7 @@ def export_result(project: dict, job: dict, splats: list[dict]) -> dict:
             "project_name": project["name"],
             "manifest_path": str(manifest_path),
             "scene_ply": str(exported_ply),
+            "scene_gasp": str(exported_gasp),
             "package_path": str(package_path),
             "created_at": manifest["created_at"],
         }
@@ -818,7 +848,8 @@ def export_result(project: dict, job: dict, splats: list[dict]) -> dict:
     store.update_project(
         project["id"],
         status="ready",
-        last_result_ply=str(ply_path),
+        last_result_ply=str(exported_ply),
+        last_result_gasp=str(workspace_gasp),
         last_manifest_path=str(manifest_path),
     )
     return manifest

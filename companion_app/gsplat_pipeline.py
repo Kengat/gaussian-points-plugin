@@ -23,6 +23,12 @@ from gsplat.strategy.base import Strategy
 from gsplat.strategy.ops import inject_noise_to_position
 
 from . import paths, store
+from .gaussian_gasp import (
+    export_ply_from_gaussian_gasp,
+    result_gasp_path,
+    safe_export_stem,
+    write_gaussian_gasp_from_ply,
+)
 from .pipeline import load_project_import_summary
 from .quality import (
     compute_dataset_diagnostics,
@@ -72,8 +78,8 @@ def _stage_dir(project_id: str, name: str) -> Path:
     return directory
 
 
-def _result_ply_path(project_id: str) -> Path:
-    return paths.project_result_dir(project_id) / "scene.ply"
+def _result_temp_ply_path(project_id: str) -> Path:
+    return paths.project_result_dir(project_id) / "_gaussian_export_tmp.ply"
 
 
 def _result_manifest_path(project_id: str) -> Path:
@@ -1994,7 +2000,7 @@ def _train_gaussians(
         f"visible={validation_evaluation['visible_gaussians']:.0f}",
     )
 
-    result_path = _result_ply_path(project["id"])
+    result_path = _result_temp_ply_path(project["id"])
     export_splats(
         means=splats["means"].detach().cpu(),
         scales=splats["scales"].detach().cpu(),
@@ -2019,17 +2025,28 @@ def _export_handoff(
     bounds: dict,
     training_summary: dict[str, object],
 ) -> dict:
-    _update(job["id"], "Exporting", 0.9, "Writing the trained splat and SketchUp handoff package.")
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    export_dir = paths.exports_root() / f"{project['name'].replace(' ', '_')}_{timestamp}"
+    _update(job["id"], "Exporting", 0.9, "Writing the trained splat project and SketchUp handoff package.")
+    workspace_gasp = write_gaussian_gasp_from_ply(
+        workspace_ply,
+        result_gasp_path(project["id"], project["name"]),
+        project=project,
+        extra_manifest={"bounds": bounds, "training_summary": training_summary},
+    )
+    export_stem = safe_export_stem(project["name"])
+    export_dir = paths.exports_root()
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    exported_ply = export_dir / "scene.ply"
-    shutil.copy2(workspace_ply, exported_ply)
+    exported_ply = export_dir / f"{export_stem}.ply"
+    exported_gasp = export_dir / f"{export_stem}.gasp"
+    shutil.copy2(workspace_gasp, exported_gasp)
+    export_ply_from_gaussian_gasp(workspace_gasp, exported_ply)
+    workspace_ply.unlink(missing_ok=True)
     ply_size_bytes = int(exported_ply.stat().st_size)
     summary_payload = dict(training_summary)
+    summary_payload["gasp_size_bytes"] = int(exported_gasp.stat().st_size)
     summary_payload["ply_size_bytes"] = ply_size_bytes
     summary_payload["scene_ply"] = str(exported_ply)
+    summary_payload["scene_gasp"] = str(exported_gasp)
     summary_path = _training_summary_path(project["id"])
     summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
 
@@ -2041,22 +2058,26 @@ def _export_handoff(
         "created_at": store.utc_now(),
         "point_count": point_count,
         "scene_ply": str(exported_ply),
-        "workspace_scene_ply": str(workspace_ply),
+        "scene_gasp": str(exported_gasp),
+        "workspace_scene_gasp": str(workspace_gasp),
+        "workspace_scene_ply": None,
         "bounds": bounds,
         "sketchup_import": {
             "type": "gaussian_ply",
             "path": str(exported_ply),
+            "source_gasp": str(exported_gasp),
         },
         "training_summary_path": str(summary_path),
         "training_summary": summary_payload,
     }
-    manifest_path = export_dir / "scene_manifest.json"
+    manifest_path = export_dir / f"{export_stem}_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    package_path = export_dir / "scene_package.gspkg"
+    package_path = export_dir / f"{export_stem}.gspkg"
     with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(exported_ply, arcname="scene.ply")
-        archive.write(manifest_path, arcname="scene_manifest.json")
+        archive.write(exported_ply, arcname=f"{export_stem}.ply")
+        archive.write(exported_gasp, arcname=f"{export_stem}.gasp")
+        archive.write(manifest_path, arcname=f"{export_stem}_manifest.json")
 
     paths.write_latest_export(
         {
@@ -2064,6 +2085,7 @@ def _export_handoff(
             "project_name": project["name"],
             "manifest_path": str(manifest_path),
             "scene_ply": str(exported_ply),
+            "scene_gasp": str(exported_gasp),
             "package_path": str(package_path),
             "created_at": manifest["created_at"],
         }
@@ -2072,7 +2094,8 @@ def _export_handoff(
     store.update_project(
         project["id"],
         status="ready",
-        last_result_ply=str(workspace_ply),
+        last_result_ply=str(exported_ply),
+        last_result_gasp=str(workspace_gasp),
         last_manifest_path=str(manifest_path),
         last_training_summary=summary_payload,
     )

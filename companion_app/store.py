@@ -239,6 +239,7 @@ def create_project(name: str, backend: str = "gsplat_colmap", note: str | None =
         "input_dir": str(paths.project_input_dir(project_id)),
         "result_dir": str(paths.project_result_dir(project_id)),
         "last_result_ply": None,
+        "last_result_gasp": None,
         "last_manifest_path": None,
         "last_import_summary": None,
         "last_training_summary": None,

@@ -217,6 +217,36 @@
       );
     };
 
+    const SplatImportModal = ({ open, fileName, onCancel, onConfirm }) => {
+      if (!open) return null;
+      return (
+        <div className="absolute inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-md">
+          <div className="w-[520px] rounded-2xl border border-white/10 bg-[#101016] p-6 shadow-[0_24px_80px_rgba(0,0,0,0.6)]">
+            <div className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-3">Gaussian Scene Import</div>
+            <div className="text-2xl font-semibold text-white tracking-tight mb-3">Choose load mode</div>
+            <p className="text-sm text-zinc-400 leading-relaxed mb-5">
+              {fileName || 'Selected file'}
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={() => onConfirm('convert')} className="rounded-xl border border-[#FF5400]/30 bg-[#FF5400] px-4 py-4 text-left text-white hover:bg-[#FF6A22] transition-colors">
+                <div className="text-sm font-bold">Create / Use GASP</div>
+                <div className="mt-1 text-xs text-white/75 leading-relaxed">Fast cached project, instant reloads.</div>
+              </button>
+              <button onClick={() => onConfirm('direct')} className="rounded-xl border border-white/10 bg-white/[0.03] px-4 py-4 text-left text-zinc-100 hover:bg-white/[0.06] transition-colors">
+                <div className="text-sm font-bold">Load Directly</div>
+                <div className="mt-1 text-xs text-zinc-400 leading-relaxed">Use the selected file without building a cache.</div>
+              </button>
+            </div>
+            <div className="mt-5 flex justify-end">
+              <button onClick={onCancel} className="px-4 py-2.5 rounded-xl border border-white/10 bg-white/[0.03] text-sm font-semibold text-zinc-200 hover:bg-white/[0.06]">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
     const TrainingSetupModal = ({ open, form, onChange, onCancel, onConfirm, restartMode, valid }) => {
       if (!open) return null;
       return (
@@ -320,6 +350,8 @@
       const [activeTab, setActiveTab] = useState('overview');
       const [newProjectOpen, setNewProjectOpen] = useState(false);
       const [newProjectName, setNewProjectName] = useState('');
+      const [fileMenuOpen, setFileMenuOpen] = useState(false);
+      const [pendingSplatImport, setPendingSplatImport] = useState(null);
       const [trainingModalOpen, setTrainingModalOpen] = useState(false);
       const [trainingForm, setTrainingForm] = useState(emptyTrainingForm);
       const [trainingRestartMode, setTrainingRestartMode] = useState(false);
@@ -512,6 +544,34 @@
         setNewProjectName('');
       };
 
+      const openSplatImport = async () => {
+        if (!pyApi()) return;
+        const result = await pyApi().pick_scene_file();
+        if (result?.ok && result.filePath) {
+          const picked = { path: result.filePath, name: result.fileName || result.filePath };
+          if ((picked.path || '').toLowerCase().endsWith('.gasp')) {
+            const importResult = await pyApi().import_scene_path(picked.path, 'direct');
+            if (importResult?.state) {
+              setAppState(importResult.state);
+              setActiveProjectId(importResult.state.activeProjectId || null);
+            }
+            return;
+          }
+          setPendingSplatImport(picked);
+        }
+      };
+
+      const confirmSplatImport = async (mode) => {
+        if (!pendingSplatImport || !pyApi()) return;
+        const filePath = pendingSplatImport.path;
+        setPendingSplatImport(null);
+        const result = await pyApi().import_scene_path(filePath, mode);
+        if (result?.state) {
+          setAppState(result.state);
+          setActiveProjectId(result.state.activeProjectId || null);
+        }
+      };
+
       const copyText = async (value) => {
         try {
           await navigator.clipboard.writeText(String(value || ''));
@@ -539,7 +599,22 @@
              </div>
              
              <div className="flex items-center gap-4">
-               <button className="hover:text-white transition-colors cursor-default">File</button>
+               <div className="relative">
+                 <button onClick={() => setFileMenuOpen((open) => !open)} className="hover:text-white transition-colors cursor-pointer">File</button>
+                 {fileMenuOpen && (
+                   <div className="absolute left-0 top-6 w-36 rounded-lg border border-white/10 bg-[#111116] p-1 shadow-2xl z-[80]">
+                     <button
+                       onClick={async () => {
+                         setFileMenuOpen(false);
+                         await openSplatImport();
+                       }}
+                       className="w-full rounded-md px-3 py-2 text-left text-xs font-semibold text-zinc-200 hover:bg-[#FF5400] hover:text-white transition-colors"
+                     >
+                       Import...
+                     </button>
+                   </div>
+                 )}
+               </div>
                <button className="hover:text-white transition-colors cursor-default">Edit</button>
                <button className="hover:text-white transition-colors cursor-default">View</button>
                <button className="hover:text-white transition-colors cursor-default">Tools</button>
@@ -981,6 +1056,12 @@
               setNewProjectName('');
             }}
             onConfirm={handleCreateProject}
+          />
+          <SplatImportModal
+            open={Boolean(pendingSplatImport)}
+            fileName={pendingSplatImport?.name}
+            onCancel={() => setPendingSplatImport(null)}
+            onConfirm={confirmSplatImport}
           />
           <TrainingSetupModal
             open={trainingModalOpen}

@@ -28,14 +28,15 @@ module GaussianPoints
 
       def import_latest_result
         payload = latest_export_payload
-        unless payload && payload['scene_ply'] && File.exist?(payload['scene_ply'])
+        scene_path = payload && preferred_scene_path(payload)
+        unless scene_path && File.exist?(scene_path)
           UI.messagebox("No companion export was found.\nRun an export from the desktop app first.")
           return nil
         end
 
-        GaussianPoints::UIparts::RenderItemRegistry.register_gaussian_file(
-          name: File.basename(payload['scene_ply']),
-          filename: payload['scene_ply']
+        GaussianPoints::IO::GaussianSceneImporter.load_with_mode_prompt(
+          scene_path,
+          name: File.basename(scene_path)
         )
       rescue StandardError => e
         UI.messagebox("Failed to import companion result:\n#{e.message}")
@@ -63,6 +64,11 @@ module GaussianPoints
         JSON.parse(File.read(LATEST_EXPORT_FILE))
       rescue StandardError
         nil
+      end
+
+      def preferred_scene_path(payload)
+        candidates = [payload['scene_gasp'], payload['scene_ply']]
+        candidates.find { |path| path && File.exist?(path) }
       end
 
       def find_python_gui

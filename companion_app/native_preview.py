@@ -6,31 +6,64 @@ import tkinter as tk
 from pathlib import Path
 
 from . import paths
+from .gaussian_gasp import export_ply_from_gaussian_gasp
 
 
 DEFAULT_UP_AXIS_MODE = 2
+
+
+_REQUIRED_PREVIEW_EXPORTS = (
+    "CreateStandalonePreviewWindow",
+    "DestroyStandalonePreviewWindow",
+    "ResizeStandalonePreviewWindow",
+    "RequestStandalonePreviewRedraw",
+    "ResetStandalonePreviewCamera",
+    "FitStandalonePreviewCamera",
+    "ClearSplats",
+    "LoadSplatsFromPLYWithUpAxis",
+    "SetSHRenderDegree",
+    "SetFastApproximateSortingEnabled",
+)
 
 
 class _NativePreviewBridge:
     def __init__(self) -> None:
         runtime_dir = paths.repo_root() / "sandbox" / "runtime"
         candidates = [
-            runtime_dir / "GaussianSplatRenderer.dll",
             runtime_dir / "GaussianSplatRenderer_preview.dll",
+            runtime_dir / "GaussianSplatRenderer.dll",
             paths.repo_root() / "sandbox" / "GaussianSplatRenderer.dll",
         ]
-        renderer_path = next((path for path in candidates if path.exists()), None)
-        if renderer_path is None:
+        existing_candidates = [path for path in candidates if path.exists()]
+        if not existing_candidates:
             raise FileNotFoundError("Gaussian preview runtime DLL was not found.")
 
         self._dll_dirs = []
         if hasattr(os, "add_dll_directory"):
-            for directory in {renderer_path.parent, runtime_dir}:
+            for directory in {runtime_dir, *(path.parent for path in existing_candidates)}:
                 if directory.exists():
                     self._dll_dirs.append(os.add_dll_directory(str(directory)))
 
-        self.dll = ctypes.WinDLL(str(renderer_path))
-        self.renderer_path = renderer_path
+        load_errors: list[str] = []
+        self.dll = None
+        self.renderer_path = None
+        for renderer_path in existing_candidates:
+            try:
+                dll = ctypes.WinDLL(str(renderer_path))
+                missing_exports = [name for name in _REQUIRED_PREVIEW_EXPORTS if not hasattr(dll, name)]
+            except Exception as error:
+                load_errors.append(f"{renderer_path}: {error}")
+                continue
+            if missing_exports:
+                load_errors.append(f"{renderer_path}: missing exports {', '.join(missing_exports)}")
+                continue
+            self.dll = dll
+            self.renderer_path = renderer_path
+            break
+
+        if self.dll is None or self.renderer_path is None:
+            details = "; ".join(load_errors) if load_errors else "No usable preview DLL candidates."
+            raise RuntimeError(f"Gaussian preview runtime DLL could not be loaded. {details}")
 
         self.dll.CreateStandalonePreviewWindow.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         self.dll.CreateStandalonePreviewWindow.restype = ctypes.c_int
@@ -48,23 +81,34 @@ class _NativePreviewBridge:
         self.dll.ClearSplats.restype = None
         self.dll.LoadSplatsFromPLYWithUpAxis.argtypes = [ctypes.c_char_p, ctypes.c_int]
         self.dll.LoadSplatsFromPLYWithUpAxis.restype = None
+        self._load_gasp_with_up_axis = getattr(self.dll, "LoadSplatsFromGASPWithUpAxis", None)
+        if self._load_gasp_with_up_axis is not None:
+            self._load_gasp_with_up_axis.argtypes = [ctypes.c_char_p, ctypes.c_int]
+            self._load_gasp_with_up_axis.restype = None
         self.dll.SetSHRenderDegree.argtypes = [ctypes.c_int]
         self.dll.SetSHRenderDegree.restype = None
         self.dll.SetFastApproximateSortingEnabled.argtypes = [ctypes.c_int]
         self.dll.SetFastApproximateSortingEnabled.restype = None
+        self._get_splat_bounds = getattr(self.dll, "GetSplatBounds", None)
+        if self._get_splat_bounds is not None:
+            self._get_splat_bounds.argtypes = [
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+            ]
+            self._get_splat_bounds.restype = ctypes.c_int
         self._get_preview_fps = getattr(self.dll, "GetStandalonePreviewFPS", None)
         if self._get_preview_fps is not None:
             self._get_preview_fps.argtypes = []
             self._get_preview_fps.restype = ctypes.c_double
 
-    def create_window(self, parent_hwnd: int, width: int, height: int) -> bool:
-        return bool(self.dll.CreateStandalonePreviewWindow(ctypes.c_void_p(parent_hwnd), 0, 0, int(width), int(height)))
+    def create_window(self, parent_hwnd: int, width: int, height: int, *, x: int = 0, y: int = 0) -> bool:
+        return bool(self.dll.CreateStandalonePreviewWindow(ctypes.c_void_p(parent_hwnd), int(x), int(y), int(width), int(height)))
 
     def destroy_window(self) -> None:
         self.dll.DestroyStandalonePreviewWindow()
 
-    def resize_window(self, width: int, height: int) -> None:
-        self.dll.ResizeStandalonePreviewWindow(0, 0, int(width), int(height))
+    def resize_window(self, width: int, height: int, *, x: int = 0, y: int = 0) -> None:
+        self.dll.ResizeStandalonePreviewWindow(int(x), int(y), int(width), int(height))
 
     def request_redraw(self) -> None:
         self.dll.RequestStandalonePreviewRedraw()
@@ -72,9 +116,29 @@ class _NativePreviewBridge:
     def clear_splats(self) -> None:
         self.dll.ClearSplats()
 
-    def load_ply(self, path: str | Path, up_axis_mode: int = DEFAULT_UP_AXIS_MODE) -> None:
+    def load_ply(self, path: str | Path, up_axis_mode: int = DEFAULT_UP_AXIS_MODE) -> bool:
         payload = str(path).encode("utf-8")
         self.dll.LoadSplatsFromPLYWithUpAxis(payload, int(up_axis_mode))
+        return self.has_loaded_scene()
+
+    def load_scene(self, path: str | Path, up_axis_mode: int = DEFAULT_UP_AXIS_MODE) -> bool:
+        scene_path = Path(path)
+        self.clear_splats()
+        if scene_path.suffix.lower() == ".gasp":
+            if self._load_gasp_with_up_axis is not None:
+                self._load_gasp_with_up_axis(str(scene_path).encode("utf-8"), int(up_axis_mode))
+                return self.has_loaded_scene()
+            cache_dir = paths.scratch_root() / "preview_gasp_cache"
+            cache_name = f"{scene_path.stem}_{scene_path.stat().st_mtime_ns}.ply"
+            scene_path = export_ply_from_gaussian_gasp(scene_path, cache_dir / cache_name)
+        return self.load_ply(scene_path, up_axis_mode)
+
+    def has_loaded_scene(self) -> bool:
+        if self._get_splat_bounds is None:
+            return True
+        mins = (ctypes.c_double * 3)()
+        maxs = (ctypes.c_double * 3)()
+        return bool(self._get_splat_bounds(mins, maxs))
 
     def reset_camera(self) -> None:
         self.dll.ResetStandalonePreviewCamera()
@@ -215,6 +279,6 @@ class NativeSplatPreview(tk.Frame):
             self.bridge.request_redraw()
             self._current_path = None
             return
-        self.bridge.load_ply(scene_path, self._pending_up_axis)
+        loaded = self.bridge.load_scene(scene_path, self._pending_up_axis)
         self.bridge.request_redraw()
-        self._current_path = str(scene_path)
+        self._current_path = str(scene_path) if loaded else None
