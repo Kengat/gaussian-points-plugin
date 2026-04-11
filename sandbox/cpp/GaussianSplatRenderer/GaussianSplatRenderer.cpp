@@ -563,8 +563,27 @@ static bool ComputeProjectedBasis(
     }
 
     const float world_position[3] = { splat.position[0], splat.position[1], splat.position[2] };
+    const float relative_world[3] = {
+        world_position[0] - camera_position[0],
+        world_position[1] - camera_position[1],
+        world_position[2] - camera_position[2]
+    };
     float view_position[3] = {};
-    TransformPointMat4(view_matrix, world_position, view_position);
+    view_position[0] =
+        view_matrix[0] * relative_world[0] +
+        view_matrix[1] * relative_world[1] +
+        view_matrix[2] * relative_world[2];
+    view_position[1] =
+        view_matrix[4] * relative_world[0] +
+        view_matrix[5] * relative_world[1] +
+        view_matrix[6] * relative_world[2];
+    view_position[2] =
+        view_matrix[8] * relative_world[0] +
+        view_matrix[9] * relative_world[1] +
+        view_matrix[10] * relative_world[2];
+    if (!std::isfinite(view_position[0]) || !std::isfinite(view_position[1]) || !std::isfinite(view_position[2])) {
+        return false;
+    }
 
     const float clip_x =
         projection_matrix[0] * view_position[0] +
@@ -582,6 +601,9 @@ static bool ComputeProjectedBasis(
         projection_matrix[14] * view_position[2] +
         projection_matrix[15];
     if (!std::isfinite(clip_x) || !std::isfinite(clip_y) || !std::isfinite(clip_w) || fabs(clip_w) < 1.0e-6f) {
+        return false;
+    }
+    if (is_perspective != 0 && clip_w <= 1.0e-6f) {
         return false;
     }
 
@@ -623,15 +645,39 @@ static bool ComputeProjectedBasis(
         return false;
     }
 
-    const float depth = std::max(fabs(view_position[2]), 1.0e-4f);
+    float depth = std::max(fabs(view_position[2]), 1.0e-4f);
+    float clamped_view_x = view_position[0];
+    float clamped_view_y = view_position[1];
+    if (is_perspective != 0) {
+        float min_covariance_depth = 0.2f;
+        const float proj_a = projection_matrix[10];
+        const float proj_b = projection_matrix[11];
+        if (std::isfinite(proj_a) && std::isfinite(proj_b) && fabs(proj_a - 1.0f) > 1.0e-6f) {
+            const float derived_near = fabs(proj_b / (proj_a - 1.0f));
+            if (std::isfinite(derived_near)) {
+                min_covariance_depth = std::max(min_covariance_depth, derived_near);
+            }
+        }
+        depth = std::max(depth, min_covariance_depth);
+        const float proj_x_scale = fabs(projection_matrix[0]);
+        const float proj_y_scale = fabs(projection_matrix[5]);
+        const float tan_fov_x = 1.0f / std::max(proj_x_scale, 1.0e-6f);
+        const float tan_fov_y = 1.0f / std::max(proj_y_scale, 1.0e-6f);
+        const float lim_x = 1.3f * tan_fov_x;
+        const float lim_y = 1.3f * tan_fov_y;
+        const float txtz = view_position[0] / depth;
+        const float tytz = view_position[1] / depth;
+        clamped_view_x = std::max(-lim_x, std::min(txtz, lim_x)) * depth;
+        clamped_view_y = std::max(-lim_y, std::min(tytz, lim_y)) * depth;
+    }
     float J[6] = {};
     if (is_perspective != 0) {
         J[0] = focal_x / depth;
         J[1] = 0.0f;
-        J[2] = (focal_x * view_position[0]) / (depth * depth);
+        J[2] = (focal_x * clamped_view_x) / (depth * depth);
         J[3] = 0.0f;
         J[4] = focal_y / depth;
-        J[5] = (focal_y * view_position[1]) / (depth * depth);
+        J[5] = (focal_y * clamped_view_y) / (depth * depth);
     }
     else {
         J[0] = focal_x;
@@ -664,13 +710,23 @@ static bool ComputeProjectedBasis(
         return false;
     }
 
+    const float opacity = std::max(0.0f, std::min(splat.color[3], 1.0f));
+    if (opacity <= (1.0f / 255.0f)) {
+        return false;
+    }
     const float mid = 0.5f * trace;
     const float discriminant = std::max(mid * mid - det, 0.0f);
     const float root = sqrt(discriminant);
     const float lambda_major = std::max(mid + root, 1.0e-4f);
     const float lambda_minor = std::max(mid - root, 1.0e-4f);
-    const float radius_major = radius_scale * sqrt(lambda_major);
-    const float radius_minor = radius_scale * sqrt(lambda_minor);
+    const float radius_factor = std::min(
+        radius_scale * radius_scale,
+        std::max(0.0f, 2.0f * logf(255.0f * opacity)));
+    if (!std::isfinite(radius_factor) || radius_factor <= 0.0f) {
+        return false;
+    }
+    const float radius_major = sqrt(radius_factor * lambda_major);
+    const float radius_minor = sqrt(radius_factor * lambda_minor);
 
     float eig_major[2] = { 1.0f, 0.0f };
     if (fabs(cov2d_xy) > 1.0e-6f) {
@@ -2335,6 +2391,8 @@ struct GPUComputePipeline {
     int uploadedSplatCount = 0;
     int drawSplatCount = 0;
     GLuint sortCapacity = 0;
+    GLint64 maxShaderStorageBlockSize = 0;
+    GLuint maxSplatsPerChunk = 0;
 };
 static GPUComputePipeline g_gpu;
 struct GPUObjectRange {
@@ -2342,6 +2400,9 @@ struct GPUObjectRange {
     GLsizei vertexCount = 0;
 };
 static std::vector<GPUObjectRange> g_gpuObjectRanges;
+static std::vector<GLuint> g_gpuSplatChunkBuffers;
+static std::vector<GLuint> g_gpuSplatChunkOffsets;
+static std::vector<GLuint> g_gpuSplatChunkCounts;
 static const GLuint kGPUSortBinCount = 65536u;
 static const GLuint kGPUSortBlockSize = 256u;
 static const GLuint kGPUSortBlockCount = kGPUSortBinCount / kGPUSortBlockSize;
@@ -2385,6 +2446,8 @@ uniform ivec2 uViewport;
 uniform int uIsPerspective;
 uniform int uNumSplats;
 uniform int uSortCapacity;
+uniform int uBaseSplatIndex;
+uniform int uChunkNumSplats;
 uniform vec3 uCameraWorld;
 uniform int uSHDegreeOverride;
 uniform int uClipEnabled;
@@ -2463,14 +2526,14 @@ vec3 EvaluateSHColor(in SplatData s, in vec3 localDir) {
 }
 
 void main() {
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= uint(uSortCapacity)) return;
+    uint localId = gl_GlobalInvocationID.x;
+    if (localId >= uint(uChunkNumSplats)) return;
+    uint id = uint(uBaseSplatIndex) + localId;
     if (id >= uint(uNumSplats)) {
-        sortEntries[id] = SortEntry(0xFFFFFFFFu, 0xFFFFFFFFu);
         return;
     }
 
-    SplatData s = splats[id];
+    SplatData s = splats[localId];
     uint objectIndex = uint(s.basis_z.w + 0.5);
     ObjectData objectData = objects[objectIndex];
     if (objectData.axis_z_visible.w < 0.5) {
@@ -2502,10 +2565,15 @@ void main() {
         }
     }
 
-    vec4 vPos4 = uView * vec4(wPos, 1.0);
-    vec3 vPos = vPos4.xyz;
-    vec4 clip = uProj * vPos4;
+    mat3 W = mat3(uView);
+    vec3 vPos = W * (wPos - uCameraWorld);
+    vec4 clip = uProj * vec4(vPos, 1.0);
     if (abs(clip.w) < 1e-6) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+    if (uIsPerspective != 0 && clip.w <= 1e-6) {
         projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
         sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
         return;
@@ -2557,7 +2625,6 @@ void main() {
         bx.z*bx.z + by.z*by.z + bz.z*bz.z);
 
     // Camera-space covariance
-    mat3 W = mat3(uView);
     mat3 covC = W * covW * transpose(W);
 
     float fx = abs(uProj[0][0]) * 0.5 * float(uViewport.x);
@@ -2569,12 +2636,36 @@ void main() {
     }
 
     float depth = max(abs(vPos.z), 1e-4);
+    float clampedViewX = vPos.x;
+    float clampedViewY = vPos.y;
+    if (uIsPerspective != 0) {
+        float minCovarianceDepth = 0.2;
+        float projA = uProj[2][2];
+        float projB = uProj[2][3];
+        if (isinf(projA) == false && isinf(projB) == false && abs(projA - 1.0) > 1e-6) {
+            float derivedNear = abs(projB / (projA - 1.0));
+            if (isinf(derivedNear) == false) {
+                minCovarianceDepth = max(minCovarianceDepth, derivedNear);
+            }
+        }
+        depth = max(depth, minCovarianceDepth);
+        float projXScale = abs(uProj[0][0]);
+        float projYScale = abs(uProj[1][1]);
+        float tanFovX = 1.0 / max(projXScale, 1e-6);
+        float tanFovY = 1.0 / max(projYScale, 1e-6);
+        float limx = 1.3 * tanFovX;
+        float limy = 1.3 * tanFovY;
+        float txtz = vPos.x / depth;
+        float tytz = vPos.y / depth;
+        clampedViewX = clamp(txtz, -limx, limx) * depth;
+        clampedViewY = clamp(tytz, -limy, limy) * depth;
+    }
     float J00, J02, J11, J12;
     if (uIsPerspective != 0) {
         J00 = fx / depth;
-        J02 = (fx * vPos.x) / (depth * depth);
+        J02 = (fx * clampedViewX) / (depth * depth);
         J11 = fy / depth;
-        J12 = (fy * vPos.y) / (depth * depth);
+        J12 = (fy * clampedViewY) / (depth * depth);
     } else {
         J00 = fx; J02 = 0.0; J11 = fy; J12 = 0.0;
     }
@@ -2594,24 +2685,32 @@ void main() {
         sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
         return;
     }
-    float mid = 0.5 * tr;
-    float disc = max(mid * mid - det, 0.0);
-    float root = sqrt(disc);
-    float lMaj = max(mid + root, 1e-4);
-    float lMin = max(mid - root, 1e-4);
-    float rMaj = 3.0 * sqrt(lMaj);
-    float rMin = 3.0 * sqrt(lMin);
-
-    vec2 eMaj = vec2(1.0, 0.0);
-    if (abs(cxy) > 1e-6) eMaj = normalize(vec2(lMaj - cyy, cxy));
-    vec2 eMin = vec2(-eMaj.y, eMaj.x);
+    float opacity = clamp(finalColor.a, 0.0, 1.0);
+    if (opacity <= (1.0 / 255.0)) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+    float radiusFactor = min(9.0, max(0.0, 2.0 * log(255.0 * opacity)));
+    if (isinf(radiusFactor) || radiusFactor <= 0.0) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+    float coeffX = -0.5 * cyy / det;
+    float coeffY = -0.5 * cxx / det;
+    float coeffXY = cxy / det;
+    float radiusX = sqrt(radiusFactor * cxx);
+    float radiusY = sqrt(radiusFactor * cyy);
+    float vmin = min(1024.0, min(float(uViewport.x), float(uViewport.y)));
+    radiusX = min(radiusX, 2.0 * vmin);
+    radiusY = min(radiusY, 2.0 * vmin);
 
     vec2 p2n = 2.0 / vec2(uViewport);
-    vec2 ndcMaj = eMaj * rMaj * p2n;
-    vec2 ndcMin = eMin * rMin * p2n;
+    vec2 ndcRadius = vec2(radiusX, radiusY) * p2n;
 
-    projected[id].center_depth = vec4(ndc, ndcZ, 1.0);
-    projected[id].axes = vec4(ndcMaj, ndcMin);
+    projected[id].center_depth = vec4(ndc, ndcZ, coeffXY);
+    projected[id].axes = vec4(ndcRadius, coeffX, coeffY);
     projected[id].color = finalColor;
 
     uint sortKey = 0xFFFFFFFFu - floatBitsToUint(depth);
@@ -2674,6 +2773,7 @@ layout(std430, binding = 1) readonly buffer B1 { SplatOut projected[]; };
 layout(std430, binding = 3) readonly buffer B3 { uint sortedIndices[]; };
 out vec2 vTexCoord;
 out vec4 vColor;
+flat out uint vSplatIndex;
 void main() {
     int splatDraw = gl_VertexID / 6;
     int v = gl_VertexID % 6;
@@ -2684,19 +2784,28 @@ void main() {
     vec2 o = off[corner];
     vTexCoord = o * 0.5 + 0.5;
     vColor = sp.color;
-    if (sp.center_depth.w <= 0.0) { gl_Position = vec4(0,0,-2,1); return; }
-    vec2 p = sp.center_depth.xy + o.x * sp.axes.xy + o.y * sp.axes.zw;
+    vSplatIndex = si;
+    if (sp.center_depth.z <= -1.5 || sp.color.a <= 0.0) { gl_Position = vec4(0,0,-2,1); return; }
+    vec2 p = sp.center_depth.xy + o * sp.axes.xy;
     gl_Position = vec4(p, sp.center_depth.z, 1.0);
 }
 )";
 
 static const char* g_gpuRenderFS_Source = R"(#version 430
+struct SplatOut { vec4 center_depth; vec4 axes; vec4 color; };
+layout(std430, binding = 1) readonly buffer B1 { SplatOut projected[]; };
 in vec2 vTexCoord;
 in vec4 vColor;
+flat in uint vSplatIndex;
+uniform vec2 uViewport;
 out vec4 fragColor;
 void main() {
-    vec2 d = vTexCoord * 2.0 - 1.0;
-    float g = exp(-dot(d, d) / 0.18);
+    SplatOut sp = projected[vSplatIndex];
+    vec2 centerPx = (sp.center_depth.xy * 0.5 + 0.5) * uViewport;
+    vec2 d = gl_FragCoord.xy - centerPx;
+    float power = sp.axes.z * d.x * d.x + sp.center_depth.w * d.x * d.y + sp.axes.w * d.y * d.y;
+    if (power < -4.5) discard;
+    float g = exp(power);
     float a = g * vColor.a;
     if (a < 0.004) discard;
     fragColor = vec4(vColor.rgb, a);
@@ -2717,14 +2826,14 @@ void main() {
     int corner = (v < 3) ? v : (v == 3 ? 0 : (v == 4 ? 2 : 3));
     vec2 off[4] = vec2[4](vec2(-1,-1), vec2(1,-1), vec2(1,1), vec2(-1,1));
     SplatOut sp = projected[splatIndex];
-    if (sp.center_depth.w <= 0.0) {
+    if (sp.center_depth.z <= -1.5 || sp.color.a <= 0.0) {
         gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
         vTexCoord = vec2(0.5);
         vColor = vec4(0.0);
         return;
     }
     vec2 o = off[corner];
-    vec2 p = sp.center_depth.xy + o.x * sp.axes.xy + o.y * sp.axes.zw;
+    vec2 p = sp.center_depth.xy + o * sp.axes.xy;
     if (uScreenExpandPx > 0.0 && uViewportSize.x > 0.0 && uViewportSize.y > 0.0) {
         p += o * vec2((uScreenExpandPx * 2.0) / uViewportSize.x, (uScreenExpandPx * 2.0) / uViewportSize.y);
     }
@@ -2939,6 +3048,15 @@ static bool InitGPUPipeline() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.binCountersSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, kGPUSortBinCount * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &g_gpu.maxShaderStorageBlockSize);
+    if (g_gpu.maxShaderStorageBlockSize > 0) {
+        const GLint64 usableBlockSize = std::max<GLint64>(g_gpu.maxShaderStorageBlockSize - (8 * 1024 * 1024), 1024 * 1024);
+        g_gpu.maxSplatsPerChunk = static_cast<GLuint>(std::max<GLint64>(usableBlockSize / static_cast<GLint64>(sizeof(float) * 72), 1));
+        LogRenderer("GPU pipeline: GL_MAX_SHADER_STORAGE_BLOCK_SIZE=%lld bytes, max splats/chunk=%u", static_cast<long long>(g_gpu.maxShaderStorageBlockSize), g_gpu.maxSplatsPerChunk);
+    } else {
+        g_gpu.maxSplatsPerChunk = 0;
+        LogRenderer("GPU pipeline: GL_MAX_SHADER_STORAGE_BLOCK_SIZE unavailable, using single-buffer upload.");
+    }
     g_gpu.supported = true;
     LogRenderer("GPU pipeline initialized successfully.");
     return true;
@@ -3045,11 +3163,45 @@ static void UploadSplatsToGPU() {
         g_gpu.uploadedSplatCount = 0;
         g_gpu.drawSplatCount = 0;
         g_gpuSplatDataDirty = false;
+        g_gpuSplatChunkBuffers.clear();
+        g_gpuSplatChunkOffsets.clear();
+        g_gpuSplatChunkCounts.clear();
         return;
     }
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.splatDataSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(GPUSplatData), buf.data(), GL_STATIC_DRAW);
+    if (!g_gpuSplatChunkBuffers.empty()) {
+        for (size_t i = 1; i < g_gpuSplatChunkBuffers.size(); ++i) {
+            if (g_gpuSplatChunkBuffers[i] != 0) {
+                glDeleteBuffers(1, &g_gpuSplatChunkBuffers[i]);
+            }
+        }
+    }
+    g_gpuSplatChunkBuffers.clear();
+    g_gpuSplatChunkOffsets.clear();
+    g_gpuSplatChunkCounts.clear();
+
+    const GLuint maxSplatsPerChunk = (g_gpu.maxSplatsPerChunk > 0)
+        ? g_gpu.maxSplatsPerChunk
+        : static_cast<GLuint>(std::max(n, 1));
+
+    for (GLuint offset = 0; offset < static_cast<GLuint>(n); offset += maxSplatsPerChunk) {
+        const GLuint chunkCount = std::min(maxSplatsPerChunk, static_cast<GLuint>(n) - offset);
+        GLuint chunkBuffer = 0;
+        if (offset == 0) {
+            chunkBuffer = g_gpu.splatDataSSBO;
+        } else {
+            glGenBuffers(1, &chunkBuffer);
+        }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, chunkBuffer);
+        glBufferData(
+            GL_SHADER_STORAGE_BUFFER,
+            static_cast<GLsizeiptr>(chunkCount * sizeof(GPUSplatData)),
+            buf.data() + offset,
+            GL_STATIC_DRAW);
+        g_gpuSplatChunkBuffers.push_back(chunkBuffer);
+        g_gpuSplatChunkOffsets.push_back(offset);
+        g_gpuSplatChunkCounts.push_back(chunkCount);
+    }
 
     struct GPUSplatOut { float d[12]; };
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.projectedSSBO);
@@ -3058,7 +3210,14 @@ static void UploadSplatsToGPU() {
     struct GPUSortEntry { uint32_t key; uint32_t idx; };
     g_gpu.sortCapacity = NextPowerOfTwo(static_cast<GLuint>(std::max(n, 1)));
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.sortKeysSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, g_gpu.sortCapacity * sizeof(GPUSortEntry), nullptr, GL_DYNAMIC_DRAW);
+    {
+        std::vector<GPUSortEntry> sortInit(g_gpu.sortCapacity);
+        for (GPUSortEntry& entry : sortInit) {
+            entry.key = 0xFFFFFFFFu;
+            entry.idx = 0xFFFFFFFFu;
+        }
+        glBufferData(GL_SHADER_STORAGE_BUFFER, g_gpu.sortCapacity * sizeof(GPUSortEntry), sortInit.data(), GL_DYNAMIC_DRAW);
+    }
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.sortedIndicesSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(uint32_t), nullptr, GL_DYNAMIC_DRAW);
@@ -3067,7 +3226,7 @@ static void UploadSplatsToGPU() {
     g_gpu.uploadedSplatCount = n;
     g_gpu.drawSplatCount = 0;
     g_gpuSplatDataDirty = false;
-    LogRenderer("GPU: Uploaded %d splats to SSBOs (%.1f MB)", n, n * sizeof(GPUSplatData) / (1024.0f * 1024.0f));
+    LogRenderer("GPU: Uploaded %d splats to %zu SSBO chunk(s) (%.1f MB total)", n, g_gpuSplatChunkBuffers.size(), n * sizeof(GPUSplatData) / (1024.0f * 1024.0f));
 }
 
 static bool UploadGPUObjectData() {
@@ -3131,7 +3290,6 @@ static bool UploadGPUObjectData() {
 static void DispatchGPUProjection(const float* viewMatrix, const float* projMatrix, const float* cameraPosition, int vpW, int vpH, int isPerspective, const NativeClipBoxState& clipBox) {
     if (!g_gpu.supported || g_gpu.uploadedSplatCount == 0) return;
     int n = g_gpu.uploadedSplatCount;
-    GLuint sortCapacity = std::max(g_gpu.sortCapacity, 1u);
 
     glUseProgram(g_gpu.projectCS);
     glUniformMatrix4fv(glGetUniformLocation(g_gpu.projectCS, "uView"), 1, GL_TRUE, viewMatrix);
@@ -3139,7 +3297,7 @@ static void DispatchGPUProjection(const float* viewMatrix, const float* projMatr
     glUniform2i(glGetUniformLocation(g_gpu.projectCS, "uViewport"), vpW, vpH);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uIsPerspective"), isPerspective);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uNumSplats"), n);
-    glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uSortCapacity"), static_cast<GLint>(sortCapacity));
+    glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uSortCapacity"), static_cast<GLint>(std::max(g_gpu.sortCapacity, 1u)));
     glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uCameraWorld"), cameraPosition[0], cameraPosition[1], cameraPosition[2]);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uSHDegreeOverride"), g_shRenderDegreeOverride);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uClipEnabled"), clipBox.enabled ? 1 : 0);
@@ -3150,12 +3308,17 @@ static void DispatchGPUProjection(const float* viewMatrix, const float* projMatr
         glUniformMatrix3fv(glGetUniformLocation(g_gpu.projectCS, "uClipAxes"), 1, GL_TRUE, axes);
     }
 
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_gpu.splatDataSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_gpu.projectedSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, g_gpu.objectDataSSBO);
-
-    glDispatchCompute((sortCapacity + 255u) / 256u, 1, 1);
+    for (size_t chunkIndex = 0; chunkIndex < g_gpuSplatChunkBuffers.size(); ++chunkIndex) {
+        const GLuint chunkOffset = g_gpuSplatChunkOffsets[chunkIndex];
+        const GLuint chunkCount = g_gpuSplatChunkCounts[chunkIndex];
+        glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uBaseSplatIndex"), static_cast<GLint>(chunkOffset));
+        glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uChunkNumSplats"), static_cast<GLint>(chunkCount));
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_gpuSplatChunkBuffers[chunkIndex]);
+        glDispatchCompute((chunkCount + 255u) / 256u, 1, 1);
+    }
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
 
@@ -3249,12 +3412,13 @@ static void GPUCountingSort() {
     g_gpu.drawSplatCount = n;
 }
 
-static void DrawGPUSplats() {
+static void DrawGPUSplats(float viewport_width, float viewport_height) {
     if (!g_gpu.supported || g_gpu.drawSplatCount == 0) return;
 
     glUseProgram(g_gpu.renderVS_FS);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_gpu.projectedSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, g_gpu.sortedIndicesSSBO);
+    glUniform2f(glGetUniformLocation(g_gpu.renderVS_FS, "uViewport"), viewport_width, viewport_height);
     glBindVertexArray(g_gpu.emptyVAO);
     glDrawArrays(GL_TRIANGLES, 0, g_gpu.drawSplatCount * 6);
     glBindVertexArray(0);
@@ -3560,7 +3724,7 @@ extern "C" EXPORT void renderPointCloud() {
     glDisable(GL_CULL_FACE);
 
     if (gpuPathActive) {
-        DrawGPUSplats();
+        DrawGPUSplats(static_cast<float>(viewport[2]), static_cast<float>(viewport[3]));
         RenderHighlightOverlay(mvpMatrix, viewport[0], viewport[1], viewport[2], viewport[3], stencilBits, true);
     }
     else if (useVBO && g_splatVBO.initialized && g_splatShader != 0) {
