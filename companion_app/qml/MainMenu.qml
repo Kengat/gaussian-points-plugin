@@ -16,6 +16,14 @@ Rectangle {
         implicitWidth: triggerLabel.implicitWidth + 20
         implicitHeight: 24
 
+        function openMenu() {
+            var menuPoint = topTrigger.mapToGlobal(0, topTrigger.height + 2)
+            var hotPoint = topTrigger.mapToGlobal(-4, 0)
+            controller.setMenuHotZone(hotPoint.x, hotPoint.y, topTrigger.width + 8, topTrigger.height + 6)
+            controller.cancelMenuClose()
+            controller.showMenu(topTrigger.menuKey, menuPoint.x, menuPoint.y)
+        }
+
         Rectangle {
             anchors.fill: parent
             radius: 6
@@ -36,10 +44,10 @@ Rectangle {
             cursorShape: Qt.PointingHandCursor
             onHoveredChanged: {
                 topTrigger.hovered = hovered
-                if (hovered && controller.menuPopupVisible) {
-                    var point = topTrigger.mapToGlobal(0, topTrigger.height + 2)
-                    controller.showMenu(topTrigger.menuKey, point.x, point.y)
-                }
+                if (hovered)
+                    topTrigger.openMenu()
+                else
+                    controller.scheduleMenuClose()
             }
         }
 
@@ -48,8 +56,7 @@ Rectangle {
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: {
-                var point = topTrigger.mapToGlobal(0, topTrigger.height + 2)
-                controller.showMenu(topTrigger.menuKey, point.x, point.y)
+                topTrigger.openMenu()
             }
         }
     }

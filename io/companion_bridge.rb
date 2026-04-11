@@ -47,10 +47,17 @@ module GaussianPoints
         return if @menu_registered
 
         menu = UI.menu('Plugins').add_submenu('Gaussian Points')
+        menu.add_item('Enable Gaussian Points') { GaussianPoints.init_plugin }
+        menu.add_item('Disable Gaussian Points') { GaussianPoints.stop_plugin }
+        menu.add_separator
         menu.add_item('Open Gaussian Splat Trainer') { launch }
-        menu.add_item('Import Latest Companion Result') { import_latest_result }
+        menu.add_item('Import Latest Companion Result') do
+          GaussianPoints.init_plugin
+          import_latest_result
+        end
         menu.add_separator
         menu.add_item('Open Gaussian Splat Loader') do
+          GaussianPoints.init_plugin
           GaussianPoints::UIparts::GaussianSplattingDialog.show_dialog
         end
         @menu_registered = true

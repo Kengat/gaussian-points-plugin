@@ -200,10 +200,14 @@ static int g_lastGeometryPerspective = 1;
 static int g_framesSinceLastGeometryUpdate = 0;
 static const int GEOMETRY_UPDATE_EVERY_N_FRAMES = 2;
 static bool g_hasGeometryState = false;
+static int g_gpuApproximateIdleFrames = 0;
 static bool g_gpuSplatDataDirty = true;
 static bool g_gpuObjectDataDirty = true;
 static const bool g_enableDynamicSorting = true;
 static bool g_enableFastApproximateSorting = false;
+static const int kAutoApproximateSortThreshold = 250000;
+static const int kMotionApproximateSortThreshold = 100000;
+static const int kApproximateSortSettleDelayFrames = 6;
 static StandalonePreviewState g_standalonePreview = {};
 static bool g_standalonePreviewEnabled = false;
 static const wchar_t* kStandalonePreviewWindowClass = L"GaussianPointsStandalonePreview";
@@ -606,6 +610,10 @@ static bool ComputeProjectedBasis(
     if (is_perspective != 0 && clip_w <= 1.0e-6f) {
         return false;
     }
+    const float ndc_x = clip_x / clip_w;
+    const float ndc_y = clip_y / clip_w;
+    const float screen_x = (ndc_x * 0.5f + 0.5f) * static_cast<float>(viewport_width);
+    const float screen_y = (ndc_y * 0.5f + 0.5f) * static_cast<float>(viewport_height);
 
     float cov_world[6] = {};
     ComputeCovarianceFromBasisVectors(splat, cov_world);
@@ -727,6 +735,38 @@ static bool ComputeProjectedBasis(
     }
     const float radius_major = sqrt(radius_factor * lambda_major);
     const float radius_minor = sqrt(radius_factor * lambda_minor);
+    const float radius_px_major = std::min(radius_major, 2.0f * std::min(1024.0f, std::min(static_cast<float>(viewport_width), static_cast<float>(viewport_height))));
+    const float radius_px_minor = std::min(radius_minor, 2.0f * std::min(1024.0f, std::min(static_cast<float>(viewport_width), static_cast<float>(viewport_height))));
+    if (std::max(radius_px_major, radius_px_minor) < 2.0f) {
+        return false;
+    }
+    if (is_perspective != 0) {
+        float near_clip = 0.01f;
+        float far_clip = 1.0e6f;
+        const float proj_a = projection_matrix[10];
+        const float proj_b = projection_matrix[11];
+        if (std::isfinite(proj_a) && std::isfinite(proj_b)) {
+            if (fabs(proj_a - 1.0f) > 1.0e-6f) {
+                const float derived_near = fabs(proj_b / (proj_a - 1.0f));
+                if (std::isfinite(derived_near)) {
+                    near_clip = std::max(derived_near, 1.0e-4f);
+                }
+            }
+            if (fabs(proj_a + 1.0f) > 1.0e-6f) {
+                const float derived_far = fabs(proj_b / (proj_a + 1.0f));
+                if (std::isfinite(derived_far)) {
+                    far_clip = std::max(derived_far, near_clip + 1.0f);
+                }
+            }
+        }
+        const float total_contribution = opacity * 6.283185f * sqrt(det);
+        const float effective_cull_distance = far_clip * 0.02f;
+        const float depth_ratio = (effective_cull_distance + view_position[2]) / std::max(effective_cull_distance - near_clip, 1.0e-4f);
+        const float depth_norm = 1.0f - powf(std::max(0.0f, std::min(depth_ratio, 1.0f)), 2.0f);
+        if (total_contribution < depth_norm * 2.0f) {
+            return false;
+        }
+    }
 
     float eig_major[2] = { 1.0f, 0.0f };
     if (fabs(cov2d_xy) > 1.0e-6f) {
@@ -738,7 +778,17 @@ static bool ComputeProjectedBasis(
             eig_major[1] /= eig_length;
         }
     }
+    else if (cov2d_yy > cov2d_xx) {
+        eig_major[0] = 0.0f;
+        eig_major[1] = 1.0f;
+    }
     const float eig_minor[2] = { -eig_major[1], eig_major[0] };
+    const float bbox_half_width = fabs(eig_major[0]) * radius_px_major + fabs(eig_minor[0]) * radius_px_minor;
+    const float bbox_half_height = fabs(eig_major[1]) * radius_px_major + fabs(eig_minor[1]) * radius_px_minor;
+    if (screen_x + bbox_half_width < 0.0f || screen_x - bbox_half_width > static_cast<float>(viewport_width) ||
+        screen_y + bbox_half_height < 0.0f || screen_y - bbox_half_height > static_cast<float>(viewport_height)) {
+        return false;
+    }
 
     const float camera_basis_major[3] = {
         eig_major[0] * (radius_major / focal_x) * (is_perspective != 0 ? depth : 1.0f),
@@ -2297,6 +2347,7 @@ extern "C" EXPORT void SetFastApproximateSortingEnabled(int enabled) {
     g_enableFastApproximateSorting = (enabled != 0);
     g_framesSinceLastSort = SORT_EVERY_N_FRAMES;
     g_framesSinceLastGeometryUpdate = GEOMETRY_UPDATE_EVERY_N_FRAMES;
+    g_gpuApproximateIdleFrames = 0;
     g_splatVBO.needsUpdate = true;
     g_highlightMaskVBO.needsUpdate = true;
     g_gpuSplatDataDirty = true;
@@ -2305,6 +2356,10 @@ extern "C" EXPORT void SetFastApproximateSortingEnabled(int enabled) {
     InvalidateStandalonePreview();
 }
 extern "C" EXPORT int GetFastApproximateSortingEnabled() { return g_enableFastApproximateSorting ? 1 : 0; }
+
+static bool ShouldUseFastApproximateSorting(int splat_count) {
+    return g_enableFastApproximateSorting || splat_count >= kAutoApproximateSortThreshold;
+}
 
 static void RenderSingleSplatIM(
     const GaussSplat& splat,
@@ -2368,6 +2423,8 @@ static bool CheckGLCapabilities() { GLenum e = glewInit(); if (e != GLEW_OK) { L
 struct GPUComputePipeline {
     bool initialized = false;
     bool supported = false;
+    bool useApproximateSort = false;
+    bool needsExactSettle = false;
     GLuint projectCS = 0;
     GLuint bitonicSortCS = 0;
     GLuint extractSortedIndicesCS = 0;
@@ -2406,6 +2463,246 @@ static std::vector<GLuint> g_gpuSplatChunkCounts;
 static const GLuint kGPUSortBinCount = 65536u;
 static const GLuint kGPUSortBlockSize = 256u;
 static const GLuint kGPUSortBlockCount = kGPUSortBinCount / kGPUSortBlockSize;
+static const int kGPUApproximateDepthBins = 32;
+
+struct GPUApproximateSortSettings {
+    bool enabled = false;
+    float minDepth = 0.0f;
+    float invDepthRange = 1.0f;
+    float binWeights[kGPUApproximateDepthBins * 2] = {};
+};
+
+static float ApproximateSortWeightForDistance(int distance_from_near_bin) {
+    if (distance_from_near_bin <= 0) {
+        return 40.0f;
+    }
+    if (distance_from_near_bin <= 2) {
+        return 20.0f;
+    }
+    if (distance_from_near_bin <= 5) {
+        return 8.0f;
+    }
+    if (distance_from_near_bin <= 10) {
+        return 3.0f;
+    }
+    return 1.0f;
+}
+
+static void BuildApproximateSortBinWeights(float* out_weights) {
+    if (!out_weights) {
+        return;
+    }
+
+    float weights[kGPUApproximateDepthBins] = {};
+    float total_weight = 0.0f;
+    for (int i = 0; i < kGPUApproximateDepthBins; ++i) {
+        const int distance_from_near_bin = (kGPUApproximateDepthBins - 1) - i;
+        weights[i] = ApproximateSortWeightForDistance(distance_from_near_bin);
+        total_weight += weights[i];
+    }
+
+    float accumulated = 0.0f;
+    float remaining_weight = total_weight;
+    int remaining_buckets = static_cast<int>(kGPUSortBinCount);
+    for (int i = 0; i < kGPUApproximateDepthBins; ++i) {
+        int divider = 1;
+        if (i == (kGPUApproximateDepthBins - 1)) {
+            divider = std::max(remaining_buckets, 1);
+        }
+        else if (remaining_weight > 0.0f) {
+            divider = std::max(
+                1,
+                static_cast<int>(floorf((weights[i] / remaining_weight) * static_cast<float>(remaining_buckets))));
+        }
+        out_weights[i * 2 + 0] = accumulated;
+        out_weights[i * 2 + 1] = static_cast<float>(divider);
+        accumulated += static_cast<float>(divider);
+        remaining_buckets = std::max(remaining_buckets - divider, 1);
+        remaining_weight = std::max(remaining_weight - weights[i], 0.0f);
+    }
+}
+
+static void AccumulateProjectedDepthSample(
+    const float* view_matrix,
+    const float* world_point,
+    bool* out_have_depth,
+    float* out_min_depth,
+    float* out_max_depth) {
+    if (!view_matrix || !world_point || !out_have_depth || !out_min_depth || !out_max_depth) {
+        return;
+    }
+
+    float view_point[3] = {};
+    TransformPointMat4(view_matrix, world_point, view_point);
+    const float depth = -view_point[2];
+    if (depth <= 1.0e-4f) {
+        return;
+    }
+
+    if (!(*out_have_depth)) {
+        *out_have_depth = true;
+        *out_min_depth = depth;
+        *out_max_depth = depth;
+        return;
+    }
+
+    *out_min_depth = std::min(*out_min_depth, depth);
+    *out_max_depth = std::max(*out_max_depth, depth);
+}
+
+static void AccumulateProjectedDepthRangeForObject(
+    const SplatObject& object,
+    const float* view_matrix,
+    bool* out_have_depth,
+    float* out_min_depth,
+    float* out_max_depth) {
+    if (!object.visible) {
+        return;
+    }
+
+    const float axis_x[3] = {
+        static_cast<float>(object.axes_xyz[0]),
+        static_cast<float>(object.axes_xyz[1]),
+        static_cast<float>(object.axes_xyz[2])
+    };
+    const float axis_y[3] = {
+        static_cast<float>(object.axes_xyz[3]),
+        static_cast<float>(object.axes_xyz[4]),
+        static_cast<float>(object.axes_xyz[5])
+    };
+    const float axis_z[3] = {
+        static_cast<float>(object.axes_xyz[6]),
+        static_cast<float>(object.axes_xyz[7]),
+        static_cast<float>(object.axes_xyz[8])
+    };
+    const float center[3] = {
+        static_cast<float>(object.center_xyz[0]),
+        static_cast<float>(object.center_xyz[1]),
+        static_cast<float>(object.center_xyz[2])
+    };
+    const float half_x = static_cast<float>(std::max(object.half_extents_xyz[0], 0.0));
+    const float half_y = static_cast<float>(std::max(object.half_extents_xyz[1], 0.0));
+    const float half_z = static_cast<float>(std::max(object.half_extents_xyz[2], 0.0));
+
+    for (int corner = 0; corner < 8; ++corner) {
+        const float sign_x = (corner & 1) ? 1.0f : -1.0f;
+        const float sign_y = (corner & 2) ? 1.0f : -1.0f;
+        const float sign_z = (corner & 4) ? 1.0f : -1.0f;
+        const float world_point[3] = {
+            center[0] + axis_x[0] * half_x * sign_x + axis_y[0] * half_y * sign_y + axis_z[0] * half_z * sign_z,
+            center[1] + axis_x[1] * half_x * sign_x + axis_y[1] * half_y * sign_y + axis_z[1] * half_z * sign_z,
+            center[2] + axis_x[2] * half_x * sign_x + axis_y[2] * half_y * sign_y + axis_z[2] * half_z * sign_z
+        };
+        AccumulateProjectedDepthSample(view_matrix, world_point, out_have_depth, out_min_depth, out_max_depth);
+    }
+}
+
+static bool ComputeApproximateSortDepthRange(
+    const float* view_matrix,
+    float* out_min_depth,
+    float* out_max_depth) {
+    if (!view_matrix || !out_min_depth || !out_max_depth) {
+        return false;
+    }
+
+    bool have_depth = false;
+    float min_depth = 0.0f;
+    float max_depth = 0.0f;
+
+    if (!g_splatObjects.empty()) {
+        for (const SplatObject& object : g_splatObjects) {
+            AccumulateProjectedDepthRangeForObject(object, view_matrix, &have_depth, &min_depth, &max_depth);
+        }
+    }
+    else {
+        double min_xyz[3] = {};
+        double max_xyz[3] = {};
+        if (ComputeCurrentSplatBounds(min_xyz, max_xyz)) {
+            for (int corner = 0; corner < 8; ++corner) {
+                const float world_point[3] = {
+                    static_cast<float>((corner & 1) ? max_xyz[0] : min_xyz[0]),
+                    static_cast<float>((corner & 2) ? max_xyz[1] : min_xyz[1]),
+                    static_cast<float>((corner & 4) ? max_xyz[2] : min_xyz[2])
+                };
+                AccumulateProjectedDepthSample(view_matrix, world_point, &have_depth, &min_depth, &max_depth);
+            }
+        }
+    }
+
+    if (!have_depth) {
+        return false;
+    }
+
+    *out_min_depth = min_depth;
+    *out_max_depth = max_depth;
+    return true;
+}
+
+static GPUApproximateSortSettings BuildGPUApproximateSortSettings(
+    int splat_count,
+    const float* view_matrix,
+    bool use_approximate_sort) {
+    GPUApproximateSortSettings settings = {};
+    BuildApproximateSortBinWeights(settings.binWeights);
+    settings.enabled = use_approximate_sort;
+    if (!settings.enabled) {
+        return settings;
+    }
+
+    float min_depth = 0.0f;
+    float max_depth = 0.0f;
+    if (ComputeApproximateSortDepthRange(view_matrix, &min_depth, &max_depth)) {
+        settings.minDepth = min_depth;
+        settings.invDepthRange = 1.0f / std::max(max_depth - min_depth, 1.0e-3f);
+    }
+    else {
+        settings.minDepth = 0.0f;
+        settings.invDepthRange = 1.0f;
+    }
+
+    return settings;
+}
+
+static bool ShouldUseApproximateSortThisFrame(
+    int splat_count,
+    const float* camera_position,
+    const float* view_direction) {
+    if (g_enableFastApproximateSorting) {
+        return true;
+    }
+
+    if (splat_count < kMotionApproximateSortThreshold) {
+        return false;
+    }
+
+    if (splat_count >= 1000000) {
+        return true;
+    }
+
+    if (!camera_position || !view_direction || !g_hasGeometryState) {
+        return true;
+    }
+
+    const float pos_dist_sq =
+        (camera_position[0] - g_lastGeometryCamPos[0]) * (camera_position[0] - g_lastGeometryCamPos[0]) +
+        (camera_position[1] - g_lastGeometryCamPos[1]) * (camera_position[1] - g_lastGeometryCamPos[1]) +
+        (camera_position[2] - g_lastGeometryCamPos[2]) * (camera_position[2] - g_lastGeometryCamPos[2]);
+
+    const float dir_diff =
+        (view_direction[0] - g_lastGeometryViewDir[0]) * (view_direction[0] - g_lastGeometryViewDir[0]) +
+        (view_direction[1] - g_lastGeometryViewDir[1]) * (view_direction[1] - g_lastGeometryViewDir[1]) +
+        (view_direction[2] - g_lastGeometryViewDir[2]) * (view_direction[2] - g_lastGeometryViewDir[2]);
+
+    if (splat_count >= 700000) {
+        return pos_dist_sq > 0.000016f || dir_diff > 0.0000004f;
+    }
+
+    if (splat_count >= 250000) {
+        return pos_dist_sq > 0.000064f || dir_diff > 0.0000010f;
+    }
+
+    return pos_dist_sq > 0.000004f || dir_diff > 0.0000002f;
+}
 
 static const char* g_projectCS_Source = R"(#version 430
 layout(local_size_x = 256) in;
@@ -2427,7 +2724,8 @@ struct ObjectData {
 };
 struct SplatOut {
     vec4 center_depth;
-    vec4 axes;
+    vec4 quad_major_minor;
+    vec4 conic;
     vec4 color;
 };
 struct SortEntry {
@@ -2454,6 +2752,10 @@ uniform int uClipEnabled;
 uniform vec3 uClipCenter;
 uniform vec3 uClipHalfExtents;
 uniform mat3 uClipAxes;
+uniform int uApproximateSort;
+uniform float uApproxMinDepth;
+uniform float uApproxInvDepthRange;
+uniform vec2 uApproxBinWeights[32];
 
 const float SH_C0 = 0.28209479177387814;
 const float SH_C1 = 0.4886025119029199;
@@ -2523,6 +2825,19 @@ vec3 EvaluateSHColor(in SplatData s, in vec3 localDir) {
         result[channel] = max(value + 0.5, 0.0);
     }
     return result;
+}
+
+uint ComputeApproximateSortKey(float depth) {
+    if (uApproxInvDepthRange <= 0.0) {
+        return 0u;
+    }
+
+    float normalizedDepth = clamp((depth - uApproxMinDepth) * uApproxInvDepthRange, 0.0, 0.99999994);
+    float weightedDepth = (1.0 - normalizedDepth) * 32.0;
+    weightedDepth = clamp(weightedDepth, 0.0, 31.999999);
+    uint bin = uint(weightedDepth);
+    vec2 weights = uApproxBinWeights[int(bin)];
+    return uint(clamp(weights.x + weights.y * (weightedDepth - float(bin)), 0.0, 65535.0));
 }
 
 void main() {
@@ -2680,7 +2995,7 @@ void main() {
 
     float tr = cxx + cyy;
     float det = cxx * cyy - cxy * cxy;
-    if (det <= 0.0 || !isinf(tr) == false) {
+    if (det <= 0.0 || isnan(tr) || isinf(tr)) {
         projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
         sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
         return;
@@ -2692,28 +3007,86 @@ void main() {
         return;
     }
     float radiusFactor = min(9.0, max(0.0, 2.0 * log(255.0 * opacity)));
-    if (isinf(radiusFactor) || radiusFactor <= 0.0) {
+    if (isnan(radiusFactor) || isinf(radiusFactor) || radiusFactor <= 0.0) {
         projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
         sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
         return;
     }
+    float mid = 0.5 * tr;
+    float discriminant = max(mid * mid - det, 0.0);
+    float root = sqrt(discriminant);
+    float lambdaMajor = max(mid + root, 1e-4);
+    float lambdaMinor = max(mid - root, 1e-4);
+    vec2 eigMajor = vec2(1.0, 0.0);
+    if (abs(cxy) > 1e-6) {
+        eigMajor = normalize(vec2(lambdaMajor - cyy, cxy));
+    } else if (cyy > cxx) {
+        eigMajor = vec2(0.0, 1.0);
+    }
+    vec2 eigMinor = vec2(-eigMajor.y, eigMajor.x);
     float coeffX = -0.5 * cyy / det;
     float coeffY = -0.5 * cxx / det;
     float coeffXY = cxy / det;
-    float radiusX = sqrt(radiusFactor * cxx);
-    float radiusY = sqrt(radiusFactor * cyy);
+    float radiusMajor = sqrt(radiusFactor * lambdaMajor);
+    float radiusMinor = sqrt(radiusFactor * lambdaMinor);
     float vmin = min(1024.0, min(float(uViewport.x), float(uViewport.y)));
-    radiusX = min(radiusX, 2.0 * vmin);
-    radiusY = min(radiusY, 2.0 * vmin);
+    radiusMajor = min(radiusMajor, 2.0 * vmin);
+    radiusMinor = min(radiusMinor, 2.0 * vmin);
+    if (max(radiusMajor, radiusMinor) < 2.0) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+    vec2 bboxExtents = abs(eigMajor) * radiusMajor + abs(eigMinor) * radiusMinor;
+    vec2 screen = (ndc * 0.5 + 0.5) * vec2(uViewport);
+    if (screen.x + bboxExtents.x < 0.0 || screen.x - bboxExtents.x > float(uViewport.x) ||
+        screen.y + bboxExtents.y < 0.0 || screen.y - bboxExtents.y > float(uViewport.y)) {
+        projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+        sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+        return;
+    }
+    if (uIsPerspective != 0) {
+        float nearClip = 0.01;
+        float farClip = 1.0e6;
+        float projA2 = uProj[2][2];
+        float projB2 = uProj[2][3];
+        if (isinf(projA2) == false && isinf(projB2) == false) {
+            if (abs(projA2 - 1.0) > 1e-6) {
+                float derivedNear2 = abs(projB2 / (projA2 - 1.0));
+                if (isinf(derivedNear2) == false) {
+                    nearClip = max(derivedNear2, 1e-4);
+                }
+            }
+            if (abs(projA2 + 1.0) > 1e-6) {
+                float derivedFar2 = abs(projB2 / (projA2 + 1.0));
+                if (isinf(derivedFar2) == false) {
+                    farClip = max(derivedFar2, nearClip + 1.0);
+                }
+            }
+        }
+        float totalContribution = opacity * 6.283185 * sqrt(det);
+        float effectiveCullDistance = farClip * 0.02;
+        float depthRatio = (effectiveCullDistance + vPos.z) / max(effectiveCullDistance - nearClip, 1e-4);
+        float depthNorm = 1.0 - pow(clamp(depthRatio, 0.0, 1.0), 2.0);
+        if (totalContribution < depthNorm * 2.0) {
+            projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+            sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+            return;
+        }
+    }
 
     vec2 p2n = 2.0 / vec2(uViewport);
-    vec2 ndcRadius = vec2(radiusX, radiusY) * p2n;
+    vec2 ndcMajor = eigMajor * radiusMajor * p2n;
+    vec2 ndcMinor = eigMinor * radiusMinor * p2n;
 
-    projected[id].center_depth = vec4(ndc, ndcZ, coeffXY);
-    projected[id].axes = vec4(ndcRadius, coeffX, coeffY);
+    projected[id].center_depth = vec4(ndc, ndcZ, 0.0);
+    projected[id].quad_major_minor = vec4(ndcMajor, ndcMinor);
+    projected[id].conic = vec4(coeffX, coeffY, coeffXY, 0.0);
     projected[id].color = finalColor;
 
-    uint sortKey = 0xFFFFFFFFu - floatBitsToUint(depth);
+    uint sortKey = (uApproximateSort != 0)
+        ? ComputeApproximateSortKey(depth)
+        : (0xFFFFFFFFu - floatBitsToUint(depth));
     sortEntries[id] = SortEntry(sortKey, uint(id));
 }
 )";
@@ -2768,7 +3141,7 @@ void main() {
 )";
 
 static const char* g_gpuRenderVS_Source = R"(#version 430
-struct SplatOut { vec4 center_depth; vec4 axes; vec4 color; };
+struct SplatOut { vec4 center_depth; vec4 quad_major_minor; vec4 conic; vec4 color; };
 layout(std430, binding = 1) readonly buffer B1 { SplatOut projected[]; };
 layout(std430, binding = 3) readonly buffer B3 { uint sortedIndices[]; };
 out vec2 vTexCoord;
@@ -2786,13 +3159,15 @@ void main() {
     vColor = sp.color;
     vSplatIndex = si;
     if (sp.center_depth.z <= -1.5 || sp.color.a <= 0.0) { gl_Position = vec4(0,0,-2,1); return; }
-    vec2 p = sp.center_depth.xy + o * sp.axes.xy;
+    vec2 p = sp.center_depth.xy +
+        o.x * sp.quad_major_minor.xy +
+        o.y * sp.quad_major_minor.zw;
     gl_Position = vec4(p, sp.center_depth.z, 1.0);
 }
 )";
 
 static const char* g_gpuRenderFS_Source = R"(#version 430
-struct SplatOut { vec4 center_depth; vec4 axes; vec4 color; };
+struct SplatOut { vec4 center_depth; vec4 quad_major_minor; vec4 conic; vec4 color; };
 layout(std430, binding = 1) readonly buffer B1 { SplatOut projected[]; };
 in vec2 vTexCoord;
 in vec4 vColor;
@@ -2803,7 +3178,7 @@ void main() {
     SplatOut sp = projected[vSplatIndex];
     vec2 centerPx = (sp.center_depth.xy * 0.5 + 0.5) * uViewport;
     vec2 d = gl_FragCoord.xy - centerPx;
-    float power = sp.axes.z * d.x * d.x + sp.center_depth.w * d.x * d.y + sp.axes.w * d.y * d.y;
+    float power = sp.conic.x * d.x * d.x + sp.conic.z * d.x * d.y + sp.conic.y * d.y * d.y;
     if (power < -4.5) discard;
     float g = exp(power);
     float a = g * vColor.a;
@@ -2813,7 +3188,7 @@ void main() {
 )";
 
 static const char* g_gpuHighlightVS_Source = R"(#version 430
-struct SplatOut { vec4 center_depth; vec4 axes; vec4 color; };
+struct SplatOut { vec4 center_depth; vec4 quad_major_minor; vec4 conic; vec4 color; };
 layout(std430, binding = 1) readonly buffer B1 { SplatOut projected[]; };
 uniform vec2 uViewportSize;
 uniform float uScreenExpandPx;
@@ -2833,7 +3208,9 @@ void main() {
         return;
     }
     vec2 o = off[corner];
-    vec2 p = sp.center_depth.xy + o * sp.axes.xy;
+    vec2 p = sp.center_depth.xy +
+        o.x * sp.quad_major_minor.xy +
+        o.y * sp.quad_major_minor.zw;
     if (uScreenExpandPx > 0.0 && uViewportSize.x > 0.0 && uViewportSize.y > 0.0) {
         p += o * vec2((uScreenExpandPx * 2.0) / uViewportSize.x, (uScreenExpandPx * 2.0) / uViewportSize.y);
     }
@@ -2879,10 +3256,11 @@ struct SortEntry {
 layout(std430, binding = 2) readonly buffer B2 { SortEntry sortEntries[]; };
 layout(std430, binding = 4) buffer B4 { uint histogram[]; };
 uniform uint uNumSplats;
+uniform uint uNumBins;
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= uNumSplats) return;
-    uint bin = sortEntries[id].key >> 16;
+    uint bin = min(sortEntries[id].key, uNumBins - 1u);
     atomicAdd(histogram[bin], 1u);
 }
 )";
@@ -2964,11 +3342,12 @@ layout(std430, binding = 3) writeonly buffer B3 { uint sortedIndices[]; };
 layout(std430, binding = 4) readonly buffer B4 { uint histogram[]; };
 layout(std430, binding = 6) buffer B6 { uint binCounters[]; };
 uniform uint uNumSplats;
+uniform uint uNumBins;
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= uNumSplats) return;
     SortEntry entry = sortEntries[id];
-    uint bin = entry.key >> 16;
+    uint bin = min(entry.key, uNumBins - 1u);
     uint dst = histogram[bin] + atomicAdd(binCounters[bin], 1u);
     sortedIndices[dst] = entry.idx;
 }
@@ -3203,7 +3582,7 @@ static void UploadSplatsToGPU() {
         g_gpuSplatChunkCounts.push_back(chunkCount);
     }
 
-    struct GPUSplatOut { float d[12]; };
+    struct GPUSplatOut { float d[16]; };
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gpu.projectedSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(GPUSplatOut), nullptr, GL_DYNAMIC_DRAW);
 
@@ -3287,9 +3666,11 @@ static bool UploadGPUObjectData() {
     return true;
 }
 
-static void DispatchGPUProjection(const float* viewMatrix, const float* projMatrix, const float* cameraPosition, int vpW, int vpH, int isPerspective, const NativeClipBoxState& clipBox) {
+static void DispatchGPUProjection(const float* viewMatrix, const float* projMatrix, const float* cameraPosition, int vpW, int vpH, int isPerspective, const NativeClipBoxState& clipBox, bool useApproximateSort) {
     if (!g_gpu.supported || g_gpu.uploadedSplatCount == 0) return;
     int n = g_gpu.uploadedSplatCount;
+    const GPUApproximateSortSettings approximateSort = BuildGPUApproximateSortSettings(n, viewMatrix, useApproximateSort);
+    g_gpu.useApproximateSort = approximateSort.enabled;
 
     glUseProgram(g_gpu.projectCS);
     glUniformMatrix4fv(glGetUniformLocation(g_gpu.projectCS, "uView"), 1, GL_TRUE, viewMatrix);
@@ -3301,6 +3682,13 @@ static void DispatchGPUProjection(const float* viewMatrix, const float* projMatr
     glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uCameraWorld"), cameraPosition[0], cameraPosition[1], cameraPosition[2]);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uSHDegreeOverride"), g_shRenderDegreeOverride);
     glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uClipEnabled"), clipBox.enabled ? 1 : 0);
+    glUniform1i(glGetUniformLocation(g_gpu.projectCS, "uApproximateSort"), approximateSort.enabled ? 1 : 0);
+    glUniform1f(glGetUniformLocation(g_gpu.projectCS, "uApproxMinDepth"), approximateSort.minDepth);
+    glUniform1f(glGetUniformLocation(g_gpu.projectCS, "uApproxInvDepthRange"), approximateSort.invDepthRange);
+    glUniform2fv(
+        glGetUniformLocation(g_gpu.projectCS, "uApproxBinWeights[0]"),
+        kGPUApproximateDepthBins,
+        approximateSort.binWeights);
     if (clipBox.enabled) {
         glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uClipCenter"), (float)clipBox.center_xyz[0], (float)clipBox.center_xyz[1], (float)clipBox.center_xyz[2]);
         glUniform3f(glGetUniformLocation(g_gpu.projectCS, "uClipHalfExtents"), (float)clipBox.half_extents_xyz[0], (float)clipBox.half_extents_xyz[1], (float)clipBox.half_extents_xyz[2]);
@@ -3341,11 +3729,12 @@ static void GPUCountingSort() {
         return;
     }
 
-    if (g_enableFastApproximateSorting) {
+    if (g_gpu.useApproximateSort) {
         ClearGPUUIntBuffer(g_gpu.histogramSSBO, kGPUSortBinCount);
 
         glUseProgram(g_gpu.histogramCS);
         glUniform1ui(glGetUniformLocation(g_gpu.histogramCS, "uNumSplats"), static_cast<GLuint>(n));
+        glUniform1ui(glGetUniformLocation(g_gpu.histogramCS, "uNumBins"), kGPUSortBinCount);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
         glDispatchCompute((static_cast<GLuint>(n) + 255u) / 256u, 1, 1);
@@ -3375,6 +3764,7 @@ static void GPUCountingSort() {
 
         glUseProgram(g_gpu.scatterCS);
         glUniform1ui(glGetUniformLocation(g_gpu.scatterCS, "uNumSplats"), static_cast<GLuint>(n));
+        glUniform1ui(glGetUniformLocation(g_gpu.scatterCS, "uNumBins"), kGPUSortBinCount);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_gpu.sortKeysSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, g_gpu.sortedIndicesSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, g_gpu.histogramSSBO);
@@ -3556,8 +3946,23 @@ extern "C" EXPORT void renderPointCloud() {
         const bool uploadedSplats = (g_gpuSplatDataDirty && g_gpu.supported);
         const bool uploadedObjects = UploadGPUObjectData();
         UploadSplatsToGPU();
-        if (g_gpu.uploadedSplatCount > 0 && (uploadedSplats || uploadedObjects || g_splatVBO.needsUpdate || geometryStateChanged || clipStateChanged)) {
-            DispatchGPUProjection(viewMatrix, projectionMatrix, camPos, viewport[2], viewport[3], isPerspective, clipBoxState);
+        bool useApproximateSort = ShouldUseApproximateSortThisFrame(g_gpu.uploadedSplatCount, camPos, viewDir);
+        if (useApproximateSort) {
+            g_gpu.needsExactSettle = true;
+            g_gpuApproximateIdleFrames = 0;
+        }
+        else if (g_gpu.needsExactSettle && g_gpu.uploadedSplatCount >= kMotionApproximateSortThreshold) {
+            ++g_gpuApproximateIdleFrames;
+            if (g_gpuApproximateIdleFrames < kApproximateSortSettleDelayFrames) {
+                useApproximateSort = true;
+            }
+        }
+        else {
+            g_gpuApproximateIdleFrames = 0;
+        }
+        const bool forceExactSettle = g_gpu.needsExactSettle && !useApproximateSort;
+        if (g_gpu.uploadedSplatCount > 0 && (uploadedSplats || uploadedObjects || g_splatVBO.needsUpdate || geometryStateChanged || clipStateChanged || forceExactSettle)) {
+            DispatchGPUProjection(viewMatrix, projectionMatrix, camPos, viewport[2], viewport[3], isPerspective, clipBoxState, useApproximateSort);
             GPUCountingSort();
             memcpy(g_lastGeometryCamPos, camPos, 3 * sizeof(float));
             memcpy(g_lastGeometryViewDir, viewDir, 3 * sizeof(float));
@@ -3567,6 +3972,10 @@ extern "C" EXPORT void renderPointCloud() {
             g_hasGeometryState = true;
             g_splatVBO.needsUpdate = false;
             geometryUpdated = true;
+            if (!useApproximateSort) {
+                g_gpu.needsExactSettle = false;
+                g_gpuApproximateIdleFrames = 0;
+            }
         }
         gpuPathActive = g_gpu.drawSplatCount > 0;
     }

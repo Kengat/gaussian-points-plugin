@@ -316,13 +316,9 @@ class PopupMenuItemFrame(QtWidgets.QFrame):
         self.shortcut_label.setFont(shortcut_font)
         layout.addWidget(self.shortcut_label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-        self.arrow_label = QtWidgets.QLabel("›" if spec.get("submenu") else "")
+        self.arrow_label = QtWidgets.QLabel()
         self.arrow_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        arrow_font = QtGui.QFont("Outfit")
-        arrow_font.setPixelSize(13)
-        arrow_font.setWeight(QtGui.QFont.Weight.Medium)
-        self.arrow_label.setFont(arrow_font)
-        self.arrow_label.setFixedWidth(10)
+        self.arrow_label.setFixedSize(14, 14)
         self.arrow_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.arrow_label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
 
@@ -344,9 +340,6 @@ class PopupMenuItemFrame(QtWidgets.QFrame):
         self.shortcut_label.setStyleSheet(
             f"background:transparent; color:{'#71717A' if self.spec.get('shortcut') else 'transparent'};"
         )
-        self.arrow_label.setStyleSheet(
-            f"background:transparent; color:{'#FFFFFF' if self._hovered else '#71717A'};"
-        )
         icon_name = str(self.spec.get("icon") or "")
         if icon_name:
             pixmap = self._controller._menu_icon_pixmap(
@@ -357,6 +350,15 @@ class PopupMenuItemFrame(QtWidgets.QFrame):
             self.icon_label.setPixmap(pixmap)
         else:
             self.icon_label.clear()
+        if self.spec.get("submenu"):
+            arrow_pixmap = self._controller._menu_icon_pixmap(
+                "chevron-right",
+                "#FFFFFF" if self._hovered else "#71717A",
+                14,
+            )
+            self.arrow_label.setPixmap(arrow_pixmap)
+        else:
+            self.arrow_label.clear()
 
     def enterEvent(self, event: QtCore.QEvent) -> None:
         self.set_hovered(True)
@@ -449,6 +451,7 @@ class PopupMenuWindow(QtWidgets.QWidget):
         self.adjustSize()
 
     def open_at(self, global_pos: QtCore.QPoint) -> None:
+        self._controller.cancelMenuClose()
         self.adjustSize()
         self.move(global_pos)
         self.show()
@@ -467,6 +470,14 @@ class PopupMenuWindow(QtWidgets.QWidget):
             self._child_popup.deleteLater()
             self._child_popup = None
         self.hide()
+
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        self._controller.cancelMenuClose()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self._controller.scheduleMenuClose()
+        super().leaveEvent(event)
 
     def _open_submenu(self, spec: dict[str, Any], source_item: PopupMenuItemFrame) -> None:
         submenu = spec.get("submenu")
@@ -747,7 +758,12 @@ class QtStateController(QtCore.QObject):
         self._active_menu_name = ""
         self._menu_definitions: dict[str, list[dict[str, Any]]] = {}
         self._menu_root_popup: PopupMenuWindow | None = None
-        self._menu_icon_cache: dict[tuple[str, str, int], QtGui.QPixmap] = {}
+        self._menu_icon_cache: dict[tuple[str, str, int, float], QtGui.QPixmap] = {}
+        self._menu_hot_zone = QtCore.QRect()
+        self._menu_close_timer = QtCore.QTimer(self)
+        self._menu_close_timer.setSingleShot(True)
+        self._menu_close_timer.setInterval(160)
+        self._menu_close_timer.timeout.connect(self._close_menus_if_pointer_outside)
         self.refresh()
 
     @QtCore.Property("QVariantMap", notify=stateChanged)
@@ -836,7 +852,10 @@ class QtStateController(QtCore.QObject):
         return path if path.exists() else None
 
     def _menu_icon_pixmap(self, name: str, color_hex: str, size: int) -> QtGui.QPixmap:
-        cache_key = (name, color_hex, int(size))
+        app = QtWidgets.QApplication.instance()
+        screen = app.primaryScreen() if app is not None else None
+        dpr = max(1.0, float(screen.devicePixelRatio() if screen is not None else 1.0))
+        cache_key = (name, color_hex, int(size), round(dpr, 2))
         cached = self._menu_icon_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -845,15 +864,21 @@ class QtStateController(QtCore.QObject):
         if icon_path is None:
             return QtGui.QPixmap()
 
-        image = QtGui.QImage(int(size), int(size), QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        pixel_size = max(1, int(round(int(size) * dpr)))
+        image = QtGui.QImage(pixel_size, pixel_size, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
         image.fill(QtCore.Qt.GlobalColor.transparent)
         renderer = QtSvg.QSvgRenderer(str(icon_path))
         painter = QtGui.QPainter(image)
-        renderer.render(painter)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.scale(dpr, dpr)
+        logical_rect = QtCore.QRectF(0, 0, int(size), int(size))
+        renderer.render(painter, logical_rect)
         painter.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_SourceIn)
-        painter.fillRect(image.rect(), QtGui.QColor(color_hex))
+        painter.fillRect(logical_rect, QtGui.QColor(color_hex))
         painter.end()
         pixmap = QtGui.QPixmap.fromImage(image)
+        pixmap.setDevicePixelRatio(dpr)
         self._menu_icon_cache[cache_key] = pixmap
         return pixmap
 
@@ -970,12 +995,41 @@ class QtStateController(QtCore.QObject):
 
     @QtCore.Slot()
     def closeAllMenus(self) -> None:
+        self._menu_close_timer.stop()
         if self._menu_root_popup is not None:
             self._menu_root_popup.close_chain()
             self._menu_root_popup.deleteLater()
             self._menu_root_popup = None
         self._set_menu_popup_visible(False)
         self._set_active_menu_name("")
+
+    @QtCore.Slot(float, float, float, float)
+    def setMenuHotZone(self, gx: float, gy: float, width: float, height: float) -> None:
+        self._menu_hot_zone = QtCore.QRect(
+            int(gx),
+            int(gy),
+            max(1, int(width)),
+            max(1, int(height)),
+        )
+
+    @QtCore.Slot()
+    def cancelMenuClose(self) -> None:
+        self._menu_close_timer.stop()
+
+    @QtCore.Slot()
+    def scheduleMenuClose(self) -> None:
+        if self._menu_popup_visible:
+            self._menu_close_timer.start()
+
+    def _close_menus_if_pointer_outside(self) -> None:
+        if not self._menu_popup_visible:
+            return
+        global_pos = QtGui.QCursor.pos()
+        if self._menu_hot_zone.contains(global_pos):
+            return
+        if self._menu_root_popup is not None and self._menu_root_popup.contains_global_pos(global_pos):
+            return
+        self.closeAllMenus()
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
         if not self._menu_popup_visible or self._menu_root_popup is None:
@@ -996,6 +1050,7 @@ class QtStateController(QtCore.QObject):
     @QtCore.Slot(str, float, float)
     def showMenu(self, menu_name: str, gx: float, gy: float) -> None:
         self._ensure_menus()
+        self.cancelMenuClose()
         menu_key = (menu_name or "").lower()
         menu_items = self._menu_definitions.get(menu_key)
         if menu_items is None:
