@@ -605,7 +605,7 @@ class TrainModelDialog(ThemedDialog):
         self.sfm_image_size_input = QtWidgets.QSpinBox()
         self.sfm_image_size_input.setRange(640, 4096)
         self.sfm_image_size_input.setSingleStep(160)
-        self.sfm_image_size_input.setValue(int(settings.get("sfm_max_image_size", 1280)))
+        self.sfm_image_size_input.setValue(int(settings.get("sfm_max_image_size", 1600)))
 
         self.sh_degree_input = QtWidgets.QSpinBox()
         self.sh_degree_input.setRange(0, 4)
@@ -673,7 +673,7 @@ class TrainModelDialog(ThemedDialog):
         grid.addWidget(options_box, 5, 0, 1, 2)
 
         note = QtWidgets.QLabel(
-            "Tip: use Auto + Balanced + Antialiased for real captures. For video, keep SfM image size near 1280 and type a Max splats cap such as 800000 or 1200000; 0 means Auto."
+            "Tip: use Auto + Balanced + Antialiased for real captures. For long videos, keep SfM image size near 1280 and type a Max splats cap such as 800000 or 1200000; 0 means Auto."
         )
         note.setWordWrap(True)
         note.setStyleSheet("font-size:12px; color:#71717A;")
@@ -744,6 +744,7 @@ class QtStateController(QtCore.QObject):
     stateChanged = QtCore.Signal()
     menuPopupVisibleChanged = QtCore.Signal()
     activeMenuNameChanged = QtCore.Signal()
+    activeToolChanged = QtCore.Signal()
 
     def __init__(self, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
@@ -756,6 +757,7 @@ class QtStateController(QtCore.QObject):
         self._preview_stats: dict[str, Any] | None = None
         self._menu_popup_visible = False
         self._active_menu_name = ""
+        self._active_tool = "projects"
         self._menu_definitions: dict[str, list[dict[str, Any]]] = {}
         self._menu_root_popup: PopupMenuWindow | None = None
         self._menu_icon_cache: dict[tuple[str, str, int, float], QtGui.QPixmap] = {}
@@ -777,6 +779,10 @@ class QtStateController(QtCore.QObject):
     @QtCore.Property(str, notify=activeMenuNameChanged)
     def activeMenuName(self) -> str:
         return self._active_menu_name
+
+    @QtCore.Property(str, notify=activeToolChanged)
+    def activeTool(self) -> str:
+        return self._active_tool
 
     @QtCore.Slot()
     def minimizeWindow(self) -> None:
@@ -1075,6 +1081,16 @@ class QtStateController(QtCore.QObject):
         self._active_project_id = project_id or None
         self.refresh()
 
+    @QtCore.Slot(str)
+    def setActiveTool(self, tool_name: str) -> None:
+        tool = (tool_name or "").strip().lower()
+        allowed = {"projects", "select", "move", "transform", "clip", "color"}
+        next_tool = tool if tool in allowed else "projects"
+        if next_tool == self._active_tool:
+            return
+        self._active_tool = next_tool
+        self.activeToolChanged.emit()
+
     @QtCore.Slot()
     def newProjectDialog(self) -> None:
         name, ok = QtWidgets.QInputDialog.getText(None, "New Project", "Project name:")
@@ -1213,8 +1229,8 @@ class QtStateController(QtCore.QObject):
         if preserve_sfm_cache:
             settings["preserve_sfm_cache"] = True
         if self._project_is_video_derived(project) and len(images) >= 96:
-            settings["sfm_max_image_size"] = min(int(settings.get("sfm_max_image_size", 1280)), 1280)
-            settings["sfm_num_threads"] = min(int(settings.get("sfm_num_threads", 4)), 4)
+            settings["sfm_max_image_size"] = min(int(settings.get("sfm_max_image_size", 1600)), 1280)
+            settings["sfm_num_threads"] = min(int(settings.get("sfm_num_threads", 6)), 4)
             settings["sfm_sequential_overlap"] = min(int(settings.get("sfm_sequential_overlap", 5)), 5)
             settings["sfm_quadratic_overlap"] = False
         dialog = TrainModelDialog(

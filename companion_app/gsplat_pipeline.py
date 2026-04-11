@@ -162,6 +162,47 @@ def _project_is_video_derived(project: dict | None) -> bool:
     return int(aggregate.get("source_videos") or 0) > 0
 
 
+def _is_long_video_sequence(project: dict | None, image_count: int) -> bool:
+    return _project_is_video_derived(project) and image_count >= 96
+
+
+def _mcmc_target_count(
+    current_count: int,
+    cap_max: int,
+    *,
+    step: int | None = None,
+    refine_stop_iter: int | None = None,
+    refine_every: int | None = None,
+) -> int:
+    if current_count <= 0:
+        return min(max(1, cap_max), 1)
+    if cap_max <= current_count:
+        return current_count
+
+    growth: float | None = None
+    if step is not None and refine_stop_iter is not None and refine_every is not None and refine_every > 0:
+        last_refine_step = max(step, int(refine_stop_iter) - 1)
+        remaining_events = max(1, 1 + ((last_refine_step - step) // int(refine_every)))
+        if remaining_events == 1:
+            return cap_max
+        growth = float(cap_max / float(max(current_count, 1))) ** (1.0 / float(remaining_events))
+        growth = max(1.01, growth)
+
+    if growth is None:
+        cap_ratio = float(cap_max) / float(max(current_count, 1))
+        growth = 1.05
+        if cap_ratio >= 16.0:
+            growth = 1.08
+        elif cap_ratio >= 8.0:
+            growth = 1.075
+        elif cap_ratio >= 4.0:
+            growth = 1.07
+        elif cap_ratio >= 2.0:
+            growth = 1.06
+
+    return min(cap_max, max(current_count + 1, int(math.ceil(current_count * growth))))
+
+
 def _rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     return (rgb - 0.5) / SH_C0
 
@@ -460,7 +501,13 @@ class _TorchFallbackMCMCStrategy(Strategy):
             dead_mask = opacities <= self.min_opacity
             relocated = _mcmc_relocate(params, optimizers, dead_mask, binoms, self.min_opacity)
             current_count = len(params["means"])
-            target_count = min(self.cap_max, int(1.05 * current_count))
+            target_count = _mcmc_target_count(
+                current_count,
+                self.cap_max,
+                step=step,
+                refine_stop_iter=self.refine_stop_iter,
+                refine_every=self.refine_every,
+            )
             added = _mcmc_sample_add(params, optimizers, max(0, target_count - current_count), binoms, self.min_opacity)
             if self.verbose:
                 print(f"Step {step}: relocated {relocated}, added {added}, total={len(params['means'])}")
@@ -537,18 +584,16 @@ def _resolve_sfm_match_mode(settings: dict, image_count: int, project: dict | No
     if mode not in {"auto", "exhaustive", "sequential", "spatial"}:
         mode = "auto"
     if mode == "auto":
-        import_summary = (project or {}).get("last_import_summary") if project else None
-        aggregate = (import_summary or {}).get("aggregate") if isinstance(import_summary, dict) else {}
-        if int((aggregate or {}).get("source_videos") or 0) > 0:
+        if _is_long_video_sequence(project, image_count):
             return "sequential"
-        if image_count >= 48:
+        if image_count >= 96:
             return "sequential"
         return "exhaustive"
     return mode
 
 
 def _sfm_thread_count(settings: dict) -> int:
-    return max(1, min(_positive_int(settings.get("sfm_num_threads")) or 4, 4))
+    return max(1, min(_positive_int(settings.get("sfm_num_threads")) or 6, 6))
 
 
 def _auto_gaussian_budget(view_count: int, initial_points: int, train_resolution: int, preset: str) -> int:
@@ -786,6 +831,25 @@ def _filter_sparse_seed_points(
     error_threshold = max(1.5, float(np.quantile(point_errors[finite_errors], 0.90)))
     keep_mask_np = finite_errors & (track_lengths >= min_track_length) & (point_errors <= error_threshold)
     kept = int(np.count_nonzero(keep_mask_np))
+    filter_label = "strict"
+    kept_ratio = float(kept) / float(max(total, 1))
+
+    if total < 50_000 and kept_ratio < 0.80:
+        relaxed_min_track = 2
+        relaxed_error_threshold = max(error_threshold, float(np.quantile(point_errors[finite_errors], 0.95)))
+        relaxed_keep_mask_np = (
+            finite_errors
+            & (track_lengths >= relaxed_min_track)
+            & (point_errors <= relaxed_error_threshold)
+        )
+        relaxed_kept = int(np.count_nonzero(relaxed_keep_mask_np))
+        if relaxed_kept > kept:
+            keep_mask_np = relaxed_keep_mask_np
+            kept = relaxed_kept
+            min_track_length = relaxed_min_track
+            error_threshold = relaxed_error_threshold
+            filter_label = "relaxed"
+
     if kept >= total or kept < max(32, int(total * 0.35)):
         return points_tensor, rgb_tensor
 
@@ -794,7 +858,7 @@ def _filter_sparse_seed_points(
         _log_line(
             job,
             f"Filtered sparse seed points to {kept:,} / {total:,} "
-            f"(min_track_length={min_track_length}, error_limit={error_threshold:.2f}).",
+            f"(mode={filter_label}, min_track_length={min_track_length}, error_limit={error_threshold:.2f}).",
         )
     return points_tensor[keep_mask], rgb_tensor[keep_mask]
 
@@ -1416,6 +1480,7 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
     database_path = colmap_dir / "database.db"
     sparse_dir = colmap_dir / "sparse"
     video_derived = _project_is_video_derived(project)
+    long_video_sequence = _is_long_video_sequence(project, len(image_paths))
     quality_preset = _normalize_quality_preset(settings)
 
     preserve_sfm_cache = bool(settings.get("preserve_sfm_cache"))
@@ -1440,10 +1505,16 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
     _log_line(job, f"Prepared {len(image_paths)} normalized images for SfM.")
 
     sfm_threads = _sfm_thread_count(settings)
+    if long_video_sequence and sfm_threads > 4:
+        _log_line(
+            job,
+            f"Capping SfM threads from {sfm_threads} to 4 for long video matching safety.",
+        )
+        sfm_threads = 4
     _update(job["id"], "COLMAP", 0.08, "Extracting image features.")
     extraction_options = pycolmap.FeatureExtractionOptions()
-    requested_sfm_image_size = int(settings.get("sfm_max_image_size", 1280))
-    if video_derived and len(image_paths) >= 96 and requested_sfm_image_size > 1280:
+    requested_sfm_image_size = int(settings.get("sfm_max_image_size", 1600))
+    if long_video_sequence and requested_sfm_image_size > 1280:
         _log_line(
             job,
             f"Capping SfM image size from {requested_sfm_image_size} to 1280 for long video matching safety.",
@@ -1492,7 +1563,7 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
     _update(job["id"], "COLMAP", 0.14, f"Matching image features with {match_mode} mode.")
     if match_mode == "sequential":
         pairing_options = pycolmap.SequentialPairingOptions()
-        default_overlap = 5 if video_derived and len(image_paths) >= 96 else 8 if video_derived else 10
+        default_overlap = 5 if long_video_sequence else 8 if video_derived else 10
         pairing_options.overlap = int(settings.get("sfm_sequential_overlap", default_overlap))
         pairing_options.quadratic_overlap = bool(settings.get("sfm_quadratic_overlap", not video_derived))
         _log_line(
@@ -1520,13 +1591,11 @@ def _run_colmap(project: dict, job: dict, settings: dict) -> pycolmap.Reconstruc
     return reconstruction
 
 
-def _load_training_views(project: dict, reconstruction: pycolmap.Reconstruction, settings: dict) -> list[TrainingView]:
-    manifest_path = _find_transforms_manifest(project["id"])
-    if manifest_path:
-        views = _load_training_views_from_transforms(project, manifest_path, reconstruction, settings)
-        if views:
-            return views
-
+def _load_training_views_from_reconstruction(
+    project: dict,
+    reconstruction: pycolmap.Reconstruction,
+    settings: dict,
+) -> list[TrainingView]:
     image_dir = Path(project["input_dir"])
     target_resolution = int(settings.get("train_resolution", 640))
     selected_image_names = _select_registered_training_images(reconstruction)
@@ -1563,6 +1632,21 @@ def _load_training_views(project: dict, reconstruction: pycolmap.Reconstruction,
     if len(views) < 2:
         raise RuntimeError("COLMAP registered too few cameras to start Gaussian Splat training.")
     return views
+
+
+def _load_training_views(
+    project: dict,
+    reconstruction: pycolmap.Reconstruction,
+    settings: dict,
+    *,
+    prefer_manifest: bool = True,
+) -> list[TrainingView]:
+    manifest_path = _find_transforms_manifest(project["id"]) if prefer_manifest else None
+    if manifest_path:
+        views = _load_training_views_from_transforms(project, manifest_path, reconstruction, settings)
+        if views:
+            return views
+    return _load_training_views_from_reconstruction(project, reconstruction, settings)
 
 
 def _load_training_views_from_transforms(
@@ -1603,6 +1687,17 @@ def _load_training_views_from_transforms(
     if reconstruction is None:
         return views
     return _align_views_to_reconstruction(views, reconstruction)
+
+
+def _known_camera_manifest_skip_reason(views: list[TrainingView]) -> str | None:
+    if not views:
+        return "no usable project images matched the manifest"
+    if len(views) < 4:
+        return f"only {len(views)} usable view(s) matched the manifest; known-camera initialization needs at least 4"
+    missing_alpha = sum(1 for view in views if not view.has_alpha)
+    if missing_alpha:
+        return f"{missing_alpha} matched view(s) are missing alpha masks"
+    return None
 
 
 def _train_gaussians(
@@ -2128,31 +2223,54 @@ def run_gsplat_job(project: dict, job: dict, settings: dict) -> dict:
         _log_line(job, f"Dataset warning: {warning}")
 
     manifest_path = _find_transforms_manifest(project["id"])
+    manifest_fallback_reason: str | None = None
     if manifest_path:
         manifest_views = _load_training_views_from_transforms(project, manifest_path, None, settings)
-        if manifest_views and all(view.has_alpha for view in manifest_views):
+        manifest_fallback_reason = _known_camera_manifest_skip_reason(manifest_views)
+        if manifest_fallback_reason is None:
             _log_line(job, f"Loaded {len(manifest_views)} training views from camera manifest {manifest_path.name}.")
             _log_line(job, "Known-camera alpha dataset detected. Training will use the manifest frame directly and will not mix in COLMAP poses.")
             manifest_settings = dict(settings)
             manifest_settings["_known_camera_mode"] = True
             manifest_diagnostics = summarize_registered_views(dataset_diagnostics, len(manifest_views))
-            workspace_ply, point_count, bounds, training_summary = _train_gaussians(
-                project,
+            try:
+                workspace_ply, point_count, bounds, training_summary = _train_gaussians(
+                    project,
+                    job,
+                    manifest_settings,
+                    None,
+                    manifest_views,
+                    manifest_diagnostics,
+                )
+            except RuntimeError as error:
+                if "Known-camera initialization failed to build a foreground visual hull from alpha masks." not in str(error):
+                    raise
+                manifest_fallback_reason = (
+                    "manifest alpha initialization could not build a foreground visual hull"
+                )
+                _log_line(job, f"{error} Falling back to COLMAP sparse reconstruction.")
+            else:
+                manifest = _export_handoff(project, job, workspace_ply, point_count, bounds, training_summary)
+                _log_line(job, f"Exported trained splats to {manifest['scene_ply']}.")
+                return manifest
+        else:
+            _log_line(
                 job,
-                manifest_settings,
-                None,
-                manifest_views,
-                manifest_diagnostics,
+                f"Camera manifest {manifest_path.name} is not usable for known-camera training: "
+                f"{manifest_fallback_reason}. Falling back to COLMAP sparse reconstruction.",
             )
-            manifest = _export_handoff(project, job, workspace_ply, point_count, bounds, training_summary)
-            _log_line(job, f"Exported trained splats to {manifest['scene_ply']}.")
-            return manifest
 
     reconstruction = _run_colmap(project, job, settings)
-    views = _load_training_views(project, reconstruction, settings)
+    views = _load_training_views(project, reconstruction, settings, prefer_manifest=False)
     dataset_diagnostics = summarize_registered_views(dataset_diagnostics, len(views))
-    if manifest_path:
-        _log_line(job, f"Loaded {len(views)} training views from camera manifest {manifest_path.name}.")
+    if manifest_path and manifest_fallback_reason:
+        _log_line(
+            job,
+            f"Loaded {len(views)} registered training views from SfM after manifest fallback "
+            f"({manifest_fallback_reason}).",
+        )
+    elif manifest_path:
+        _log_line(job, f"Loaded {len(views)} registered training views from SfM with manifest metadata available.")
     else:
         _log_line(job, f"Loaded {len(views)} registered training views from SfM.")
     workspace_ply, point_count, bounds, training_summary = _train_gaussians(

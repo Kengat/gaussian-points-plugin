@@ -759,6 +759,17 @@ static bool ComputeProjectedBasis(
                 }
             }
         }
+        const float near_visibility_depth = std::max(near_clip * 3.0f, 0.35f);
+        if (depth < near_visibility_depth) {
+            return false;
+        }
+        const float oversized_radius = std::max(radius_px_major, radius_px_minor);
+        if (
+            oversized_radius > (0.85f * std::min(static_cast<float>(viewport_width), static_cast<float>(viewport_height))) &&
+            depth < (near_visibility_depth * 2.0f)
+        ) {
+            return false;
+        }
         const float total_contribution = opacity * 6.283185f * sqrt(det);
         const float effective_cull_distance = far_clip * 0.02f;
         const float depth_ratio = (effective_cull_distance + view_position[2]) / std::max(effective_cull_distance - near_clip, 1.0e-4f);
@@ -1871,6 +1882,16 @@ static void UpdateStandalonePreviewBounds() {
     g_standalonePreview.scene_radius = std::max(diagonal * 0.5f, 20.0f);
 }
 
+static float StandalonePreviewMinDistance() {
+    const float scene_radius = std::max(g_standalonePreview.scene_radius, 20.0f);
+    return std::max(scene_radius * 0.18f, 8.0f);
+}
+
+static float StandalonePreviewNearPlane(float distance) {
+    const float scene_radius = std::max(g_standalonePreview.scene_radius, 20.0f);
+    return std::max(std::min(distance * 0.12f, scene_radius * 0.08f), 0.25f);
+}
+
 static void FitStandalonePreviewCameraInternal(bool force_default_angles) {
     UpdateStandalonePreviewBounds();
     if (g_standalonePreview.has_bounds) {
@@ -1896,7 +1917,7 @@ static void FitStandalonePreviewCameraInternal(bool force_default_angles) {
 }
 
 static void BuildStandalonePreviewRenderState(ActiveRenderState* state) {
-    const float distance = std::max(g_standalonePreview.distance, 1.0f);
+    const float distance = std::max(g_standalonePreview.distance, StandalonePreviewMinDistance());
     const float orbit_cos_pitch = cosf(g_standalonePreview.orbit_pitch);
     const float orbit_sin_pitch = sinf(g_standalonePreview.orbit_pitch);
     const float orbit_cos_yaw = cosf(g_standalonePreview.orbit_yaw);
@@ -1916,7 +1937,7 @@ static void BuildStandalonePreviewRenderState(ActiveRenderState* state) {
     const float aspect = static_cast<float>(std::max(g_standalonePreview.width, 1)) /
         static_cast<float>(std::max(g_standalonePreview.height, 1));
     const float scene_radius = std::max(g_standalonePreview.scene_radius, 20.0f);
-    const float z_near = std::max(scene_radius * 0.01f, 0.1f);
+    const float z_near = StandalonePreviewNearPlane(distance);
     const float z_far = std::max(distance + (scene_radius * 8.0f), z_near + 10.0f);
 
     BuildLookAtMatrix(eye, g_standalonePreview.target, up, state->view_matrix);
@@ -2257,7 +2278,7 @@ static LRESULT CALLBACK StandalonePreviewWndProc(HWND hwnd, UINT message, WPARAM
         const float zoom_factor = (wheel_delta > 0) ? 0.88f : 1.12f;
         g_standalonePreview.distance = ClampFloat(
             g_standalonePreview.distance * zoom_factor,
-            std::max(g_standalonePreview.scene_radius * 0.05f, 2.0f),
+            StandalonePreviewMinDistance(),
             std::max(g_standalonePreview.scene_radius * 40.0f, 4000.0f));
         InvalidateStandalonePreview();
         return 0;
@@ -3063,6 +3084,21 @@ void main() {
                     farClip = max(derivedFar2, nearClip + 1.0);
                 }
             }
+        }
+        float nearVisibilityDepth = max(nearClip * 3.0, 0.35);
+        if (depth < nearVisibilityDepth) {
+            projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+            sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+            return;
+        }
+        float oversizedRadius = max(radiusMajor, radiusMinor);
+        if (
+            oversizedRadius > (0.85 * min(float(uViewport.x), float(uViewport.y))) &&
+            depth < (nearVisibilityDepth * 2.0)
+        ) {
+            projected[id].center_depth = vec4(0.0, 0.0, -2.0, 0.0);
+            sortEntries[id] = SortEntry(0xFFFFFFFFu, uint(id));
+            return;
         }
         float totalContribution = opacity * 6.283185 * sqrt(det);
         float effectiveCullDistance = farClip * 0.02;

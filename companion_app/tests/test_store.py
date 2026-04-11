@@ -74,6 +74,19 @@ class StoreStaleJobTest(unittest.TestCase):
         self.assertEqual("sequential", restored["sfm_match_mode"])
         self.assertFalse(bool(restored["force_restart"]))
 
+    def test_default_job_settings_restore_room_scale_sfm_defaults(self) -> None:
+        settings = store.default_job_settings()
+
+        self.assertEqual(1600, settings["sfm_max_image_size"])
+        self.assertEqual(6, settings["sfm_num_threads"])
+        self.assertEqual("auto", settings["strategy_name"])
+
+    def test_worker_thread_limit_matches_restored_sfm_defaults(self) -> None:
+        from companion_app.worker_entry import _thread_limit_from_job
+
+        self.assertEqual(6, _thread_limit_from_job({"settings": {"sfm_num_threads": 12}}))
+        self.assertEqual(2, _thread_limit_from_job({"settings": {"sfm_num_threads": 2}}))
+
     def test_preserve_sfm_cache_is_runtime_only(self) -> None:
         project = store.create_project("Preserve SfM")
         settings = store.project_training_settings(project["id"], force_restart=True)

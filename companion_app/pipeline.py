@@ -288,9 +288,25 @@ def ensure_project_camera_manifests(project_id: str) -> dict[str, object]:
         if rewritten.get("frames") != payload.get("frames"):
             manifest_path.write_text(json.dumps(rewritten, indent=2), encoding="utf-8")
             repaired += 1
-        if not chosen_manifest and rewritten.get("frames"):
+        frame_count = len(rewritten.get("frames") or [])
+        if frame_count > usable_views:
             chosen_manifest = manifest_path
-            usable_views = len(rewritten["frames"])
+            usable_views = frame_count
+
+    sample_manifest = _bundled_sample_manifest_path()
+    if sample_manifest.exists():
+        sample_payload = json.loads(sample_manifest.read_text(encoding="utf-8-sig"))
+        rewritten = _rewrite_manifest_to_project_inputs(project_id, sample_payload)
+        sample_view_count = len(rewritten.get("frames") or [])
+        if sample_view_count > usable_views:
+            target_path = project_root / sample_manifest.name
+            current_text = target_path.read_text(encoding="utf-8-sig") if target_path.exists() else None
+            rewritten_text = json.dumps(rewritten, indent=2)
+            if current_text != rewritten_text:
+                target_path.write_text(rewritten_text, encoding="utf-8")
+                repaired += 1
+            chosen_manifest = target_path
+            usable_views = sample_view_count
 
     if chosen_manifest:
         return {
@@ -299,20 +315,6 @@ def ensure_project_camera_manifests(project_id: str) -> dict[str, object]:
             "usable_views": usable_views,
             "repaired_manifests": repaired,
         }
-
-    sample_manifest = _bundled_sample_manifest_path()
-    if sample_manifest.exists():
-        sample_payload = json.loads(sample_manifest.read_text(encoding="utf-8-sig"))
-        rewritten = _rewrite_manifest_to_project_inputs(project_id, sample_payload)
-        if rewritten.get("frames"):
-            target_path = project_root / sample_manifest.name
-            target_path.write_text(json.dumps(rewritten, indent=2), encoding="utf-8")
-            return {
-                "mode": "manifest",
-                "manifest_path": str(target_path),
-                "usable_views": len(rewritten["frames"]),
-                "repaired_manifests": repaired + 1,
-            }
 
     return {
         "mode": "sfm",

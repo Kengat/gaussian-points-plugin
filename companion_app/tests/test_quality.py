@@ -5,13 +5,16 @@ import unittest
 from pathlib import Path
 import uuid
 
+import numpy as np
 from PIL import Image
 import torch
 
 from companion_app.gsplat_pipeline import (
     _active_sh_degree,
     _coordinate_outlier_keep_mask,
+    _filter_sparse_seed_points,
     _manifest_intrinsics_matrix,
+    _mcmc_target_count,
     _resolve_rasterize_mode,
     _resolve_sfm_match_mode,
     _scheduled_gaussian_budget,
@@ -40,12 +43,28 @@ class TrainingQualityTest(unittest.TestCase):
 
     def test_sfm_match_mode_auto_switches_for_larger_sets(self) -> None:
         self.assertEqual("exhaustive", _resolve_sfm_match_mode({"sfm_match_mode": "auto"}, 22))
-        self.assertEqual("sequential", _resolve_sfm_match_mode({"sfm_match_mode": "auto"}, 64))
+        self.assertEqual("exhaustive", _resolve_sfm_match_mode({"sfm_match_mode": "auto"}, 64))
+        short_video_project = {"last_import_summary": {"aggregate": {"source_videos": 1}}}
+        self.assertEqual("exhaustive", _resolve_sfm_match_mode({"sfm_match_mode": "auto"}, 22, short_video_project))
+        self.assertEqual("sequential", _resolve_sfm_match_mode({"sfm_match_mode": "auto"}, 96))
+        self.assertEqual("sequential", _resolve_sfm_match_mode({"sfm_match_mode": "auto"}, 96, short_video_project))
         self.assertEqual("spatial", _resolve_sfm_match_mode({"sfm_match_mode": "spatial"}, 64))
 
     def test_sfm_threads_are_capped_for_laptop_safety(self) -> None:
-        self.assertEqual(4, _sfm_thread_count({"sfm_num_threads": 12}))
+        self.assertEqual(6, _sfm_thread_count({"sfm_num_threads": 12}))
         self.assertEqual(2, _sfm_thread_count({"sfm_num_threads": 2}))
+
+    def test_mcmc_target_count_grows_faster_when_far_from_budget(self) -> None:
+        self.assertEqual(1050, _mcmc_target_count(1000, 1500))
+        self.assertEqual(1080, _mcmc_target_count(1000, 20_000))
+        early_target = _mcmc_target_count(1000, 4000, step=300, refine_stop_iter=2400, refine_every=50)
+        late_target = _mcmc_target_count(1000, 4000, step=2100, refine_stop_iter=2400, refine_every=50)
+        self.assertEqual(
+            2000,
+            _mcmc_target_count(1000, 2000, step=2350, refine_stop_iter=2400, refine_every=50),
+        )
+        self.assertGreater(early_target, 1000)
+        self.assertGreater(late_target, early_target)
 
     def test_sh_degree_reaches_full_before_late_refinement(self) -> None:
         self.assertEqual(0, _active_sh_degree(999, 6000, 3, {}))
@@ -94,6 +113,23 @@ class TrainingQualityTest(unittest.TestCase):
         self.assertIsNotNone(keep_mask)
         self.assertEqual(3, int((~keep_mask).sum().item()))
         self.assertGreater(stats["max"], stats["q99"] * 50.0)
+
+    def test_sparse_seed_filter_relaxes_for_medium_sized_reconstructions(self) -> None:
+        total = 100
+        points = torch.zeros((total, 3), dtype=torch.float32)
+        colors = torch.zeros((total, 3), dtype=torch.float32)
+        track_lengths = np.full((total,), 3, dtype=np.int32)
+        point_errors = np.linspace(0.1, 2.4, total, dtype=np.float32)
+        track_lengths[70:] = 2
+
+        filtered_points, _filtered_colors = _filter_sparse_seed_points(
+            points,
+            colors,
+            point_errors,
+            track_lengths,
+        )
+
+        self.assertGreater(len(filtered_points), 70)
 
     def test_manifest_intrinsics_rescale_full_resolution_parameters(self) -> None:
         K = _manifest_intrinsics_matrix(

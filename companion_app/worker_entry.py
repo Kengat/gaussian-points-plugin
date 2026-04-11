@@ -18,10 +18,10 @@ _MONITOR_INTERVAL_SECONDS = 5.0
 def _thread_limit_from_job(job: dict) -> int:
     settings = job.get("settings") if isinstance(job.get("settings"), dict) else {}
     try:
-        requested = int(settings.get("sfm_num_threads", 4))
+        requested = int(settings.get("sfm_num_threads", 6))
     except (TypeError, ValueError):
-        requested = 4
-    return max(1, min(requested, 4))
+        requested = 6
+    return max(1, min(requested, 6))
 
 
 def _append_log(log_path: str | Path, message: str) -> None:
