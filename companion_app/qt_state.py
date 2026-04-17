@@ -20,6 +20,7 @@ from .pipeline import ensure_project_camera_manifests, ingest_media_sources, lis
 from .ply import read_preview_points
 from .preview_scene import preview_scene_path
 from .scene_import import IMPORT_MODE_CONVERT, IMPORT_MODE_DIRECT, import_gaussian_scene_file
+from .splat_transform import snapshot_from_payload, snapshot_to_payload
 
 
 LIVE_STALE_SECONDS = 120
@@ -831,6 +832,26 @@ class QtStateController(QtCore.QObject):
             p = p.parent()
         return p
 
+    def _preview_viewport(self) -> Any | None:
+        window = self._app_window()
+        return getattr(window, "viewport", None) if window is not None else None
+
+    def _preview_shortcuts_enabled(self) -> bool:
+        focus_widget = QtWidgets.QApplication.focusWidget()
+        if isinstance(
+            focus_widget,
+            (
+                QtWidgets.QLineEdit,
+                QtWidgets.QTextEdit,
+                QtWidgets.QPlainTextEdit,
+                QtWidgets.QAbstractSpinBox,
+            ),
+        ):
+            return False
+        if isinstance(focus_widget, QtWidgets.QComboBox) and focus_widget.isEditable():
+            return False
+        return True
+
     def _set_menu_popup_visible(self, visible: bool) -> None:
         visible = bool(visible)
         if self._menu_popup_visible == visible:
@@ -954,8 +975,8 @@ class QtStateController(QtCore.QObject):
                 self._menu_item("Exit", shortcut="ALT+F4"),
             ],
             "edit": [
-                self._menu_item("Undo", icon="rotate-ccw", shortcut="CTRL+Z"),
-                self._menu_item("Redo", icon="rotate-ccw", shortcut="CTRL+Y"),
+                self._menu_item("Undo", icon="rotate-ccw", shortcut="CTRL+Z", action="undoPreviewTransform"),
+                self._menu_item("Redo", icon="rotate-ccw", shortcut="CTRL+Y", action="redoPreviewTransform"),
                 self._menu_separator(),
                 self._menu_item("Cut", shortcut="CTRL+X"),
                 self._menu_item("Copy", icon="copy", shortcut="CTRL+C"),
@@ -996,6 +1017,14 @@ class QtStateController(QtCore.QObject):
         if action_key == "importScene":
             self.closeAllMenus()
             self.importGaussianSceneDialog()
+            return
+        if action_key == "undoPreviewTransform":
+            self.closeAllMenus()
+            self.undoPreviewTransform()
+            return
+        if action_key == "redoPreviewTransform":
+            self.closeAllMenus()
+            self.redoPreviewTransform()
             return
         self.closeAllMenus()
 
@@ -1090,6 +1119,42 @@ class QtStateController(QtCore.QObject):
             return
         self._active_tool = next_tool
         self.activeToolChanged.emit()
+
+    def save_preview_transform(self, project_id: str, scene_path: str, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        project = store.get_project(project_id)
+        if not project:
+            return None
+        if payload:
+            normalized_snapshot = snapshot_from_payload(payload)
+            stored_payload = snapshot_to_payload(normalized_snapshot, scene_path=scene_path) if normalized_snapshot else None
+        else:
+            stored_payload = None
+        return store.update_project(project_id, preview_transform=stored_payload)
+
+    @QtCore.Slot()
+    def resetPreviewTransform(self) -> None:
+        viewport = self._preview_viewport()
+        if viewport is None:
+            return
+        viewport.reset_transform()
+
+    @QtCore.Slot()
+    def undoPreviewTransform(self) -> None:
+        if not self._preview_shortcuts_enabled():
+            return
+        viewport = self._preview_viewport()
+        if viewport is None:
+            return
+        viewport.undo_transform()
+
+    @QtCore.Slot()
+    def redoPreviewTransform(self) -> None:
+        if not self._preview_shortcuts_enabled():
+            return
+        viewport = self._preview_viewport()
+        if viewport is None:
+            return
+        viewport.redo_transform()
 
     @QtCore.Slot()
     def newProjectDialog(self) -> None:
@@ -1432,9 +1497,17 @@ class QtStateController(QtCore.QObject):
         if not preview_path or not Path(preview_path).exists():
             title = "Add a dataset to this project" if not images else "Training in progress" if latest and latest["status"] == "running" else "Ready to train"
             footer = "No photos have been added yet." if not images else "Training is running. Logs update live in the right panel." if latest and latest["status"] == "running" else f"{len(images)} photos loaded. Press Train Model to build the scene."
-            return {"hasScene": False, "path": "", "pointCount": 0, "emptyTitle": title, "footer": footer}
+            return {"hasScene": False, "path": "", "pointCount": 0, "emptyTitle": title, "footer": footer, "transform": None}
         stats = self._preview_scene_stats(preview_path)
-        return {"hasScene": True, "path": preview_path, "projectId": project["id"], "pointCount": int(stats["point_count"]), "emptyTitle": "", "footer": f"Bounds: {stats['bounds']['min']} -> {stats['bounds']['max']}"}
+        return {
+            "hasScene": True,
+            "path": preview_path,
+            "projectId": project["id"],
+            "pointCount": int(stats["point_count"]),
+            "emptyTitle": "",
+            "footer": f"Bounds: {stats['bounds']['min']} -> {stats['bounds']['max']}",
+            "transform": self._preview_transform_payload(project, preview_path),
+        }
 
     def _project_preview_path(self, project: dict[str, Any]) -> str | None:
         return preview_scene_path(project)
@@ -1453,6 +1526,18 @@ class QtStateController(QtCore.QObject):
             self._preview_path = preview_path
             self._preview_stamp = stamp
         return dict(self._preview_stats or {})
+
+    def _preview_transform_payload(self, project: dict[str, Any], preview_path: str) -> dict[str, Any] | None:
+        payload = project.get("preview_transform")
+        if not isinstance(payload, dict):
+            return None
+        scene_path = str(payload.get("scenePath") or "")
+        if scene_path and Path(scene_path).resolve() != Path(preview_path).resolve():
+            return None
+        snapshot = snapshot_from_payload(payload)
+        if snapshot is None:
+            return None
+        return snapshot_to_payload(snapshot, scene_path=preview_path)
 
     def _read_logs(self, latest: dict[str, Any] | None) -> str:
         path = Path(latest["log_path"]) if latest and latest.get("log_path") else None

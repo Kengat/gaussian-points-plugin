@@ -67,6 +67,27 @@ extern "C" {
     EXPORT void ResetStandalonePreviewCamera();
     EXPORT void FitStandalonePreviewCamera();
     EXPORT double GetStandalonePreviewFPS();
+    EXPORT int GetStandalonePreviewCameraState(
+        float* out_view_matrix16,
+        float* out_projection_matrix16,
+        float* out_camera_position3,
+        float* out_camera_target3,
+        float* out_camera_up3,
+        int* out_viewport_width,
+        int* out_viewport_height);
+    EXPORT void OrbitStandalonePreviewCamera(float delta_x_pixels, float delta_y_pixels);
+    EXPORT void PanStandalonePreviewCamera(float delta_x_pixels, float delta_y_pixels);
+    EXPORT void ZoomStandalonePreviewCamera(float steps);
+    EXPORT void SetStandalonePreviewGizmoMode(int tool_mode);
+    EXPORT int ResetStandalonePreviewObjectTransform(const char* object_id);
+    EXPORT int UndoStandalonePreviewObjectTransform(const char* object_id);
+    EXPORT int RedoStandalonePreviewObjectTransform(const char* object_id);
+    EXPORT int IsStandalonePreviewDragging();
+    EXPORT int GetStandalonePreviewObjectTransform(
+        const char* object_id,
+        double* out_center_xyz,
+        double* out_half_extents_xyz,
+        double* out_axes_xyz);
 
 #ifdef __cplusplus
 }

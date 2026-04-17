@@ -37,6 +37,8 @@ static void UpdateStandalonePreviewBounds();
 static void FitStandalonePreviewCameraInternal(bool force_default_angles);
 static void InvalidateStandalonePreview();
 static LRESULT CALLBACK StandalonePreviewWndProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param);
+static void RefreshWorldSplatsFromObjects();
+static bool StandalonePreviewCanUseGPUTransformPath();
 
 struct NativeClipBoxState {
     bool enabled = false;
@@ -86,6 +88,34 @@ struct StandalonePreviewState {
     bool has_frame_timing = false;
     double smoothed_fps = 0.0;
     bool swap_interval_configured = false;
+    int gizmo_mode = 0;
+    int hovered_handle = 0;
+    int active_handle = 0;
+    bool tracking_hover = false;
+};
+
+struct StandalonePreviewDragState {
+    bool active = false;
+    bool changed = false;
+    int handle_id = 0;
+    int kind = 0;
+    float plane_origin[3] = { 0.0f, 0.0f, 0.0f };
+    float plane_normal[3] = { 0.0f, 0.0f, 1.0f };
+    float axis[3] = { 1.0f, 0.0f, 0.0f };
+    float axis_a[3] = { 1.0f, 0.0f, 0.0f };
+    float axis_b[3] = { 0.0f, 1.0f, 0.0f };
+    float start_scalar = 0.0f;
+    float start_hit[3] = { 0.0f, 0.0f, 0.0f };
+    float start_center[3] = { 0.0f, 0.0f, 0.0f };
+    float start_half_extents[3] = { 1.0f, 1.0f, 1.0f };
+    double start_axes[9] = {
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0
+    };
+    int start_mouse_x = 0;
+    int start_mouse_y = 0;
+    float start_angle = 0.0f;
 };
 
 // Renderer-owned state for splats, buffers, and camera-driven sorting.
@@ -132,12 +162,30 @@ static const float SH_C3[7] = {
     -0.5900435899266435f
 };
 
+struct SplatObjectTransformState {
+    double center_xyz[3] = { 0.0, 0.0, 0.0 };
+    double half_extents_xyz[3] = { 1.0, 1.0, 1.0 };
+    double axes_xyz[9] = {
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0
+    };
+    bool visible = true;
+};
+
 struct SplatObject {
     std::string id;
     std::vector<GaussSplat> local_splats;
     double center_xyz[3] = { 0.0, 0.0, 0.0 };
     double half_extents_xyz[3] = { 1.0, 1.0, 1.0 };
     double base_half_extents_xyz[3] = { 1.0, 1.0, 1.0 };
+    double default_center_xyz[3] = { 0.0, 0.0, 0.0 };
+    double default_half_extents_xyz[3] = { 1.0, 1.0, 1.0 };
+    double default_axes_xyz[9] = {
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0
+    };
     double axes_xyz[9] = {
         1.0, 0.0, 0.0,
         0.0, 1.0, 0.0,
@@ -145,6 +193,8 @@ struct SplatObject {
     };
     bool visible = true;
     int highlight_mode = 0;
+    std::vector<SplatObjectTransformState> undo_stack;
+    std::vector<SplatObjectTransformState> redo_stack;
 };
 static std::vector<SplatObject> g_splatObjects;
 static const int HIGHLIGHT_NONE = 0;
@@ -209,9 +259,41 @@ static const int kAutoApproximateSortThreshold = 250000;
 static const int kMotionApproximateSortThreshold = 100000;
 static const int kApproximateSortSettleDelayFrames = 6;
 static StandalonePreviewState g_standalonePreview = {};
+static StandalonePreviewDragState g_standalonePreviewDrag = {};
 static bool g_standalonePreviewEnabled = false;
 static const wchar_t* kStandalonePreviewWindowClass = L"GaussianPointsStandalonePreview";
 static HMODULE g_rendererModuleHandle = nullptr;
+static constexpr float kStandalonePreviewTanHalfFov = 0.41421356237f;
+static constexpr int kStandaloneHandleNone = 0;
+static constexpr int kStandaloneHandleMoveX = 1;
+static constexpr int kStandaloneHandleMoveY = 2;
+static constexpr int kStandaloneHandleMoveZ = 3;
+static constexpr int kStandaloneHandleResizeMinX = 4;
+static constexpr int kStandaloneHandleResizeMaxX = 5;
+static constexpr int kStandaloneHandleResizeMinY = 6;
+static constexpr int kStandaloneHandleResizeMaxY = 7;
+static constexpr int kStandaloneHandleResizeMinZ = 8;
+static constexpr int kStandaloneHandleResizeMaxZ = 9;
+static constexpr int kStandaloneHandleMovePlaneXY = 10;
+static constexpr int kStandaloneHandleMovePlaneXZ = 11;
+static constexpr int kStandaloneHandleMovePlaneYZ = 12;
+static constexpr int kStandaloneHandleRotateX = 13;
+static constexpr int kStandaloneHandleRotateY = 14;
+static constexpr int kStandaloneHandleRotateZ = 15;
+static constexpr int kStandaloneHandleMoveCenter = 16;
+static constexpr int kStandaloneHandleScaleUniform = 17;
+static constexpr int kStandaloneGizmoNone = 0;
+static constexpr int kStandaloneGizmoMove = 1;
+static constexpr int kStandaloneGizmoTransform = 2;
+static constexpr int kStandaloneDragNone = 0;
+static constexpr int kStandaloneDragMoveAxis = 1;
+static constexpr int kStandaloneDragMoveCenter = 2;
+static constexpr int kStandaloneDragRotate = 3;
+static constexpr int kStandaloneDragScaleUniform = 4;
+static constexpr int kStandaloneDragResizeAxis = 5;
+static constexpr int kStandaloneDragMovePlane = 6;
+static constexpr float kStandaloneMinHalfExtent = 1.0e-3f;
+static constexpr size_t kStandalonePreviewHistoryLimit = 64;
 
 static GLuint g_splatShader = 0;
 static GLuint g_outlineCompositeShader = 0;
@@ -1474,6 +1556,264 @@ static SplatObject* FindSplatObject(const char* object_id) {
     return nullptr;
 }
 
+struct PreviewVec3 {
+    float x;
+    float y;
+    float z;
+};
+
+static PreviewVec3 MakePreviewVec3(float x, float y, float z) {
+    PreviewVec3 value = { x, y, z };
+    return value;
+}
+
+static PreviewVec3 PreviewAdd(const PreviewVec3& a, const PreviewVec3& b) {
+    return MakePreviewVec3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+static PreviewVec3 PreviewSub(const PreviewVec3& a, const PreviewVec3& b) {
+    return MakePreviewVec3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+static PreviewVec3 PreviewScale(const PreviewVec3& value, float scalar) {
+    return MakePreviewVec3(value.x * scalar, value.y * scalar, value.z * scalar);
+}
+
+static float PreviewDot(const PreviewVec3& a, const PreviewVec3& b) {
+    return (a.x * b.x) + (a.y * b.y) + (a.z * b.z);
+}
+
+static PreviewVec3 PreviewCross(const PreviewVec3& a, const PreviewVec3& b) {
+    return MakePreviewVec3(
+        (a.y * b.z) - (a.z * b.y),
+        (a.z * b.x) - (a.x * b.z),
+        (a.x * b.y) - (a.y * b.x));
+}
+
+static float PreviewLength(const PreviewVec3& value) {
+    return sqrtf(PreviewDot(value, value));
+}
+
+static PreviewVec3 PreviewNormalize(const PreviewVec3& value, const PreviewVec3& fallback = { 0.0f, 0.0f, 1.0f }) {
+    const float length = PreviewLength(value);
+    if (length <= 1.0e-6f) {
+        return fallback;
+    }
+    return PreviewScale(value, 1.0f / length);
+}
+
+static PreviewVec3 PreviewRotateAroundAxis(const PreviewVec3& vector, const PreviewVec3& axis, float angle) {
+    const PreviewVec3 unit_axis = PreviewNormalize(axis, MakePreviewVec3(0.0f, 0.0f, 1.0f));
+    const float cos_angle = cosf(angle);
+    const float sin_angle = sinf(angle);
+    const PreviewVec3 term_a = PreviewScale(vector, cos_angle);
+    const PreviewVec3 term_b = PreviewScale(PreviewCross(unit_axis, vector), sin_angle);
+    const PreviewVec3 term_c = PreviewScale(unit_axis, PreviewDot(unit_axis, vector) * (1.0f - cos_angle));
+    return PreviewAdd(PreviewAdd(term_a, term_b), term_c);
+}
+
+static void CopyPreviewVec3ToArray(const PreviewVec3& value, float* out_xyz) {
+    if (!out_xyz) {
+        return;
+    }
+    out_xyz[0] = value.x;
+    out_xyz[1] = value.y;
+    out_xyz[2] = value.z;
+}
+
+static PreviewVec3 PreviewVec3FromArray(const float* xyz, const PreviewVec3& fallback = { 0.0f, 0.0f, 0.0f }) {
+    if (!xyz) {
+        return fallback;
+    }
+    return MakePreviewVec3(xyz[0], xyz[1], xyz[2]);
+}
+
+static PreviewVec3 PreviewVec3FromObjectAxis(const SplatObject& object, int axis_index) {
+    const int offset = axis_index * 3;
+    const PreviewVec3 fallback = axis_index == 0 ? MakePreviewVec3(1.0f, 0.0f, 0.0f) :
+        axis_index == 1 ? MakePreviewVec3(0.0f, 1.0f, 0.0f) :
+        MakePreviewVec3(0.0f, 0.0f, 1.0f);
+    return PreviewNormalize(
+        MakePreviewVec3(
+            static_cast<float>(object.axes_xyz[offset + 0]),
+            static_cast<float>(object.axes_xyz[offset + 1]),
+            static_cast<float>(object.axes_xyz[offset + 2])),
+        fallback);
+}
+
+static PreviewVec3 PreviewObjectCenter(const SplatObject& object) {
+    return MakePreviewVec3(
+        static_cast<float>(object.center_xyz[0]),
+        static_cast<float>(object.center_xyz[1]),
+        static_cast<float>(object.center_xyz[2]));
+}
+
+static float PreviewObjectHalfExtent(const SplatObject& object, int axis_index) {
+    return static_cast<float>(std::max(object.half_extents_xyz[axis_index], 1.0e-3));
+}
+
+static SplatObject* FindStandalonePreviewEditableObject() {
+    for (SplatObject& object : g_splatObjects) {
+        if (object.visible && !object.local_splats.empty()) {
+            return &object;
+        }
+    }
+    return nullptr;
+}
+
+static void NormalizeSplatObjectAxes(SplatObject* object) {
+    if (!object) {
+        return;
+    }
+    PreviewVec3 axis_x = PreviewVec3FromObjectAxis(*object, 0);
+    PreviewVec3 axis_y = PreviewVec3FromObjectAxis(*object, 1);
+    axis_y = PreviewSub(axis_y, PreviewScale(axis_x, PreviewDot(axis_y, axis_x)));
+    axis_y = PreviewNormalize(axis_y, MakePreviewVec3(0.0f, 1.0f, 0.0f));
+    PreviewVec3 axis_z = PreviewNormalize(PreviewCross(axis_x, axis_y), MakePreviewVec3(0.0f, 0.0f, 1.0f));
+    axis_y = PreviewNormalize(PreviewCross(axis_z, axis_x), MakePreviewVec3(0.0f, 1.0f, 0.0f));
+    object->axes_xyz[0] = axis_x.x; object->axes_xyz[1] = axis_x.y; object->axes_xyz[2] = axis_x.z;
+    object->axes_xyz[3] = axis_y.x; object->axes_xyz[4] = axis_y.y; object->axes_xyz[5] = axis_y.z;
+    object->axes_xyz[6] = axis_z.x; object->axes_xyz[7] = axis_z.y; object->axes_xyz[8] = axis_z.z;
+}
+
+static void CopySplatObjectTransformState(const SplatObject& object, SplatObjectTransformState* out_state) {
+    if (!out_state) {
+        return;
+    }
+    memcpy(out_state->center_xyz, object.center_xyz, sizeof(out_state->center_xyz));
+    memcpy(out_state->half_extents_xyz, object.half_extents_xyz, sizeof(out_state->half_extents_xyz));
+    memcpy(out_state->axes_xyz, object.axes_xyz, sizeof(out_state->axes_xyz));
+    out_state->visible = object.visible;
+}
+
+static void ApplySplatObjectTransformState(SplatObject* object, const SplatObjectTransformState& state) {
+    if (!object) {
+        return;
+    }
+    memcpy(object->center_xyz, state.center_xyz, sizeof(object->center_xyz));
+    memcpy(object->half_extents_xyz, state.half_extents_xyz, sizeof(object->half_extents_xyz));
+    memcpy(object->axes_xyz, state.axes_xyz, sizeof(object->axes_xyz));
+    object->visible = state.visible;
+}
+
+static bool SplatObjectTransformStateEquals(
+    const SplatObjectTransformState& a,
+    const SplatObjectTransformState& b,
+    double epsilon = 1.0e-6) {
+    if (a.visible != b.visible) {
+        return false;
+    }
+    for (int index = 0; index < 3; ++index) {
+        if (fabs(a.center_xyz[index] - b.center_xyz[index]) > epsilon ||
+            fabs(a.half_extents_xyz[index] - b.half_extents_xyz[index]) > epsilon) {
+            return false;
+        }
+    }
+    for (int index = 0; index < 9; ++index) {
+        if (fabs(a.axes_xyz[index] - b.axes_xyz[index]) > epsilon) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ResetSplatObjectTransformHistory(SplatObject* object) {
+    if (!object) {
+        return;
+    }
+    object->undo_stack.clear();
+    object->redo_stack.clear();
+}
+
+static void PushSplatObjectTransformHistory(
+    std::vector<SplatObjectTransformState>* stack,
+    const SplatObjectTransformState& state) {
+    if (!stack) {
+        return;
+    }
+    if (!stack->empty() && SplatObjectTransformStateEquals(stack->back(), state)) {
+        return;
+    }
+    stack->push_back(state);
+    if (stack->size() > kStandalonePreviewHistoryLimit) {
+        stack->erase(stack->begin());
+    }
+}
+
+static SplatObjectTransformState StandalonePreviewDefaultTransformState(const SplatObject& object) {
+    SplatObjectTransformState state = {};
+    memcpy(state.center_xyz, object.default_center_xyz, sizeof(state.center_xyz));
+    memcpy(state.half_extents_xyz, object.default_half_extents_xyz, sizeof(state.half_extents_xyz));
+    memcpy(state.axes_xyz, object.default_axes_xyz, sizeof(state.axes_xyz));
+    state.visible = true;
+    return state;
+}
+
+static SplatObjectTransformState StandalonePreviewDragStartState() {
+    SplatObjectTransformState state = {};
+    for (int axis = 0; axis < 3; ++axis) {
+        state.center_xyz[axis] = g_standalonePreviewDrag.start_center[axis];
+        state.half_extents_xyz[axis] = g_standalonePreviewDrag.start_half_extents[axis];
+    }
+    memcpy(state.axes_xyz, g_standalonePreviewDrag.start_axes, sizeof(state.axes_xyz));
+    state.visible = true;
+    return state;
+}
+
+static void ApplyStandalonePreviewObjectChange(SplatObject* object) {
+    if (!object) {
+        return;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        object->half_extents_xyz[axis] = std::max(object->half_extents_xyz[axis], static_cast<double>(kStandaloneMinHalfExtent));
+    }
+    NormalizeSplatObjectAxes(object);
+    UpdateStandalonePreviewBounds();
+    if (StandalonePreviewCanUseGPUTransformPath()) {
+        g_gpuObjectDataDirty = true;
+        g_splatVBO.needsUpdate = false;
+        g_hasGeometryState = false;
+    } else {
+        RefreshWorldSplatsFromObjects();
+    }
+    InvalidateStandalonePreview();
+}
+
+static bool ApplyStandalonePreviewTransformCommand(
+    SplatObject* object,
+    const SplatObjectTransformState& next_state) {
+    if (!object) {
+        return false;
+    }
+    SplatObjectTransformState current_state = {};
+    CopySplatObjectTransformState(*object, &current_state);
+    if (SplatObjectTransformStateEquals(current_state, next_state)) {
+        return true;
+    }
+    PushSplatObjectTransformHistory(&object->undo_stack, current_state);
+    object->redo_stack.clear();
+    ApplySplatObjectTransformState(object, next_state);
+    ApplyStandalonePreviewObjectChange(object);
+    return true;
+}
+
+static bool CopyStandalonePreviewObjectTransform(
+    const SplatObject& object,
+    double* out_center_xyz,
+    double* out_half_extents_xyz,
+    double* out_axes_xyz) {
+    if (out_center_xyz) {
+        memcpy(out_center_xyz, object.center_xyz, sizeof(object.center_xyz));
+    }
+    if (out_half_extents_xyz) {
+        memcpy(out_half_extents_xyz, object.half_extents_xyz, sizeof(object.half_extents_xyz));
+    }
+    if (out_axes_xyz) {
+        memcpy(out_axes_xyz, object.axes_xyz, sizeof(object.axes_xyz));
+    }
+    return true;
+}
+
 static void ResetSplatObjects() {
     std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
     g_splatObjects.clear();
@@ -2093,6 +2433,1335 @@ static void PanStandalonePreview(float delta_x_pixels, float delta_y_pixels) {
     }
 }
 
+static bool StandalonePreviewHandleHighlighted(int handle_id) {
+    return handle_id != kStandaloneHandleNone &&
+        (g_standalonePreview.hovered_handle == handle_id || g_standalonePreview.active_handle == handle_id);
+}
+
+static bool StandalonePreviewControlDown() {
+    return (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+}
+
+static bool StandalonePreviewCenterHandleScaleMode() {
+    const int handle_id =
+        g_standalonePreview.active_handle != kStandaloneHandleNone
+        ? g_standalonePreview.active_handle
+        : g_standalonePreview.hovered_handle;
+    return handle_id == kStandaloneHandleScaleUniform;
+}
+
+static void StandalonePreviewHandleColor(int handle_id, float* out_r, float* out_g, float* out_b) {
+    float r = 1.0f;
+    float g = 0.66f;
+    float b = 0.15f;
+    switch (handle_id) {
+    case kStandaloneHandleMoveX:
+    case kStandaloneHandleResizeMinX:
+    case kStandaloneHandleResizeMaxX:
+    case kStandaloneHandleRotateX:
+        r = 0.86f; g = 0.27f; b = 0.22f;
+        break;
+    case kStandaloneHandleMoveY:
+    case kStandaloneHandleResizeMinY:
+    case kStandaloneHandleResizeMaxY:
+    case kStandaloneHandleRotateY:
+        r = 0.27f; g = 0.74f; b = 0.35f;
+        break;
+    case kStandaloneHandleMoveZ:
+    case kStandaloneHandleResizeMinZ:
+    case kStandaloneHandleResizeMaxZ:
+    case kStandaloneHandleRotateZ:
+        r = 0.28f; g = 0.47f; b = 0.90f;
+        break;
+    case kStandaloneHandleMovePlaneXY:
+        r = 0.91f; g = 0.64f; b = 0.21f;
+        break;
+    case kStandaloneHandleMovePlaneXZ:
+        r = 0.74f; g = 0.38f; b = 0.74f;
+        break;
+    case kStandaloneHandleMovePlaneYZ:
+        r = 0.29f; g = 0.71f; b = 0.77f;
+        break;
+    case kStandaloneHandleMoveCenter:
+    case kStandaloneHandleScaleUniform:
+        r = 1.00f; g = 0.77f; b = 0.38f;
+        break;
+    default:
+        break;
+    }
+    if (StandalonePreviewHandleHighlighted(handle_id)) {
+        r = ClampFloat(r + 0.15f, 0.0f, 1.0f);
+        g = ClampFloat(g + 0.15f, 0.0f, 1.0f);
+        b = ClampFloat(b + 0.15f, 0.0f, 1.0f);
+    }
+    *out_r = r;
+    *out_g = g;
+    *out_b = b;
+}
+
+static PreviewVec3 StandalonePreviewCameraPosition(const ActiveRenderState& state) {
+    return MakePreviewVec3(state.camera_position[0], state.camera_position[1], state.camera_position[2]);
+}
+
+static PreviewVec3 StandalonePreviewCameraForward(const ActiveRenderState& state) {
+    return PreviewNormalize(
+        MakePreviewVec3(
+            state.camera_target[0] - state.camera_position[0],
+            state.camera_target[1] - state.camera_position[1],
+            state.camera_target[2] - state.camera_position[2]),
+        MakePreviewVec3(0.0f, 0.0f, -1.0f));
+}
+
+static PreviewVec3 StandalonePreviewCameraUp(const ActiveRenderState& state) {
+    return PreviewNormalize(
+        MakePreviewVec3(state.camera_up[0], state.camera_up[1], state.camera_up[2]),
+        MakePreviewVec3(0.0f, 0.0f, 1.0f));
+}
+
+static PreviewVec3 StandalonePreviewCameraRight(const ActiveRenderState& state) {
+    PreviewVec3 right = PreviewNormalize(
+        PreviewCross(StandalonePreviewCameraForward(state), StandalonePreviewCameraUp(state)),
+        MakePreviewVec3(1.0f, 0.0f, 0.0f));
+    if (PreviewLength(right) <= 1.0e-6f) {
+        right = MakePreviewVec3(1.0f, 0.0f, 0.0f);
+    }
+    return right;
+}
+
+static PreviewVec3 StandalonePreviewBillboardUp(const ActiveRenderState& state) {
+    return PreviewNormalize(
+        PreviewCross(StandalonePreviewCameraRight(state), StandalonePreviewCameraForward(state)),
+        MakePreviewVec3(0.0f, 1.0f, 0.0f));
+}
+
+static int StandalonePreviewAxisIndex(char axis_name) {
+    return axis_name == 'x' ? 0 : axis_name == 'y' ? 1 : 2;
+}
+
+static PreviewVec3 StandalonePreviewWorldAxis(char axis_name) {
+    switch (axis_name) {
+    case 'x': return MakePreviewVec3(1.0f, 0.0f, 0.0f);
+    case 'y': return MakePreviewVec3(0.0f, 1.0f, 0.0f);
+    default: return MakePreviewVec3(0.0f, 0.0f, 1.0f);
+    }
+}
+
+static float StandalonePreviewWorldUnitsPerPixelAt(const ActiveRenderState& state, const PreviewVec3& point) {
+    const float viewport_height = static_cast<float>(std::max(g_standalonePreview.height, 1));
+    const float projection_scale =
+        fabsf(state.projection_matrix[5]) > 1.0e-5f ? fabsf(state.projection_matrix[5]) : 1.0f;
+    if (state.is_perspective != 0) {
+        const float depth = std::max(
+            PreviewDot(PreviewSub(point, StandalonePreviewCameraPosition(state)), StandalonePreviewCameraForward(state)),
+            1.0f);
+        return (2.0f * depth / projection_scale) / viewport_height;
+    }
+    return (2.0f / projection_scale) / viewport_height;
+}
+
+static float StandalonePreviewPixelsToWorldAt(const ActiveRenderState& state, const PreviewVec3& point, float pixels) {
+    return StandalonePreviewWorldUnitsPerPixelAt(state, point) * pixels;
+}
+
+static PreviewVec3 StandalonePreviewObjectAxis(const SplatObject& object, char axis_name) {
+    PreviewVec3 axis = PreviewVec3FromObjectAxis(object, StandalonePreviewAxisIndex(axis_name));
+    if (PreviewLength(axis) <= 1.0e-6f) {
+        axis = StandalonePreviewWorldAxis(axis_name);
+    }
+    return axis;
+}
+
+static float StandalonePreviewHalfExtent(const SplatObject& object, char axis_name) {
+    return PreviewObjectHalfExtent(object, StandalonePreviewAxisIndex(axis_name));
+}
+
+static PreviewVec3 StandalonePreviewAxisFaceCenter(const SplatObject& object, char axis_name, bool positive_side) {
+    return PreviewAdd(
+        PreviewObjectCenter(object),
+        PreviewScale(
+            StandalonePreviewObjectAxis(object, axis_name),
+            StandalonePreviewHalfExtent(object, axis_name) * (positive_side ? 1.0f : -1.0f)));
+}
+
+static void StandalonePreviewMoveHandleGeometry(
+    const ActiveRenderState& state,
+    const SplatObject& object,
+    char axis_name,
+    PreviewVec3* out_line_start,
+    PreviewVec3* out_line_tip) {
+    const PreviewVec3 face_center = StandalonePreviewAxisFaceCenter(object, axis_name, true);
+    const PreviewVec3 axis_dir = StandalonePreviewObjectAxis(object, axis_name);
+    const float gap = StandalonePreviewPixelsToWorldAt(state, face_center, 18.0f);
+    const float length = StandalonePreviewPixelsToWorldAt(state, face_center, 54.0f);
+    *out_line_start = PreviewAdd(face_center, PreviewScale(axis_dir, gap));
+    *out_line_tip = PreviewAdd(face_center, PreviewScale(axis_dir, gap + length));
+}
+
+static void StandalonePreviewPlaneHandleGeometry(
+    const ActiveRenderState& state,
+    const SplatObject& object,
+    char axis_a_name,
+    char axis_b_name,
+    PreviewVec3* out_center,
+    float* out_half_size) {
+    const PreviewVec3 box_center = PreviewObjectCenter(object);
+    const PreviewVec3 axis_a = StandalonePreviewObjectAxis(object, axis_a_name);
+    const PreviewVec3 axis_b = StandalonePreviewObjectAxis(object, axis_b_name);
+    const float half_size = StandalonePreviewPixelsToWorldAt(state, box_center, 9.0f);
+    const float offset = StandalonePreviewPixelsToWorldAt(state, box_center, 24.0f) + half_size;
+    if (out_center) {
+        *out_center = PreviewAdd(
+            PreviewAdd(box_center, PreviewScale(axis_a, offset)),
+            PreviewScale(axis_b, offset));
+    }
+    if (out_half_size) {
+        *out_half_size = half_size;
+    }
+}
+
+static float StandalonePreviewCenterHandleHalfSize(const ActiveRenderState& state, const SplatObject& object) {
+    return StandalonePreviewPixelsToWorldAt(state, PreviewObjectCenter(object), 6.0f);
+}
+
+static void StandalonePreviewRotationGeometry(
+    const ActiveRenderState& state,
+    const SplatObject& object,
+    char axis_name,
+    PreviewVec3* out_center,
+    PreviewVec3* out_axis_a,
+    PreviewVec3* out_axis_b,
+    float* out_radius) {
+    *out_radius = StandalonePreviewPixelsToWorldAt(state, PreviewObjectCenter(object), 120.0f);
+    if (axis_name == 'x') {
+        *out_axis_a = StandalonePreviewObjectAxis(object, 'y');
+        *out_axis_b = StandalonePreviewObjectAxis(object, 'z');
+    }
+    else if (axis_name == 'y') {
+        *out_axis_a = StandalonePreviewObjectAxis(object, 'z');
+        *out_axis_b = StandalonePreviewObjectAxis(object, 'x');
+    }
+    else {
+        *out_axis_a = StandalonePreviewObjectAxis(object, 'x');
+        *out_axis_b = StandalonePreviewObjectAxis(object, 'y');
+    }
+    if (out_center) {
+        *out_center = PreviewObjectCenter(object);
+    }
+}
+
+static PreviewVec3 StandalonePreviewRotationArcPoint(
+    const PreviewVec3& center,
+    const PreviewVec3& axis_a,
+    const PreviewVec3& axis_b,
+    float radius,
+    float angle) {
+    return PreviewAdd(
+        PreviewAdd(center, PreviewScale(axis_a, cosf(angle) * radius)),
+        PreviewScale(axis_b, sinf(angle) * radius));
+}
+
+static bool StandalonePreviewProjectPoint(const ActiveRenderState& state, const PreviewVec3& point, float* out_x, float* out_y) {
+    const float world[3] = { point.x, point.y, point.z };
+    float view_position[3] = {};
+    TransformPointMat4(state.view_matrix, world, view_position);
+    const float clip_x =
+        state.projection_matrix[0] * view_position[0] +
+        state.projection_matrix[1] * view_position[1] +
+        state.projection_matrix[2] * view_position[2] +
+        state.projection_matrix[3];
+    const float clip_y =
+        state.projection_matrix[4] * view_position[0] +
+        state.projection_matrix[5] * view_position[1] +
+        state.projection_matrix[6] * view_position[2] +
+        state.projection_matrix[7];
+    const float clip_w =
+        state.projection_matrix[12] * view_position[0] +
+        state.projection_matrix[13] * view_position[1] +
+        state.projection_matrix[14] * view_position[2] +
+        state.projection_matrix[15];
+    if (fabsf(clip_w) <= 1.0e-6f) {
+        return false;
+    }
+    const float ndc_x = clip_x / clip_w;
+    const float ndc_y = clip_y / clip_w;
+    if (!std::isfinite(ndc_x) || !std::isfinite(ndc_y)) {
+        return false;
+    }
+    *out_x = ((ndc_x * 0.5f) + 0.5f) * static_cast<float>(std::max(g_standalonePreview.width, 1));
+    *out_y = (1.0f - ((ndc_y * 0.5f) + 0.5f)) * static_cast<float>(std::max(g_standalonePreview.height, 1));
+    return true;
+}
+
+static bool StandalonePreviewMouseRay(int mouse_x, int mouse_y, PreviewVec3* out_origin, PreviewVec3* out_direction) {
+    ActiveRenderState state = {};
+    BuildStandalonePreviewRenderState(&state);
+    if (!state.has_view || !state.has_projection || !state.has_camera) {
+        return false;
+    }
+    const float width = static_cast<float>(std::max(g_standalonePreview.width, 1));
+    const float height = static_cast<float>(std::max(g_standalonePreview.height, 1));
+    const float aspect = width / height;
+    const float ndc_x = (2.0f * static_cast<float>(mouse_x) / width) - 1.0f;
+    const float ndc_y = 1.0f - (2.0f * static_cast<float>(mouse_y) / height);
+    const PreviewVec3 forward = StandalonePreviewCameraForward(state);
+    const PreviewVec3 right = StandalonePreviewCameraRight(state);
+    const PreviewVec3 up = StandalonePreviewBillboardUp(state);
+    *out_origin = StandalonePreviewCameraPosition(state);
+    *out_direction = PreviewNormalize(
+        PreviewAdd(
+            forward,
+            PreviewAdd(
+                PreviewScale(right, ndc_x * aspect * kStandalonePreviewTanHalfFov),
+                PreviewScale(up, ndc_y * kStandalonePreviewTanHalfFov))),
+        forward);
+    return true;
+}
+
+static bool StandalonePreviewIntersectMousePlane(
+    int mouse_x,
+    int mouse_y,
+    const PreviewVec3& plane_origin,
+    const PreviewVec3& plane_normal,
+    PreviewVec3* out_hit) {
+    PreviewVec3 ray_origin = {};
+    PreviewVec3 ray_direction = {};
+    if (!StandalonePreviewMouseRay(mouse_x, mouse_y, &ray_origin, &ray_direction)) {
+        return false;
+    }
+    const PreviewVec3 normal = PreviewNormalize(plane_normal, MakePreviewVec3(0.0f, 0.0f, 1.0f));
+    const float denominator = PreviewDot(ray_direction, normal);
+    if (fabsf(denominator) <= 1.0e-6f) {
+        return false;
+    }
+    const float distance = PreviewDot(PreviewSub(plane_origin, ray_origin), normal) / denominator;
+    if (distance < 0.0f) {
+        return false;
+    }
+    *out_hit = PreviewAdd(ray_origin, PreviewScale(ray_direction, distance));
+    return true;
+}
+
+static PreviewVec3 StandalonePreviewPlaneNormalForAxis(const PreviewVec3& axis, const PreviewVec3& camera_direction) {
+    const PreviewVec3 tangent = PreviewCross(camera_direction, axis);
+    PreviewVec3 normal = PreviewCross(axis, tangent);
+    if (PreviewLength(normal) > 1.0e-3f) {
+        return PreviewNormalize(normal, MakePreviewVec3(0.0f, 0.0f, 1.0f));
+    }
+    const PreviewVec3 fallback = PreviewCross(MakePreviewVec3(0.0f, 0.0f, 1.0f), axis);
+    normal = PreviewCross(axis, fallback);
+    if (PreviewLength(normal) > 1.0e-3f) {
+        return PreviewNormalize(normal, MakePreviewVec3(0.0f, 1.0f, 0.0f));
+    }
+    return MakePreviewVec3(0.0f, 1.0f, 0.0f);
+}
+
+static float StandalonePreviewAngleOnPlane(
+    const PreviewVec3& point,
+    const PreviewVec3& origin,
+    const PreviewVec3& axis_a,
+    const PreviewVec3& axis_b) {
+    const PreviewVec3 vector = PreviewSub(point, origin);
+    return atan2f(PreviewDot(vector, axis_b), PreviewDot(vector, axis_a));
+}
+
+static float StandalonePreviewNormalizeAngle(float angle) {
+    while (angle > static_cast<float>(M_PI)) {
+        angle -= static_cast<float>(M_PI * 2.0);
+    }
+    while (angle < -static_cast<float>(M_PI)) {
+        angle += static_cast<float>(M_PI * 2.0);
+    }
+    return angle;
+}
+
+static float StandalonePreviewDistanceToSegment(
+    float x,
+    float y,
+    float start_x,
+    float start_y,
+    float end_x,
+    float end_y) {
+    const float vx = end_x - start_x;
+    const float vy = end_y - start_y;
+    const float wx = x - start_x;
+    const float wy = y - start_y;
+    const float vv = (vx * vx) + (vy * vy);
+    if (vv <= 1.0e-4f) {
+        return sqrtf((wx * wx) + (wy * wy));
+    }
+    float t = ((wx * vx) + (wy * vy)) / vv;
+    t = ClampFloat(t, 0.0f, 1.0f);
+    const float closest_x = start_x + (vx * t);
+    const float closest_y = start_y + (vy * t);
+    const float dx = x - closest_x;
+    const float dy = y - closest_y;
+    return sqrtf((dx * dx) + (dy * dy));
+}
+
+static float StandalonePreviewSignedUniformScalePixels(int mouse_x, int mouse_y) {
+    const float diagonal = sqrtf(0.5f);
+    return (static_cast<float>(mouse_x - g_standalonePreviewDrag.start_mouse_x) * diagonal) +
+        (static_cast<float>(g_standalonePreviewDrag.start_mouse_y - mouse_y) * diagonal);
+}
+
+static void DrawStandalonePreviewVertex(const PreviewVec3& point) {
+    glVertex3f(point.x, point.y, point.z);
+}
+
+static void DrawStandalonePreviewBillboardDisc(
+    const ActiveRenderState& state,
+    const PreviewVec3& center,
+    float radius,
+    float r,
+    float g,
+    float b,
+    bool highlighted) {
+    constexpr int kSegments = 24;
+    const PreviewVec3 right = StandalonePreviewCameraRight(state);
+    const PreviewVec3 up = StandalonePreviewBillboardUp(state);
+    glColor4f(0.0f, 0.0f, 0.0f, highlighted ? 0.28f : 0.18f);
+    glBegin(GL_TRIANGLE_FAN);
+    DrawStandalonePreviewVertex(center);
+    for (int segment = 0; segment <= kSegments; ++segment) {
+        const float angle = static_cast<float>(segment) / static_cast<float>(kSegments) * 6.28318530718f;
+        DrawStandalonePreviewVertex(PreviewAdd(PreviewAdd(center, PreviewScale(right, cosf(angle) * radius)), PreviewScale(up, sinf(angle) * radius)));
+    }
+    glEnd();
+    glLineWidth(highlighted ? 2.5f : 1.5f);
+    glColor4f(r, g, b, 1.0f);
+    glBegin(GL_LINE_LOOP);
+    for (int segment = 0; segment < kSegments; ++segment) {
+        const float angle = static_cast<float>(segment) / static_cast<float>(kSegments) * 6.28318530718f;
+        DrawStandalonePreviewVertex(PreviewAdd(PreviewAdd(center, PreviewScale(right, cosf(angle) * radius)), PreviewScale(up, sinf(angle) * radius)));
+    }
+    glEnd();
+}
+
+static void DrawStandalonePreviewBillboardSquare(
+    const ActiveRenderState& state,
+    const PreviewVec3& center,
+    float half_size,
+    float r,
+    float g,
+    float b,
+    bool highlighted) {
+    const PreviewVec3 right = PreviewScale(StandalonePreviewCameraRight(state), half_size);
+    const PreviewVec3 up = PreviewScale(StandalonePreviewBillboardUp(state), half_size);
+    const PreviewVec3 corners[4] = {
+        PreviewSub(PreviewSub(center, right), up),
+        PreviewAdd(PreviewSub(center, up), right),
+        PreviewAdd(PreviewAdd(center, right), up),
+        PreviewAdd(PreviewSub(center, right), up)
+    };
+    glColor4f(0.0f, 0.0f, 0.0f, highlighted ? 0.28f : 0.18f);
+    glBegin(GL_QUADS);
+    for (const PreviewVec3& corner : corners) {
+        DrawStandalonePreviewVertex(corner);
+    }
+    glEnd();
+    glLineWidth(highlighted ? 2.5f : 1.5f);
+    glColor4f(r, g, b, 1.0f);
+    glBegin(GL_LINE_LOOP);
+    for (const PreviewVec3& corner : corners) {
+        DrawStandalonePreviewVertex(corner);
+    }
+    glEnd();
+}
+
+static void DrawStandalonePreviewPlanarDisc(
+    const PreviewVec3& center,
+    const PreviewVec3& axis_a,
+    const PreviewVec3& axis_b,
+    float radius,
+    float r,
+    float g,
+    float b,
+    bool highlighted) {
+    constexpr int kSegments = 24;
+    glColor4f(r, g, b, highlighted ? 0.34f : 0.22f);
+    glBegin(GL_TRIANGLE_FAN);
+    DrawStandalonePreviewVertex(center);
+    for (int index = 0; index <= kSegments; ++index) {
+        const float angle = (static_cast<float>(index) / static_cast<float>(kSegments)) * 6.28318530718f;
+        DrawStandalonePreviewVertex(
+            PreviewAdd(
+                PreviewAdd(center, PreviewScale(axis_a, cosf(angle) * radius)),
+                PreviewScale(axis_b, sinf(angle) * radius)));
+    }
+    glEnd();
+
+    glLineWidth(highlighted ? 3.0f : 1.5f);
+    glColor4f(r, g, b, 1.0f);
+    glBegin(GL_LINE_LOOP);
+    for (int index = 0; index < kSegments; ++index) {
+        const float angle = (static_cast<float>(index) / static_cast<float>(kSegments)) * 6.28318530718f;
+        DrawStandalonePreviewVertex(
+            PreviewAdd(
+                PreviewAdd(center, PreviewScale(axis_a, cosf(angle) * radius)),
+                PreviewScale(axis_b, sinf(angle) * radius)));
+    }
+    glEnd();
+}
+
+static void DrawStandalonePreviewRotationArc(
+    const ActiveRenderState& state,
+    const PreviewVec3& center,
+    const PreviewVec3& axis_a,
+    const PreviewVec3& axis_b,
+    float radius,
+    float r,
+    float g,
+    float b,
+    bool highlighted) {
+    constexpr int kSegments = 24;
+    constexpr float kSweep = 1.00530964915f;
+    const float start_angle = 0.78539816339f - (kSweep * 0.5f);
+
+    glLineWidth(highlighted ? 5.0f : 3.0f);
+    glColor4f(0.0f, 0.0f, 0.0f, 0.22f);
+    glBegin(GL_LINE_STRIP);
+    for (int segment = 0; segment <= kSegments; ++segment) {
+        const float angle = start_angle + (static_cast<float>(segment) / static_cast<float>(kSegments) * kSweep);
+        DrawStandalonePreviewVertex(StandalonePreviewRotationArcPoint(center, axis_a, axis_b, radius, angle));
+    }
+    glEnd();
+
+    glLineWidth(highlighted ? 3.0f : 2.0f);
+    glColor4f(r, g, b, 1.0f);
+    glBegin(GL_LINE_STRIP);
+    for (int segment = 0; segment <= kSegments; ++segment) {
+        const float angle = start_angle + (static_cast<float>(segment) / static_cast<float>(kSegments) * kSweep);
+        DrawStandalonePreviewVertex(StandalonePreviewRotationArcPoint(center, axis_a, axis_b, radius, angle));
+    }
+    glEnd();
+
+    const float end_angle = start_angle + kSweep;
+    const PreviewVec3 tip = StandalonePreviewRotationArcPoint(center, axis_a, axis_b, radius, end_angle);
+    const PreviewVec3 prev = StandalonePreviewRotationArcPoint(center, axis_a, axis_b, radius, end_angle - 0.08f);
+    const PreviewVec3 direction = PreviewNormalize(PreviewSub(tip, prev), axis_a);
+    const PreviewVec3 plane_normal = PreviewNormalize(PreviewCross(axis_a, axis_b), StandalonePreviewCameraForward(state));
+    PreviewVec3 side = PreviewNormalize(PreviewCross(direction, plane_normal), StandalonePreviewCameraForward(state));
+    if (PreviewLength(side) <= 1.0e-5f) {
+        side = PreviewNormalize(PreviewCross(direction, StandalonePreviewCameraForward(state)), axis_b);
+    }
+    const float arrow_length = StandalonePreviewPixelsToWorldAt(state, tip, 10.0f);
+    const PreviewVec3 left_wing = PreviewAdd(
+        PreviewSub(tip, PreviewScale(direction, arrow_length)),
+        PreviewScale(side, arrow_length * 0.45f));
+    const PreviewVec3 right_wing = PreviewSub(
+        PreviewSub(tip, PreviewScale(direction, arrow_length)),
+        PreviewScale(side, arrow_length * 0.45f));
+
+    glLineWidth(highlighted ? 3.0f : 2.0f);
+    glBegin(GL_LINES);
+    DrawStandalonePreviewVertex(tip); DrawStandalonePreviewVertex(left_wing);
+    DrawStandalonePreviewVertex(tip); DrawStandalonePreviewVertex(right_wing);
+    glEnd();
+}
+
+static bool StandalonePreviewHandlePoint(
+    const ActiveRenderState& state,
+    const SplatObject& object,
+    int handle_id,
+    PreviewVec3* out_point) {
+    if (!out_point) {
+        return false;
+    }
+    switch (handle_id) {
+    case kStandaloneHandleMoveX:
+    case kStandaloneHandleMoveY:
+    case kStandaloneHandleMoveZ: {
+        PreviewVec3 line_start = {};
+        PreviewVec3 line_tip = {};
+        const char axis_name =
+            handle_id == kStandaloneHandleMoveX ? 'x' :
+            handle_id == kStandaloneHandleMoveY ? 'y' : 'z';
+        StandalonePreviewMoveHandleGeometry(state, object, axis_name, &line_start, &line_tip);
+        *out_point = line_tip;
+        return true;
+    }
+    case kStandaloneHandleResizeMinX:
+        *out_point = StandalonePreviewAxisFaceCenter(object, 'x', false);
+        return true;
+    case kStandaloneHandleResizeMaxX:
+        *out_point = StandalonePreviewAxisFaceCenter(object, 'x', true);
+        return true;
+    case kStandaloneHandleResizeMinY:
+        *out_point = StandalonePreviewAxisFaceCenter(object, 'y', false);
+        return true;
+    case kStandaloneHandleResizeMaxY:
+        *out_point = StandalonePreviewAxisFaceCenter(object, 'y', true);
+        return true;
+    case kStandaloneHandleResizeMinZ:
+        *out_point = StandalonePreviewAxisFaceCenter(object, 'z', false);
+        return true;
+    case kStandaloneHandleResizeMaxZ:
+        *out_point = StandalonePreviewAxisFaceCenter(object, 'z', true);
+        return true;
+    case kStandaloneHandleMovePlaneXY:
+        StandalonePreviewPlaneHandleGeometry(state, object, 'x', 'y', out_point, nullptr);
+        return true;
+    case kStandaloneHandleMovePlaneXZ:
+        StandalonePreviewPlaneHandleGeometry(state, object, 'x', 'z', out_point, nullptr);
+        return true;
+    case kStandaloneHandleMovePlaneYZ:
+        StandalonePreviewPlaneHandleGeometry(state, object, 'y', 'z', out_point, nullptr);
+        return true;
+    case kStandaloneHandleRotateX:
+    case kStandaloneHandleRotateY:
+    case kStandaloneHandleRotateZ: {
+        PreviewVec3 center = {};
+        PreviewVec3 axis_a = {};
+        PreviewVec3 axis_b = {};
+        float radius = 0.0f;
+        const char axis_name =
+            handle_id == kStandaloneHandleRotateX ? 'x' :
+            handle_id == kStandaloneHandleRotateY ? 'y' : 'z';
+        StandalonePreviewRotationGeometry(state, object, axis_name, &center, &axis_a, &axis_b, &radius);
+        *out_point = StandalonePreviewRotationArcPoint(center, axis_a, axis_b, radius, 0.78539816339f);
+        return true;
+    }
+    case kStandaloneHandleMoveCenter:
+    case kStandaloneHandleScaleUniform:
+        *out_point = PreviewObjectCenter(object);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void DrawStandalonePreviewGizmo() {
+    if (g_standalonePreview.gizmo_mode == kStandaloneGizmoNone) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    SplatObject* object = FindStandalonePreviewEditableObject();
+    if (!object) {
+        return;
+    }
+    ActiveRenderState state = {};
+    BuildStandalonePreviewRenderState(&state);
+    if (!state.has_view || !state.has_projection || !state.has_camera) {
+        return;
+    }
+
+    float projection_gl[16] = {};
+    float view_gl[16] = {};
+    TransposeMat4(state.projection_matrix, projection_gl);
+    TransposeMat4(state.view_matrix, view_gl);
+
+    GLint old_matrix_mode = 0;
+    GLint old_texture = 0;
+    GLint old_program = 0;
+    GLint old_depth_func = GL_LEQUAL;
+    GLfloat old_line_width = 1.0f;
+    GLfloat old_point_size = 1.0f;
+    GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean old_depth_mask = GL_TRUE;
+    GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+    GLboolean texture_enabled = glIsEnabled(GL_TEXTURE_2D);
+    GLboolean cull_enabled = glIsEnabled(GL_CULL_FACE);
+
+    glGetIntegerv(GL_MATRIX_MODE, &old_matrix_mode);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
+    glGetIntegerv(GL_DEPTH_FUNC, &old_depth_func);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &old_depth_mask);
+    glGetFloatv(GL_LINE_WIDTH, &old_line_width);
+    glGetFloatv(GL_POINT_SIZE, &old_point_size);
+
+    glUseProgram(0);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_PROGRAM_POINT_SIZE);
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadMatrixf(projection_gl);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadMatrixf(view_gl);
+
+    const int move_ids[3] = { kStandaloneHandleMoveX, kStandaloneHandleMoveY, kStandaloneHandleMoveZ };
+    const char move_axes[3] = { 'x', 'y', 'z' };
+    for (int index = 0; index < 3; ++index) {
+        PreviewVec3 line_start = {};
+        PreviewVec3 line_tip = {};
+        StandalonePreviewMoveHandleGeometry(state, *object, move_axes[index], &line_start, &line_tip);
+
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        StandalonePreviewHandleColor(move_ids[index], &r, &g, &b);
+
+        const PreviewVec3 axis_dir = StandalonePreviewObjectAxis(*object, move_axes[index]);
+        PreviewVec3 side = PreviewNormalize(PreviewCross(axis_dir, StandalonePreviewCameraForward(state)), StandalonePreviewBillboardUp(state));
+        if (PreviewLength(side) < 1.0e-5f) {
+            side = PreviewNormalize(PreviewCross(axis_dir, StandalonePreviewBillboardUp(state)), StandalonePreviewCameraRight(state));
+        }
+        if (PreviewLength(side) < 1.0e-5f) {
+            side = PreviewNormalize(PreviewCross(axis_dir, MakePreviewVec3(0.0f, 0.0f, 1.0f)), MakePreviewVec3(0.0f, 1.0f, 0.0f));
+        }
+        const float arrow_length = StandalonePreviewPixelsToWorldAt(state, line_tip, 12.0f);
+        const PreviewVec3 arrow_back = PreviewScale(axis_dir, arrow_length);
+        const PreviewVec3 arrow_side = PreviewScale(side, arrow_length * 0.55f);
+        const PreviewVec3 left_wing = PreviewAdd(PreviewSub(line_tip, arrow_back), arrow_side);
+        const PreviewVec3 right_wing = PreviewSub(PreviewSub(line_tip, arrow_back), arrow_side);
+
+        glLineWidth(StandalonePreviewHandleHighlighted(move_ids[index]) ? 5.0f : 3.0f);
+        glColor4f(0.0f, 0.0f, 0.0f, 0.18f);
+        glBegin(GL_LINES);
+        DrawStandalonePreviewVertex(line_start); DrawStandalonePreviewVertex(line_tip);
+        DrawStandalonePreviewVertex(line_tip); DrawStandalonePreviewVertex(left_wing);
+        DrawStandalonePreviewVertex(line_tip); DrawStandalonePreviewVertex(right_wing);
+        glEnd();
+
+        glLineWidth(StandalonePreviewHandleHighlighted(move_ids[index]) ? 3.0f : 2.0f);
+        glColor4f(r, g, b, 1.0f);
+        glBegin(GL_LINES);
+        DrawStandalonePreviewVertex(line_start); DrawStandalonePreviewVertex(line_tip);
+        DrawStandalonePreviewVertex(line_tip); DrawStandalonePreviewVertex(left_wing);
+        DrawStandalonePreviewVertex(line_tip); DrawStandalonePreviewVertex(right_wing);
+        glEnd();
+    }
+
+    const int plane_ids[3] = {
+        kStandaloneHandleMovePlaneXY,
+        kStandaloneHandleMovePlaneXZ,
+        kStandaloneHandleMovePlaneYZ
+    };
+    for (int index = 0; index < 3; ++index) {
+        char axis_a = 'x';
+        char axis_b = 'y';
+        if (plane_ids[index] == kStandaloneHandleMovePlaneXZ) {
+            axis_b = 'z';
+        } else if (plane_ids[index] == kStandaloneHandleMovePlaneYZ) {
+            axis_a = 'y';
+            axis_b = 'z';
+        }
+
+        PreviewVec3 plane_center = {};
+        float plane_half_size = 0.0f;
+        StandalonePreviewPlaneHandleGeometry(state, *object, axis_a, axis_b, &plane_center, &plane_half_size);
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        StandalonePreviewHandleColor(plane_ids[index], &r, &g, &b);
+        DrawStandalonePreviewPlanarDisc(
+            plane_center,
+            StandalonePreviewObjectAxis(*object, axis_a),
+            StandalonePreviewObjectAxis(*object, axis_b),
+            plane_half_size,
+            r,
+            g,
+            b,
+            StandalonePreviewHandleHighlighted(plane_ids[index]));
+    }
+
+    {
+        const int center_handle_id = StandalonePreviewCenterHandleScaleMode()
+            ? kStandaloneHandleScaleUniform
+            : kStandaloneHandleMoveCenter;
+        const bool highlighted =
+            StandalonePreviewHandleHighlighted(kStandaloneHandleMoveCenter) ||
+            StandalonePreviewHandleHighlighted(kStandaloneHandleScaleUniform);
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        StandalonePreviewHandleColor(center_handle_id, &r, &g, &b);
+        const PreviewVec3 center = PreviewObjectCenter(*object);
+        const float half_size = StandalonePreviewCenterHandleHalfSize(state, *object) * (highlighted ? 1.15f : 1.0f);
+        if (center_handle_id == kStandaloneHandleScaleUniform) {
+            DrawStandalonePreviewBillboardSquare(state, center, half_size, r, g, b, highlighted);
+        } else {
+            DrawStandalonePreviewBillboardDisc(state, center, half_size, r, g, b, highlighted);
+        }
+    }
+
+    const int rotate_ids[3] = { kStandaloneHandleRotateX, kStandaloneHandleRotateY, kStandaloneHandleRotateZ };
+    const char rotate_axes[3] = { 'x', 'y', 'z' };
+    for (int index = 0; index < 3; ++index) {
+        PreviewVec3 center = {};
+        PreviewVec3 axis_a = {};
+        PreviewVec3 axis_b = {};
+        float radius = 0.0f;
+        StandalonePreviewRotationGeometry(state, *object, rotate_axes[index], &center, &axis_a, &axis_b, &radius);
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        StandalonePreviewHandleColor(rotate_ids[index], &r, &g, &b);
+        DrawStandalonePreviewRotationArc(
+            state,
+            center,
+            axis_a,
+            axis_b,
+            radius,
+            r,
+            g,
+            b,
+            StandalonePreviewHandleHighlighted(rotate_ids[index]));
+    }
+
+    const int resize_ids[6] = {
+        kStandaloneHandleResizeMinX, kStandaloneHandleResizeMaxX,
+        kStandaloneHandleResizeMinY, kStandaloneHandleResizeMaxY,
+        kStandaloneHandleResizeMinZ, kStandaloneHandleResizeMaxZ
+    };
+    for (int index = 0; index < 6; ++index) {
+        PreviewVec3 center = {};
+        if (!StandalonePreviewHandlePoint(state, *object, resize_ids[index], &center)) {
+            continue;
+        }
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        StandalonePreviewHandleColor(resize_ids[index], &r, &g, &b);
+        const float half_size = StandalonePreviewPixelsToWorldAt(
+            state,
+            center,
+            StandalonePreviewHandleHighlighted(resize_ids[index]) ? 8.0f : 6.0f);
+        DrawStandalonePreviewBillboardSquare(
+            state,
+            center,
+            half_size,
+            r,
+            g,
+            b,
+            StandalonePreviewHandleHighlighted(resize_ids[index]));
+    }
+
+    glPointSize(old_point_size);
+    glLineWidth(old_line_width);
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(old_matrix_mode);
+    glBindTexture(GL_TEXTURE_2D, old_texture);
+    glUseProgram(static_cast<GLuint>(old_program));
+    if (blend_enabled) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    glDepthMask(old_depth_mask);
+    glDepthFunc(old_depth_func);
+    if (depth_enabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (texture_enabled) glEnable(GL_TEXTURE_2D); else glDisable(GL_TEXTURE_2D);
+    if (cull_enabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+}
+
+static int PickStandalonePreviewHandle(int mouse_x, int mouse_y) {
+    if (g_standalonePreview.gizmo_mode == kStandaloneGizmoNone) {
+        return kStandaloneHandleNone;
+    }
+    constexpr float kResizePickThreshold = 16.0f;
+    constexpr float kPlanePickThreshold = 18.0f;
+    constexpr float kCenterPickThreshold = 18.0f;
+    constexpr float kRotatePickThreshold = 22.0f;
+    constexpr float kMovePickThreshold = 12.0f;
+    constexpr int kRotateSegments = 24;
+    constexpr float kRotateSweep = 1.00530964915f;
+    const float rotate_start = 0.78539816339f - (kRotateSweep * 0.5f);
+
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    SplatObject* object = FindStandalonePreviewEditableObject();
+    if (!object) {
+        return kStandaloneHandleNone;
+    }
+    ActiveRenderState state = {};
+    BuildStandalonePreviewRenderState(&state);
+    if (!state.has_view || !state.has_projection || !state.has_camera) {
+        return kStandaloneHandleNone;
+    }
+    const int resize_ids[6] = {
+        kStandaloneHandleResizeMinX, kStandaloneHandleResizeMaxX,
+        kStandaloneHandleResizeMinY, kStandaloneHandleResizeMaxY,
+        kStandaloneHandleResizeMinZ, kStandaloneHandleResizeMaxZ
+    };
+    int best_handle = kStandaloneHandleNone;
+    float best_distance = kResizePickThreshold;
+    for (int index = 0; index < 6; ++index) {
+        PreviewVec3 point = {};
+        float screen_x = 0.0f;
+        float screen_y = 0.0f;
+        if (!StandalonePreviewHandlePoint(state, *object, resize_ids[index], &point) ||
+            !StandalonePreviewProjectPoint(state, point, &screen_x, &screen_y)) {
+            continue;
+        }
+        const float dx = static_cast<float>(mouse_x) - screen_x;
+        const float dy = static_cast<float>(mouse_y) - screen_y;
+        const float distance = sqrtf((dx * dx) + (dy * dy));
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_handle = resize_ids[index];
+        }
+    }
+    if (best_handle != kStandaloneHandleNone) {
+        return best_handle;
+    }
+
+    const int plane_ids[3] = {
+        kStandaloneHandleMovePlaneXY,
+        kStandaloneHandleMovePlaneXZ,
+        kStandaloneHandleMovePlaneYZ
+    };
+    best_distance = kPlanePickThreshold;
+    for (int index = 0; index < 3; ++index) {
+        PreviewVec3 point = {};
+        float screen_x = 0.0f;
+        float screen_y = 0.0f;
+        if (!StandalonePreviewHandlePoint(state, *object, plane_ids[index], &point) ||
+            !StandalonePreviewProjectPoint(state, point, &screen_x, &screen_y)) {
+            continue;
+        }
+        const float dx = static_cast<float>(mouse_x) - screen_x;
+        const float dy = static_cast<float>(mouse_y) - screen_y;
+        const float distance = sqrtf((dx * dx) + (dy * dy));
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_handle = plane_ids[index];
+        }
+    }
+    if (best_handle != kStandaloneHandleNone) {
+        return best_handle;
+    }
+
+    {
+        const int center_handle_id = StandalonePreviewControlDown() ? kStandaloneHandleScaleUniform : kStandaloneHandleMoveCenter;
+        PreviewVec3 point = {};
+        float screen_x = 0.0f;
+        float screen_y = 0.0f;
+        if (StandalonePreviewHandlePoint(state, *object, center_handle_id, &point) &&
+            StandalonePreviewProjectPoint(state, point, &screen_x, &screen_y)) {
+            const float dx = static_cast<float>(mouse_x) - screen_x;
+            const float dy = static_cast<float>(mouse_y) - screen_y;
+            if (sqrtf((dx * dx) + (dy * dy)) < kCenterPickThreshold) {
+                return center_handle_id;
+            }
+        }
+    }
+
+    const int rotate_ids[3] = { kStandaloneHandleRotateX, kStandaloneHandleRotateY, kStandaloneHandleRotateZ };
+    const char rotate_axes[3] = { 'x', 'y', 'z' };
+    best_handle = kStandaloneHandleNone;
+    best_distance = kRotatePickThreshold;
+    for (int index = 0; index < 3; ++index) {
+        PreviewVec3 center = {};
+        PreviewVec3 axis_a = {};
+        PreviewVec3 axis_b = {};
+        float radius = 0.0f;
+        StandalonePreviewRotationGeometry(state, *object, rotate_axes[index], &center, &axis_a, &axis_b, &radius);
+        float prev_x = 0.0f;
+        float prev_y = 0.0f;
+        bool have_prev = false;
+        float arc_distance = kRotatePickThreshold;
+        for (int segment = 0; segment <= kRotateSegments; ++segment) {
+            const float angle = rotate_start + (static_cast<float>(segment) / static_cast<float>(kRotateSegments) * kRotateSweep);
+            float screen_x = 0.0f;
+            float screen_y = 0.0f;
+            if (!StandalonePreviewProjectPoint(
+                state,
+                StandalonePreviewRotationArcPoint(center, axis_a, axis_b, radius, angle),
+                &screen_x,
+                &screen_y)) {
+                have_prev = false;
+                continue;
+            }
+            if (have_prev) {
+                arc_distance = std::min(
+                    arc_distance,
+                    StandalonePreviewDistanceToSegment(
+                        static_cast<float>(mouse_x),
+                        static_cast<float>(mouse_y),
+                        prev_x,
+                        prev_y,
+                        screen_x,
+                        screen_y));
+            }
+            prev_x = screen_x;
+            prev_y = screen_y;
+            have_prev = true;
+        }
+        if (arc_distance < best_distance) {
+            best_distance = arc_distance;
+            best_handle = rotate_ids[index];
+        }
+    }
+    if (best_handle != kStandaloneHandleNone) {
+        return best_handle;
+    }
+
+    const int move_ids[3] = { kStandaloneHandleMoveX, kStandaloneHandleMoveY, kStandaloneHandleMoveZ };
+    const char move_axes[3] = { 'x', 'y', 'z' };
+    best_handle = kStandaloneHandleNone;
+    best_distance = kMovePickThreshold;
+    for (int index = 0; index < 3; ++index) {
+        PreviewVec3 line_start = {};
+        PreviewVec3 line_tip = {};
+        StandalonePreviewMoveHandleGeometry(state, *object, move_axes[index], &line_start, &line_tip);
+        float start_x = 0.0f;
+        float start_y = 0.0f;
+        float end_x = 0.0f;
+        float end_y = 0.0f;
+        if (!StandalonePreviewProjectPoint(state, line_start, &start_x, &start_y) ||
+            !StandalonePreviewProjectPoint(state, line_tip, &end_x, &end_y)) {
+            continue;
+        }
+        const float distance = StandalonePreviewDistanceToSegment(
+            static_cast<float>(mouse_x),
+            static_cast<float>(mouse_y),
+            start_x,
+            start_y,
+            end_x,
+            end_y);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_handle = move_ids[index];
+        }
+    }
+    return best_handle;
+}
+
+static void ClearStandalonePreviewDrag() {
+    g_standalonePreviewDrag = {};
+    g_standalonePreview.active_handle = kStandaloneHandleNone;
+    InvalidateStandalonePreview();
+}
+
+static void FinishStandalonePreviewDrag() {
+    if (!g_standalonePreviewDrag.active) {
+        return;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+        SplatObject* object = FindStandalonePreviewEditableObject();
+        if (object && g_standalonePreviewDrag.changed) {
+            const SplatObjectTransformState start_state = StandalonePreviewDragStartState();
+            SplatObjectTransformState current_state = {};
+            CopySplatObjectTransformState(*object, &current_state);
+            if (!SplatObjectTransformStateEquals(start_state, current_state)) {
+                PushSplatObjectTransformHistory(&object->undo_stack, start_state);
+                object->redo_stack.clear();
+            }
+        }
+    }
+    ClearStandalonePreviewDrag();
+}
+
+static bool StartStandalonePreviewDrag(int handle_id, int mouse_x, int mouse_y) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    SplatObject* object = FindStandalonePreviewEditableObject();
+    if (!object || handle_id == kStandaloneHandleNone) {
+        return false;
+    }
+    ActiveRenderState state = {};
+    BuildStandalonePreviewRenderState(&state);
+    if (!state.has_view || !state.has_projection || !state.has_camera) {
+        return false;
+    }
+    g_standalonePreviewDrag = {};
+    g_standalonePreviewDrag.active = true;
+    g_standalonePreviewDrag.handle_id = handle_id;
+    g_standalonePreview.active_handle = handle_id;
+    g_standalonePreview.hovered_handle = handle_id;
+    g_standalonePreviewDrag.start_mouse_x = mouse_x;
+    g_standalonePreviewDrag.start_mouse_y = mouse_y;
+    for (int axis = 0; axis < 3; ++axis) {
+        g_standalonePreviewDrag.start_center[axis] = static_cast<float>(object->center_xyz[axis]);
+        g_standalonePreviewDrag.start_half_extents[axis] = static_cast<float>(object->half_extents_xyz[axis]);
+    }
+    memcpy(g_standalonePreviewDrag.start_axes, object->axes_xyz, sizeof(g_standalonePreviewDrag.start_axes));
+
+    const PreviewVec3 center = PreviewObjectCenter(*object);
+    const PreviewVec3 camera_direction = StandalonePreviewCameraForward(state);
+    if (handle_id == kStandaloneHandleMoveX || handle_id == kStandaloneHandleMoveY || handle_id == kStandaloneHandleMoveZ) {
+        const char axis_name = handle_id == kStandaloneHandleMoveX ? 'x' : handle_id == kStandaloneHandleMoveY ? 'y' : 'z';
+        const PreviewVec3 axis = StandalonePreviewObjectAxis(*object, axis_name);
+        const PreviewVec3 plane_normal = StandalonePreviewPlaneNormalForAxis(axis, camera_direction);
+        PreviewVec3 hit = center;
+        StandalonePreviewIntersectMousePlane(mouse_x, mouse_y, center, plane_normal, &hit);
+        g_standalonePreviewDrag.kind = kStandaloneDragMoveAxis;
+        CopyPreviewVec3ToArray(center, g_standalonePreviewDrag.plane_origin);
+        CopyPreviewVec3ToArray(plane_normal, g_standalonePreviewDrag.plane_normal);
+        CopyPreviewVec3ToArray(axis, g_standalonePreviewDrag.axis);
+        g_standalonePreviewDrag.start_scalar = PreviewDot(PreviewSub(hit, center), axis);
+    }
+    else if (
+        handle_id == kStandaloneHandleResizeMinX || handle_id == kStandaloneHandleResizeMaxX ||
+        handle_id == kStandaloneHandleResizeMinY || handle_id == kStandaloneHandleResizeMaxY ||
+        handle_id == kStandaloneHandleResizeMinZ || handle_id == kStandaloneHandleResizeMaxZ) {
+        const char axis_name =
+            (handle_id == kStandaloneHandleResizeMinX || handle_id == kStandaloneHandleResizeMaxX) ? 'x' :
+            (handle_id == kStandaloneHandleResizeMinY || handle_id == kStandaloneHandleResizeMaxY) ? 'y' : 'z';
+        const bool positive_side =
+            handle_id == kStandaloneHandleResizeMaxX ||
+            handle_id == kStandaloneHandleResizeMaxY ||
+            handle_id == kStandaloneHandleResizeMaxZ;
+        const PreviewVec3 axis = StandalonePreviewObjectAxis(*object, axis_name);
+        const PreviewVec3 plane_origin = StandalonePreviewAxisFaceCenter(*object, axis_name, positive_side);
+        const PreviewVec3 plane_normal = StandalonePreviewPlaneNormalForAxis(axis, camera_direction);
+        PreviewVec3 hit = plane_origin;
+        StandalonePreviewIntersectMousePlane(mouse_x, mouse_y, plane_origin, plane_normal, &hit);
+        g_standalonePreviewDrag.kind = kStandaloneDragResizeAxis;
+        CopyPreviewVec3ToArray(plane_origin, g_standalonePreviewDrag.plane_origin);
+        CopyPreviewVec3ToArray(plane_normal, g_standalonePreviewDrag.plane_normal);
+        CopyPreviewVec3ToArray(axis, g_standalonePreviewDrag.axis);
+        g_standalonePreviewDrag.start_scalar = PreviewDot(PreviewSub(hit, plane_origin), axis);
+    }
+    else if (
+        handle_id == kStandaloneHandleMovePlaneXY ||
+        handle_id == kStandaloneHandleMovePlaneXZ ||
+        handle_id == kStandaloneHandleMovePlaneYZ) {
+        const char axis_a = handle_id == kStandaloneHandleMovePlaneYZ ? 'y' : 'x';
+        const char axis_b = handle_id == kStandaloneHandleMovePlaneXY ? 'y' : 'z';
+        const char normal_axis =
+            handle_id == kStandaloneHandleMovePlaneXY ? 'z' :
+            handle_id == kStandaloneHandleMovePlaneXZ ? 'y' : 'x';
+        const PreviewVec3 axis_a_vec = StandalonePreviewObjectAxis(*object, axis_a);
+        const PreviewVec3 axis_b_vec = StandalonePreviewObjectAxis(*object, axis_b);
+        const PreviewVec3 plane_normal = StandalonePreviewObjectAxis(*object, normal_axis);
+        PreviewVec3 hit = center;
+        StandalonePreviewIntersectMousePlane(mouse_x, mouse_y, center, plane_normal, &hit);
+        g_standalonePreviewDrag.kind = kStandaloneDragMovePlane;
+        CopyPreviewVec3ToArray(center, g_standalonePreviewDrag.plane_origin);
+        CopyPreviewVec3ToArray(plane_normal, g_standalonePreviewDrag.plane_normal);
+        CopyPreviewVec3ToArray(axis_a_vec, g_standalonePreviewDrag.axis_a);
+        CopyPreviewVec3ToArray(axis_b_vec, g_standalonePreviewDrag.axis_b);
+        CopyPreviewVec3ToArray(hit, g_standalonePreviewDrag.start_hit);
+    }
+    else if (handle_id == kStandaloneHandleMoveCenter) {
+        PreviewVec3 hit = center;
+        StandalonePreviewIntersectMousePlane(mouse_x, mouse_y, center, camera_direction, &hit);
+        g_standalonePreviewDrag.kind = kStandaloneDragMoveCenter;
+        CopyPreviewVec3ToArray(center, g_standalonePreviewDrag.plane_origin);
+        CopyPreviewVec3ToArray(camera_direction, g_standalonePreviewDrag.plane_normal);
+        CopyPreviewVec3ToArray(hit, g_standalonePreviewDrag.start_hit);
+    }
+    else if (handle_id == kStandaloneHandleRotateX || handle_id == kStandaloneHandleRotateY || handle_id == kStandaloneHandleRotateZ) {
+        const char axis_name = handle_id == kStandaloneHandleRotateX ? 'x' : handle_id == kStandaloneHandleRotateY ? 'y' : 'z';
+        const PreviewVec3 axis = StandalonePreviewObjectAxis(*object, axis_name);
+        PreviewVec3 arc_center = {};
+        PreviewVec3 axis_a = {};
+        PreviewVec3 axis_b = {};
+        float radius = 0.0f;
+        StandalonePreviewRotationGeometry(state, *object, axis_name, &arc_center, &axis_a, &axis_b, &radius);
+        PreviewVec3 hit = StandalonePreviewRotationArcPoint(arc_center, axis_a, axis_b, radius, 0.78539816339f);
+        StandalonePreviewIntersectMousePlane(mouse_x, mouse_y, arc_center, axis, &hit);
+        g_standalonePreviewDrag.kind = kStandaloneDragRotate;
+        CopyPreviewVec3ToArray(arc_center, g_standalonePreviewDrag.plane_origin);
+        CopyPreviewVec3ToArray(axis, g_standalonePreviewDrag.plane_normal);
+        CopyPreviewVec3ToArray(axis, g_standalonePreviewDrag.axis);
+        CopyPreviewVec3ToArray(axis_a, g_standalonePreviewDrag.axis_a);
+        CopyPreviewVec3ToArray(axis_b, g_standalonePreviewDrag.axis_b);
+        g_standalonePreviewDrag.start_angle = StandalonePreviewAngleOnPlane(hit, arc_center, axis_a, axis_b);
+    }
+    else if (handle_id == kStandaloneHandleScaleUniform) {
+        g_standalonePreviewDrag.kind = kStandaloneDragScaleUniform;
+        CopyPreviewVec3ToArray(center, g_standalonePreviewDrag.plane_origin);
+    }
+    else {
+        ClearStandalonePreviewDrag();
+        return false;
+    }
+    InvalidateStandalonePreview();
+    return true;
+}
+
+static bool ApplyStandalonePreviewDrag(int mouse_x, int mouse_y) {
+    if (!g_standalonePreviewDrag.active) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    SplatObject* object = FindStandalonePreviewEditableObject();
+    if (!object) {
+        ClearStandalonePreviewDrag();
+        return false;
+    }
+    ActiveRenderState state = {};
+    BuildStandalonePreviewRenderState(&state);
+    if (!state.has_view || !state.has_projection || !state.has_camera) {
+        return false;
+    }
+
+    if (g_standalonePreviewDrag.kind == kStandaloneDragMoveAxis) {
+        PreviewVec3 hit = {};
+        if (!StandalonePreviewIntersectMousePlane(
+            mouse_x,
+            mouse_y,
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin),
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_normal),
+            &hit)) {
+            return false;
+        }
+        const PreviewVec3 plane_origin = PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin);
+        const PreviewVec3 axis = PreviewNormalize(PreviewVec3FromArray(g_standalonePreviewDrag.axis), MakePreviewVec3(1.0f, 0.0f, 0.0f));
+        const float scalar = PreviewDot(PreviewSub(hit, plane_origin), axis);
+        const float delta = scalar - g_standalonePreviewDrag.start_scalar;
+        const PreviewVec3 start_center = MakePreviewVec3(
+            static_cast<float>(g_standalonePreviewDrag.start_center[0]),
+            static_cast<float>(g_standalonePreviewDrag.start_center[1]),
+            static_cast<float>(g_standalonePreviewDrag.start_center[2]));
+        const PreviewVec3 next_center = PreviewAdd(start_center, PreviewScale(axis, delta));
+        object->center_xyz[0] = next_center.x;
+        object->center_xyz[1] = next_center.y;
+        object->center_xyz[2] = next_center.z;
+    }
+    else if (g_standalonePreviewDrag.kind == kStandaloneDragResizeAxis) {
+        PreviewVec3 hit = {};
+        if (!StandalonePreviewIntersectMousePlane(
+            mouse_x,
+            mouse_y,
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin),
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_normal),
+            &hit)) {
+            return false;
+        }
+        const PreviewVec3 plane_origin = PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin);
+        const PreviewVec3 axis = PreviewNormalize(PreviewVec3FromArray(g_standalonePreviewDrag.axis), MakePreviewVec3(1.0f, 0.0f, 0.0f));
+        const float scalar = PreviewDot(PreviewSub(hit, plane_origin), axis);
+        const float delta = scalar - g_standalonePreviewDrag.start_scalar;
+        const int handle_id = g_standalonePreviewDrag.handle_id;
+        const bool max_side =
+            handle_id == kStandaloneHandleResizeMaxX ||
+            handle_id == kStandaloneHandleResizeMaxY ||
+            handle_id == kStandaloneHandleResizeMaxZ;
+        const float sign = max_side ? 1.0f : -1.0f;
+        const int axis_index =
+            (handle_id == kStandaloneHandleResizeMinX || handle_id == kStandaloneHandleResizeMaxX) ? 0 :
+            (handle_id == kStandaloneHandleResizeMinY || handle_id == kStandaloneHandleResizeMaxY) ? 1 : 2;
+        const float current_half = g_standalonePreviewDrag.start_half_extents[axis_index];
+        const float target_half = current_half + (delta * sign * 0.5f);
+        const float new_half = std::max(target_half, kStandaloneMinHalfExtent);
+        const float applied_delta = (new_half - current_half) * 2.0f * sign;
+        const PreviewVec3 start_center = MakePreviewVec3(
+            g_standalonePreviewDrag.start_center[0],
+            g_standalonePreviewDrag.start_center[1],
+            g_standalonePreviewDrag.start_center[2]);
+        const PreviewVec3 next_center = PreviewAdd(start_center, PreviewScale(axis, applied_delta * 0.5f));
+        object->center_xyz[0] = next_center.x;
+        object->center_xyz[1] = next_center.y;
+        object->center_xyz[2] = next_center.z;
+        object->half_extents_xyz[0] = g_standalonePreviewDrag.start_half_extents[0];
+        object->half_extents_xyz[1] = g_standalonePreviewDrag.start_half_extents[1];
+        object->half_extents_xyz[2] = g_standalonePreviewDrag.start_half_extents[2];
+        object->half_extents_xyz[axis_index] = new_half;
+    }
+    else if (g_standalonePreviewDrag.kind == kStandaloneDragMovePlane) {
+        PreviewVec3 hit = {};
+        if (!StandalonePreviewIntersectMousePlane(
+            mouse_x,
+            mouse_y,
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin),
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_normal),
+            &hit)) {
+            return false;
+        }
+        const PreviewVec3 start_center = MakePreviewVec3(
+            g_standalonePreviewDrag.start_center[0],
+            g_standalonePreviewDrag.start_center[1],
+            g_standalonePreviewDrag.start_center[2]);
+        const PreviewVec3 start_hit = PreviewVec3FromArray(g_standalonePreviewDrag.start_hit);
+        const PreviewVec3 delta_vector = PreviewSub(hit, start_hit);
+        const PreviewVec3 axis_a = PreviewNormalize(PreviewVec3FromArray(g_standalonePreviewDrag.axis_a), MakePreviewVec3(1.0f, 0.0f, 0.0f));
+        const PreviewVec3 axis_b = PreviewNormalize(PreviewVec3FromArray(g_standalonePreviewDrag.axis_b), MakePreviewVec3(0.0f, 1.0f, 0.0f));
+        const PreviewVec3 translation = PreviewAdd(
+            PreviewScale(axis_a, PreviewDot(delta_vector, axis_a)),
+            PreviewScale(axis_b, PreviewDot(delta_vector, axis_b)));
+        const PreviewVec3 next_center = PreviewAdd(start_center, translation);
+        object->center_xyz[0] = next_center.x;
+        object->center_xyz[1] = next_center.y;
+        object->center_xyz[2] = next_center.z;
+    }
+    else if (g_standalonePreviewDrag.kind == kStandaloneDragMoveCenter) {
+        PreviewVec3 hit = {};
+        if (!StandalonePreviewIntersectMousePlane(
+            mouse_x,
+            mouse_y,
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin),
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_normal),
+            &hit)) {
+            return false;
+        }
+        const PreviewVec3 start_center = MakePreviewVec3(
+            static_cast<float>(g_standalonePreviewDrag.start_center[0]),
+            static_cast<float>(g_standalonePreviewDrag.start_center[1]),
+            static_cast<float>(g_standalonePreviewDrag.start_center[2]));
+        const PreviewVec3 start_hit = PreviewVec3FromArray(g_standalonePreviewDrag.start_hit);
+        const PreviewVec3 next_center = PreviewAdd(start_center, PreviewSub(hit, start_hit));
+        object->center_xyz[0] = next_center.x;
+        object->center_xyz[1] = next_center.y;
+        object->center_xyz[2] = next_center.z;
+    }
+    else if (g_standalonePreviewDrag.kind == kStandaloneDragRotate) {
+        PreviewVec3 hit = {};
+        if (!StandalonePreviewIntersectMousePlane(
+            mouse_x,
+            mouse_y,
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin),
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_normal),
+            &hit)) {
+            return false;
+        }
+        const float angle = StandalonePreviewAngleOnPlane(
+            hit,
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin),
+            PreviewVec3FromArray(g_standalonePreviewDrag.axis_a),
+            PreviewVec3FromArray(g_standalonePreviewDrag.axis_b));
+        const float delta_angle = StandalonePreviewNormalizeAngle(angle - g_standalonePreviewDrag.start_angle);
+        const PreviewVec3 rotation_axis = PreviewNormalize(PreviewVec3FromArray(g_standalonePreviewDrag.axis), MakePreviewVec3(0.0f, 0.0f, 1.0f));
+        for (int axis = 0; axis < 3; ++axis) {
+            const int offset = axis * 3;
+            const PreviewVec3 start_axis = MakePreviewVec3(
+                static_cast<float>(g_standalonePreviewDrag.start_axes[offset + 0]),
+                static_cast<float>(g_standalonePreviewDrag.start_axes[offset + 1]),
+                static_cast<float>(g_standalonePreviewDrag.start_axes[offset + 2]));
+            const PreviewVec3 rotated = PreviewRotateAroundAxis(start_axis, rotation_axis, delta_angle);
+            object->axes_xyz[offset + 0] = rotated.x;
+            object->axes_xyz[offset + 1] = rotated.y;
+            object->axes_xyz[offset + 2] = rotated.z;
+        }
+    }
+    else if (g_standalonePreviewDrag.kind == kStandaloneDragScaleUniform) {
+        const float delta_pixels = StandalonePreviewSignedUniformScalePixels(mouse_x, mouse_y);
+        float delta_world = fabsf(delta_pixels) * StandalonePreviewWorldUnitsPerPixelAt(
+            state,
+            PreviewVec3FromArray(g_standalonePreviewDrag.plane_origin));
+        if (delta_pixels < 0.0f) {
+            delta_world *= -1.0f;
+        }
+        const float x_half = std::max(g_standalonePreviewDrag.start_half_extents[0], kStandaloneMinHalfExtent);
+        const float y_half = std::max(g_standalonePreviewDrag.start_half_extents[1], kStandaloneMinHalfExtent);
+        const float z_half = std::max(g_standalonePreviewDrag.start_half_extents[2], kStandaloneMinHalfExtent);
+        const float reference = std::max(std::max(x_half, y_half), z_half);
+        if (reference <= 1.0e-6f) {
+            return false;
+        }
+        const float raw_factor = (reference + delta_world) / reference;
+        const float min_factor = std::max(
+            std::max(kStandaloneMinHalfExtent / x_half, kStandaloneMinHalfExtent / y_half),
+            kStandaloneMinHalfExtent / z_half);
+        const float factor = std::max(raw_factor, min_factor);
+        object->half_extents_xyz[0] = std::max(x_half * factor, kStandaloneMinHalfExtent);
+        object->half_extents_xyz[1] = std::max(y_half * factor, kStandaloneMinHalfExtent);
+        object->half_extents_xyz[2] = std::max(z_half * factor, kStandaloneMinHalfExtent);
+    }
+    else {
+        return false;
+    }
+
+    g_standalonePreviewDrag.changed = true;
+    ApplyStandalonePreviewObjectChange(object);
+    return true;
+}
+
 static void DrawBackgroundDotGrid(int width, int height) {
     const int spacing = 31;
     const int cols = width / spacing + 1;
@@ -2191,6 +3860,7 @@ static void RenderStandalonePreviewFrame() {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     DrawBackgroundDotGrid(viewport_width, viewport_height);
     renderPointCloud();
+    DrawStandalonePreviewGizmo();
     SwapBuffers(g_standalonePreview.device_context);
     LARGE_INTEGER frame_end = {};
     if (g_standalonePreview.perf_frequency_ready && QueryPerformanceCounter(&frame_end) != 0) {
@@ -2238,24 +3908,50 @@ static LRESULT CALLBACK StandalonePreviewWndProc(HWND hwnd, UINT message, WPARAM
         SetFocus(hwnd);
         SetCapture(hwnd);
         g_standalonePreview.mouse_captured = true;
-        g_standalonePreview.active_button =
-            (message == WM_LBUTTONDOWN && (w_param & MK_SHIFT) == 0) ? 1 : 2;
         g_standalonePreview.last_mouse.x = GET_X_LPARAM(l_param);
         g_standalonePreview.last_mouse.y = GET_Y_LPARAM(l_param);
+        if (message == WM_LBUTTONDOWN && (w_param & MK_SHIFT) == 0) {
+            const int handle_id = PickStandalonePreviewHandle(g_standalonePreview.last_mouse.x, g_standalonePreview.last_mouse.y);
+            if (handle_id != kStandaloneHandleNone && StartStandalonePreviewDrag(handle_id, g_standalonePreview.last_mouse.x, g_standalonePreview.last_mouse.y)) {
+                g_standalonePreview.active_button = 0;
+                return 0;
+            }
+            g_standalonePreview.active_button = 1;
+        } else {
+            g_standalonePreview.active_button = 2;
+        }
         return 0;
     case WM_LBUTTONUP:
     case WM_MBUTTONUP:
     case WM_RBUTTONUP:
+        if (g_standalonePreviewDrag.active) {
+            FinishStandalonePreviewDrag();
+        }
         if (g_standalonePreview.mouse_captured) {
             ReleaseCapture();
             g_standalonePreview.mouse_captured = false;
             g_standalonePreview.active_button = 0;
         }
         return 0;
-    case WM_MOUSEMOVE:
+    case WM_CAPTURECHANGED:
+        if (g_standalonePreviewDrag.active) {
+            FinishStandalonePreviewDrag();
+        }
+        g_standalonePreview.mouse_captured = false;
+        g_standalonePreview.active_button = 0;
+        return 0;
+    case WM_MOUSEMOVE: {
+        const int mouse_x = GET_X_LPARAM(l_param);
+        const int mouse_y = GET_Y_LPARAM(l_param);
+        TRACKMOUSEEVENT tracking = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tracking);
+        if (g_standalonePreviewDrag.active) {
+            ApplyStandalonePreviewDrag(mouse_x, mouse_y);
+            g_standalonePreview.last_mouse.x = mouse_x;
+            g_standalonePreview.last_mouse.y = mouse_y;
+            return 0;
+        }
         if (g_standalonePreview.active_button != 0) {
-            const int mouse_x = GET_X_LPARAM(l_param);
-            const int mouse_y = GET_Y_LPARAM(l_param);
             const float delta_x = static_cast<float>(mouse_x - g_standalonePreview.last_mouse.x);
             const float delta_y = static_cast<float>(mouse_y - g_standalonePreview.last_mouse.y);
             g_standalonePreview.last_mouse.x = mouse_x;
@@ -2271,6 +3967,19 @@ static LRESULT CALLBACK StandalonePreviewWndProc(HWND hwnd, UINT message, WPARAM
                 PanStandalonePreview(delta_x, delta_y);
             }
             InvalidateStandalonePreview();
+            return 0;
+        }
+        const int next_hovered = PickStandalonePreviewHandle(mouse_x, mouse_y);
+        if (next_hovered != g_standalonePreview.hovered_handle) {
+            g_standalonePreview.hovered_handle = next_hovered;
+            InvalidateStandalonePreview();
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (!g_standalonePreviewDrag.active && g_standalonePreview.hovered_handle != kStandaloneHandleNone) {
+            g_standalonePreview.hovered_handle = kStandaloneHandleNone;
+            InvalidateStandalonePreview();
         }
         return 0;
     case WM_MOUSEWHEEL: {
@@ -2284,6 +3993,16 @@ static LRESULT CALLBACK StandalonePreviewWndProc(HWND hwnd, UINT message, WPARAM
         return 0;
     }
     case WM_KEYDOWN:
+        if (w_param == VK_CONTROL && !g_standalonePreviewDrag.active) {
+            const int next_hovered = PickStandalonePreviewHandle(
+                g_standalonePreview.last_mouse.x,
+                g_standalonePreview.last_mouse.y);
+            if (next_hovered != g_standalonePreview.hovered_handle) {
+                g_standalonePreview.hovered_handle = next_hovered;
+            }
+            InvalidateStandalonePreview();
+            return 0;
+        }
         if (w_param == 'F') {
             FitStandalonePreviewCameraInternal(false);
             return 0;
@@ -2293,12 +4012,28 @@ static LRESULT CALLBACK StandalonePreviewWndProc(HWND hwnd, UINT message, WPARAM
             return 0;
         }
         break;
+    case WM_KEYUP:
+        if (w_param == VK_CONTROL && !g_standalonePreviewDrag.active) {
+            const int next_hovered = PickStandalonePreviewHandle(
+                g_standalonePreview.last_mouse.x,
+                g_standalonePreview.last_mouse.y);
+            if (next_hovered != g_standalonePreview.hovered_handle) {
+                g_standalonePreview.hovered_handle = next_hovered;
+            }
+            InvalidateStandalonePreview();
+            return 0;
+        }
+        break;
     case WM_DESTROY:
         ShutdownStandalonePreviewContext();
         g_standalonePreview.preview_hwnd = nullptr;
         g_standalonePreview.parent_hwnd = nullptr;
         g_standalonePreview.width = 1;
         g_standalonePreview.height = 1;
+        g_standalonePreview.gizmo_mode = kStandaloneGizmoNone;
+        g_standalonePreview.hovered_handle = kStandaloneHandleNone;
+        g_standalonePreview.active_handle = kStandaloneHandleNone;
+        g_standalonePreviewDrag = {};
         g_standalonePreviewEnabled = false;
         return 0;
     default:
@@ -2485,6 +4220,10 @@ static const GLuint kGPUSortBinCount = 65536u;
 static const GLuint kGPUSortBlockSize = 256u;
 static const GLuint kGPUSortBlockCount = kGPUSortBinCount / kGPUSortBlockSize;
 static const int kGPUApproximateDepthBins = 32;
+
+static bool StandalonePreviewCanUseGPUTransformPath() {
+    return g_gpu.supported;
+}
 
 struct GPUApproximateSortSettings {
     bool enabled = false;
@@ -4322,6 +6061,7 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     object.local_splats.reserve(count);
     object.visible = true;
     object.highlight_mode = HIGHLIGHT_NONE;
+    ResetSplatObjectTransformHistory(&object);
     object.axes_xyz[0] = 1.0; object.axes_xyz[1] = 0.0; object.axes_xyz[2] = 0.0;
     object.axes_xyz[3] = 0.0; object.axes_xyz[4] = 1.0; object.axes_xyz[5] = 0.0;
     object.axes_xyz[6] = 0.0; object.axes_xyz[7] = 0.0; object.axes_xyz[8] = 1.0;
@@ -4422,6 +6162,9 @@ static int BuildSplatObjectFromPLYData(const char* object_id, PLYGaussianPoint* 
     object.half_extents_xyz[0] = object.base_half_extents_xyz[0];
     object.half_extents_xyz[1] = object.base_half_extents_xyz[1];
     object.half_extents_xyz[2] = object.base_half_extents_xyz[2];
+    memcpy(object.default_center_xyz, object.center_xyz, sizeof(object.default_center_xyz));
+    memcpy(object.default_half_extents_xyz, object.half_extents_xyz, sizeof(object.default_half_extents_xyz));
+    memcpy(object.default_axes_xyz, object.axes_xyz, sizeof(object.default_axes_xyz));
 
     for (GaussSplat& splat : object.local_splats) {
         splat.position[0] -= static_cast<float>(object.center_xyz[0]);
@@ -4721,6 +6464,9 @@ extern "C" EXPORT int SetSplatObjectTransform(const char* object_id, const doubl
         memcpy(object->axes_xyz, axes_xyz, sizeof(object->axes_xyz));
     }
     object->visible = visible != 0;
+    ResetSplatObjectTransformHistory(object);
+    NormalizeSplatObjectAxes(object);
+    UpdateStandalonePreviewBounds();
     if (g_gpu.supported) {
         g_gpuObjectDataDirty = true;
         g_splatVBO.needsUpdate = false;
@@ -4870,6 +6616,166 @@ extern "C" EXPORT double GetStandalonePreviewFPS() {
         return 0.0;
     }
     return g_standalonePreview.smoothed_fps;
+}
+
+extern "C" EXPORT int GetStandalonePreviewCameraState(
+    float* out_view_matrix16,
+    float* out_projection_matrix16,
+    float* out_camera_position3,
+    float* out_camera_target3,
+    float* out_camera_up3,
+    int* out_viewport_width,
+    int* out_viewport_height) {
+    if (g_standalonePreview.preview_hwnd == nullptr) {
+        return 0;
+    }
+    if (!out_view_matrix16 || !out_projection_matrix16 ||
+        !out_camera_position3 || !out_camera_target3 || !out_camera_up3 ||
+        !out_viewport_width || !out_viewport_height) {
+        return 0;
+    }
+
+    ActiveRenderState state = {};
+    BuildStandalonePreviewRenderState(&state);
+    if (!state.has_view || !state.has_projection || !state.has_camera) {
+        return 0;
+    }
+
+    memcpy(out_view_matrix16, state.view_matrix, sizeof(state.view_matrix));
+    memcpy(out_projection_matrix16, state.projection_matrix, sizeof(state.projection_matrix));
+    memcpy(out_camera_position3, state.camera_position, sizeof(state.camera_position));
+    memcpy(out_camera_target3, state.camera_target, sizeof(state.camera_target));
+    memcpy(out_camera_up3, state.camera_up, sizeof(state.camera_up));
+    *out_viewport_width = std::max(g_standalonePreview.width, 1);
+    *out_viewport_height = std::max(g_standalonePreview.height, 1);
+    return 1;
+}
+
+extern "C" EXPORT void OrbitStandalonePreviewCamera(float delta_x_pixels, float delta_y_pixels) {
+    if (g_standalonePreview.preview_hwnd == nullptr) {
+        return;
+    }
+    g_standalonePreview.orbit_yaw -= static_cast<float>(delta_x_pixels) * 0.0125f;
+    g_standalonePreview.orbit_pitch = ClampFloat(
+        g_standalonePreview.orbit_pitch - (static_cast<float>(delta_y_pixels) * 0.0125f),
+        -1.45f,
+        1.45f);
+    InvalidateStandalonePreview();
+}
+
+extern "C" EXPORT void PanStandalonePreviewCamera(float delta_x_pixels, float delta_y_pixels) {
+    if (g_standalonePreview.preview_hwnd == nullptr) {
+        return;
+    }
+    PanStandalonePreview(static_cast<float>(delta_x_pixels), static_cast<float>(delta_y_pixels));
+    InvalidateStandalonePreview();
+}
+
+extern "C" EXPORT void ZoomStandalonePreviewCamera(float steps) {
+    if (g_standalonePreview.preview_hwnd == nullptr) {
+        return;
+    }
+    const float zoom_factor = powf(0.88f, static_cast<float>(steps));
+    g_standalonePreview.distance = ClampFloat(
+        g_standalonePreview.distance * zoom_factor,
+        StandalonePreviewMinDistance(),
+        std::max(g_standalonePreview.scene_radius * 40.0f, 4000.0f));
+    InvalidateStandalonePreview();
+}
+
+extern "C" EXPORT void SetStandalonePreviewGizmoMode(int tool_mode) {
+    const int next_mode =
+        (tool_mode == kStandaloneGizmoMove || tool_mode == kStandaloneGizmoTransform)
+        ? tool_mode
+        : kStandaloneGizmoNone;
+    if (g_standalonePreview.gizmo_mode == next_mode) {
+        return;
+    }
+    g_standalonePreview.gizmo_mode = next_mode;
+    g_standalonePreview.hovered_handle = kStandaloneHandleNone;
+    ClearStandalonePreviewDrag();
+    InvalidateStandalonePreview();
+}
+
+extern "C" EXPORT int ResetStandalonePreviewObjectTransform(const char* object_id) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    if (g_standalonePreviewDrag.active) {
+        return 0;
+    }
+    SplatObject* object = object_id ? FindSplatObject(object_id) : FindStandalonePreviewEditableObject();
+    if (!object) {
+        object = FindStandalonePreviewEditableObject();
+    }
+    if (!object) {
+        return 0;
+    }
+    const SplatObjectTransformState target_state = StandalonePreviewDefaultTransformState(*object);
+    return ApplyStandalonePreviewTransformCommand(object, target_state) ? 1 : 0;
+}
+
+extern "C" EXPORT int UndoStandalonePreviewObjectTransform(const char* object_id) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    if (g_standalonePreviewDrag.active) {
+        return 0;
+    }
+    SplatObject* object = object_id ? FindSplatObject(object_id) : FindStandalonePreviewEditableObject();
+    if (!object) {
+        object = FindStandalonePreviewEditableObject();
+    }
+    if (!object || object->undo_stack.empty()) {
+        return 0;
+    }
+    SplatObjectTransformState current_state = {};
+    CopySplatObjectTransformState(*object, &current_state);
+    const SplatObjectTransformState previous_state = object->undo_stack.back();
+    object->undo_stack.pop_back();
+    PushSplatObjectTransformHistory(&object->redo_stack, current_state);
+    ApplySplatObjectTransformState(object, previous_state);
+    ApplyStandalonePreviewObjectChange(object);
+    return 1;
+}
+
+extern "C" EXPORT int RedoStandalonePreviewObjectTransform(const char* object_id) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    if (g_standalonePreviewDrag.active) {
+        return 0;
+    }
+    SplatObject* object = object_id ? FindSplatObject(object_id) : FindStandalonePreviewEditableObject();
+    if (!object) {
+        object = FindStandalonePreviewEditableObject();
+    }
+    if (!object || object->redo_stack.empty()) {
+        return 0;
+    }
+    SplatObjectTransformState current_state = {};
+    CopySplatObjectTransformState(*object, &current_state);
+    const SplatObjectTransformState next_state = object->redo_stack.back();
+    object->redo_stack.pop_back();
+    PushSplatObjectTransformHistory(&object->undo_stack, current_state);
+    ApplySplatObjectTransformState(object, next_state);
+    ApplyStandalonePreviewObjectChange(object);
+    return 1;
+}
+
+extern "C" EXPORT int IsStandalonePreviewDragging() {
+    return g_standalonePreviewDrag.active ? 1 : 0;
+}
+
+extern "C" EXPORT int GetStandalonePreviewObjectTransform(
+    const char* object_id,
+    double* out_center_xyz,
+    double* out_half_extents_xyz,
+    double* out_axes_xyz) {
+    std::lock_guard<std::recursive_mutex> lock(g_splatStateMutex);
+    SplatObject* object = object_id ? FindSplatObject(object_id) : FindStandalonePreviewEditableObject();
+    if (!object) {
+        object = FindStandalonePreviewEditableObject();
+    }
+    if (!object) {
+        return 0;
+    }
+    CopyStandalonePreviewObjectTransform(*object, out_center_xyz, out_half_extents_xyz, out_axes_xyz);
+    return 1;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {

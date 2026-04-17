@@ -95,6 +95,7 @@ class QmlCompanionWindow(QtWidgets.QMainWindow):
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.timeout.connect(self.controller.refresh)
         self._refresh_timer.start(1200)
+        self._install_shortcuts()
         self._sync_widgets()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
@@ -109,6 +110,19 @@ class QmlCompanionWindow(QtWidgets.QMainWindow):
         self.dialog_overlay.setVisible(dialog_active)
         if dialog_active:
             self.dialog_overlay.raise_()
+
+    def _install_shortcuts(self) -> None:
+        bindings = [
+            ("Ctrl+Z", self.controller.undoPreviewTransform),
+            ("Ctrl+Y", self.controller.redoPreviewTransform),
+            ("Ctrl+Shift+Z", self.controller.redoPreviewTransform),
+        ]
+        self._shortcuts: list[QtGui.QShortcut] = []
+        for key, handler in bindings:
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            shortcut.setContext(QtCore.Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(handler)
+            self._shortcuts.append(shortcut)
 
 
 def launch(plugin_root: str | None = None) -> int:

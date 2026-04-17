@@ -6,6 +6,7 @@ from typing import Any
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .qt_native_preview import NativePreviewHost
+from .splat_transform import snapshot_from_payload, snapshot_to_payload, snapshots_equal
 
 
 class ViewportWidget(QtWidgets.QWidget):
@@ -13,6 +14,9 @@ class ViewportWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self._controller = controller
         self._last_project_id: str | None = None
+        self._current_project_id: str | None = None
+        self._current_scene_path: str | None = None
+        self._last_saved_snapshot: dict[str, object] | None = None
         self.setMouseTracking(True)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet("background:#050505;")
@@ -39,6 +43,10 @@ class ViewportWidget(QtWidgets.QWidget):
         self._fps_timer.setInterval(350)
         self._fps_timer.timeout.connect(self._refresh_fps)
         self._fps_timer.start()
+        self._transform_timer = QtCore.QTimer(self)
+        self._transform_timer.setInterval(150)
+        self._transform_timer.timeout.connect(self._sync_native_transform)
+        self._transform_timer.start()
 
         self._fit_button = QtWidgets.QPushButton(self)
         self._fit_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
@@ -60,17 +68,32 @@ class ViewportWidget(QtWidgets.QWidget):
         self._footer.setStyleSheet("color:#A1A1AA; background:transparent;")
         self._footer.setFont(self._mono_font(12, 400))
 
+        if hasattr(self._controller, "activeToolChanged"):
+            self._controller.activeToolChanged.connect(
+                lambda: self._host.set_active_tool(str(getattr(self._controller, "activeTool", "projects")))
+            )
+        self._host.set_active_tool(str(getattr(self._controller, "activeTool", "projects")))
+
     def apply_detail(self, detail: dict[str, Any] | None) -> None:
         preview = (detail or {}).get("preview") or {}
         footer = preview.get("footer") or ""
         self._footer.setText(footer)
         self._splat_value.setText(f"{int(preview.get('pointCount') or 0):,}")
+        self._host.set_active_tool(str(getattr(self._controller, "activeTool", "projects")))
         if preview.get("hasScene") and preview.get("path"):
             project_id = str(preview.get("projectId") or "")
             force_reload = bool(project_id and project_id != self._last_project_id)
+            transform_payload = preview.get("transform")
+            self._current_project_id = project_id or None
+            self._current_scene_path = str(preview.get("path") or "") or None
+            self._last_saved_snapshot = snapshot_from_payload(transform_payload)
             self._host.show()
             self._placeholder.hide()
-            self._host.load_scene(preview["path"], force_reload=force_reload)
+            self._host.load_scene(
+                preview["path"],
+                force_reload=force_reload,
+                transform_payload=transform_payload,
+            )
             if self._host.last_load_succeeded:
                 self._last_project_id = project_id or self._last_project_id
             else:
@@ -82,6 +105,9 @@ class ViewportWidget(QtWidgets.QWidget):
             self._placeholder.setText(preview.get("emptyTitle") or "Scene preview will appear here")
             self._placeholder.show()
             self._last_project_id = None
+            self._current_project_id = None
+            self._current_scene_path = None
+            self._last_saved_snapshot = None
         hud = (detail or {}).get("hud") or {}
         self._refresh_fps(fallback_text=hud.get("performance"))
         self._reposition()
@@ -131,6 +157,23 @@ class ViewportWidget(QtWidgets.QWidget):
         self._fit_button.raise_()
         self._footer.raise_()
         self._hint.raise_()
+
+    def _sync_native_transform(self) -> None:
+        if not self._current_project_id or not self._current_scene_path:
+            return
+        if self._host.is_transform_dragging():
+            return
+        snapshot = self._host.sync_transform_from_native()
+        self._persist_snapshot(snapshot)
+
+    def reset_transform(self) -> bool:
+        return self._persist_snapshot(self._host.reset_transform())
+
+    def undo_transform(self) -> bool:
+        return self._persist_snapshot(self._host.undo_transform())
+
+    def redo_transform(self) -> bool:
+        return self._persist_snapshot(self._host.redo_transform())
 
     def _make_panel(self) -> QtWidgets.QFrame:
         panel = QtWidgets.QFrame(self)
@@ -191,3 +234,16 @@ class ViewportWidget(QtWidgets.QWidget):
 
     def _asset(self, name: str) -> str:
         return str(Path(__file__).resolve().parent / "assets" / "icons_png" / name)
+
+    def _persist_snapshot(self, snapshot: dict[str, object] | None) -> bool:
+        if snapshot is None or not self._current_project_id or not self._current_scene_path:
+            return False
+        if self._last_saved_snapshot and snapshots_equal(self._last_saved_snapshot, snapshot):
+            return True
+        self._controller.save_preview_transform(
+            self._current_project_id,
+            self._current_scene_path,
+            snapshot_to_payload(snapshot),
+        )
+        self._last_saved_snapshot = snapshot
+        return True

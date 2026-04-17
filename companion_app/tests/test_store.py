@@ -80,6 +80,45 @@ class StoreStaleJobTest(unittest.TestCase):
         self.assertEqual(1600, settings["sfm_max_image_size"])
         self.assertEqual(6, settings["sfm_num_threads"])
         self.assertEqual("auto", settings["strategy_name"])
+        self.assertEqual("igs_plus", settings["budget_schedule"])
+        self.assertEqual(0.30, settings["init_opacity"])
+        self.assertEqual(3000, settings["opacity_reset_interval"])
+        self.assertEqual(5000, settings["depth_reinit_every"])
+        self.assertTrue(bool(settings["enable_depth_bootstrap"]))
+        self.assertEqual(16000, settings["depth_bootstrap_points"])
+        self.assertEqual(16, settings["depth_bootstrap_max_views"])
+        self.assertEqual(1024, settings["depth_bootstrap_max_image_size"])
+        self.assertEqual(2.0e-4, settings["grow_grad2d"])
+        self.assertEqual(0.005, settings["prune_opa"])
+        self.assertEqual(0, settings["edge_warmup_events"])
+        self.assertFalse(bool(settings["enable_appearance_compensation"]))
+        self.assertEqual("off", settings["appearance_mode"])
+
+    def test_sanitize_training_settings_migrates_legacy_auto_profile(self) -> None:
+        settings = store.sanitize_training_settings(
+            {
+                "strategy_name": "auto",
+                "budget_schedule": "staged",
+                "init_opacity": 0.10,
+                "opacity_reset_interval": 1500,
+                "depth_reinit_every": 200,
+                "grow_grad2d": 0.0,
+                "prune_opa": 0.0,
+                "edge_warmup_events": 3,
+                "edge_candidate_factor": None,
+                "edge_score_weight": None,
+            }
+        )
+
+        self.assertEqual("igs_plus", settings["budget_schedule"])
+        self.assertEqual(0.30, settings["init_opacity"])
+        self.assertEqual(3000, settings["opacity_reset_interval"])
+        self.assertEqual(5000, settings["depth_reinit_every"])
+        self.assertEqual(2.0e-4, settings["grow_grad2d"])
+        self.assertEqual(0.005, settings["prune_opa"])
+        self.assertEqual(0, settings["edge_warmup_events"])
+        self.assertEqual(4, settings["edge_candidate_factor"])
+        self.assertEqual(0.25, settings["edge_score_weight"])
 
     def test_worker_thread_limit_matches_restored_sfm_defaults(self) -> None:
         from companion_app.worker_entry import _thread_limit_from_job

@@ -288,14 +288,14 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "rasterize_mode": "auto",
         "sfm_match_mode": "auto",
         "max_gaussians": 0,
-        "budget_schedule": "staged",
+        "budget_schedule": "igs_plus",
         "train_steps": 3000,
         "train_resolution": 640,
         "validation_fraction": 0.18,
         "min_validation_views": 2,
         "sh_degree": 3,
         "sh_increment_interval": 0,
-        "init_opacity": 0.10,
+        "init_opacity": 0.30,
         "lambda_dssim": 0.20,
         "means_lr": 1.6e-4,
         "scales_lr": 5.0e-3,
@@ -309,24 +309,59 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
         "densify_start_iter": 0,
         "densify_stop_iter": 0,
         "densify_interval": 0,
-        "opacity_reset_interval": 1500,
+        "opacity_reset_interval": 3000,
         "alpha_loss_weight": 0.05,
         "random_background": True,
+        "enable_appearance_compensation": False,
+        "appearance_mode": "off",
+        "appearance_grid_size": 16,
+        "appearance_grid_low_res": 8,
+        "appearance_grid_high_res": 16,
+        "appearance_luma_bins": 8,
+        "appearance_grid_lr": 2.0e-3,
+        "appearance_regularization": 7.5e-4,
+        "appearance_smoothness": 5.0,
+        "appearance_tv_weight": 5.0,
+        "appearance_grid_warmup_factor": 0.01,
+        "appearance_grid_final_lr_factor": 0.01,
+        "appearance_bake_steps": 240,
+        "appearance_ssim_gate_scale": 2.5,
         "enable_exposure_compensation": True,
         "exposure_gain_lr": 2.0e-3,
         "exposure_bias_lr": 1.0e-3,
         "exposure_regularization": 1.0e-3,
+        "enable_depth_reinit": True,
+        "depth_reinit_every": 5000,
+        "depth_reinit_views": 2,
+        "depth_reinit_points": 2048,
+        "enable_depth_bootstrap": True,
+        "depth_bootstrap_points": 16000,
+        "depth_bootstrap_max_views": 16,
+        "depth_bootstrap_max_image_size": 1024,
+        "depth_bootstrap_min_consistent": 3,
+        "depth_bootstrap_voxel_factor": 0.75,
+        "enable_unscented_transform": True,
         "mask_min_views": 2,
         "alpha_mask_threshold": 0.2,
         "visual_hull_seed_points": 1400,
         "visual_hull_init_grid": 40,
         "visual_hull_support_ratio": 0.8,
-        "grow_grad2d": 0.0,
-        "prune_opa": 0.0,
+        "grow_grad2d": 2.0e-4,
+        "prune_opa": 0.005,
         "min_opacity": 0.0,
         "mcmc_noise_lr": 0.0,
+        "edge_threshold": 0.12,
+        "edge_warmup_events": 0,
+        "las_primary_shrink": 1.6,
+        "las_secondary_shrink": 1.2,
+        "las_opacity_factor": 0.85,
+        "las_offset_scale": 0.55,
+        "edge_candidate_factor": 4,
+        "edge_score_weight": 0.25,
         "absgrad": None,
         "revised_opacity": True,
+        "scales_lr_warmup_multiplier": 1.35,
+        "scales_lr_final_multiplier": 0.55,
         "grid_size": 56,
         "max_image_edge": 960,
         "mask_threshold": 46,
@@ -337,14 +372,42 @@ def default_job_settings(force_restart: bool = False) -> dict[str, Any]:
     }
 
 
+def _normalize_auto_research_defaults(settings: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(settings)
+    strategy_name = str(normalized.get("strategy_name") or defaults["strategy_name"]).strip().lower()
+    if strategy_name != "auto":
+        return normalized
+
+    if normalized.get("budget_schedule") in {None, "", "staged"}:
+        normalized["budget_schedule"] = defaults["budget_schedule"]
+    if normalized.get("init_opacity") in {None, "", 0, 0.1, 0.10}:
+        normalized["init_opacity"] = defaults["init_opacity"]
+    if normalized.get("opacity_reset_interval") in {None, "", 0, 1500}:
+        normalized["opacity_reset_interval"] = defaults["opacity_reset_interval"]
+    if normalized.get("depth_reinit_every") in {None, "", 0, 200}:
+        normalized["depth_reinit_every"] = defaults["depth_reinit_every"]
+    if normalized.get("grow_grad2d") in {None, "", 0, 0.0}:
+        normalized["grow_grad2d"] = defaults["grow_grad2d"]
+    if normalized.get("prune_opa") in {None, "", 0, 0.0}:
+        normalized["prune_opa"] = defaults["prune_opa"]
+    if normalized.get("edge_warmup_events") in {None, "", 3}:
+        normalized["edge_warmup_events"] = defaults["edge_warmup_events"]
+    if normalized.get("edge_candidate_factor") in {None, "", 0}:
+        normalized["edge_candidate_factor"] = defaults["edge_candidate_factor"]
+    if normalized.get("edge_score_weight") in {None, ""}:
+        normalized["edge_score_weight"] = defaults["edge_score_weight"]
+    return normalized
+
+
 def sanitize_training_settings(settings: dict[str, Any] | None) -> dict[str, Any]:
     defaults = default_job_settings(force_restart=False)
     sanitized: dict[str, Any] = {}
-    source = settings or {}
+    source = _normalize_auto_research_defaults(settings or {}, defaults)
     for key, default_value in defaults.items():
         if key in {"force_restart", "preserve_sfm_cache"}:
             continue
-        sanitized[key] = source.get(key, default_value)
+        value = source.get(key, default_value)
+        sanitized[key] = default_value if value in {None, ""} else value
     return sanitized
 
 
@@ -368,6 +431,7 @@ def create_job(project_id: str, settings: dict[str, Any]) -> dict[str, Any]:
     job_id = uuid.uuid4().hex
     log_path = str(Path(project["workspace_dir"]) / "logs" / f"{job_id}.log")
     now = utc_now()
+    normalized_settings = sanitize_training_settings(settings)
     payload = {
         "id": job_id,
         "project_id": project_id,
@@ -376,7 +440,7 @@ def create_job(project_id: str, settings: dict[str, Any]) -> dict[str, Any]:
         "progress": 0.0,
         "message": "Waiting to start.",
         "log_path": log_path,
-        "settings": settings,
+        "settings": normalized_settings,
         "error_text": None,
         "pid": None,
         "stop_requested": 0,
@@ -392,7 +456,7 @@ def create_job(project_id: str, settings: dict[str, Any]) -> dict[str, Any]:
     update_project(
         project_id,
         status="queued",
-        training_settings=sanitize_training_settings(settings),
+        training_settings=normalized_settings,
     )
     return payload
 

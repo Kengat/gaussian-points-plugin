@@ -413,7 +413,7 @@ Rectangle {
                 Item {
                     visible: activeToolName === "move"
                     width: parent.width
-                    height: visible ? 220 : 0
+                    height: visible ? 276 : 0
 
                     Column {
                         x: 20
@@ -474,14 +474,75 @@ Rectangle {
                             }
                         }
 
-                        Rectangle {
+                        Row {
                             width: parent.width
-                            height: 42
-                            radius: 10
-                            color: "#1A16C784"
-                            border.color: "#4D16C784"
-                            border.width: 1
-                            Text { anchors.centerIn: parent; text: "Apply Transform"; color: "#16C784"; font.pixelSize: 12; font.weight: 700; font.family: "Outfit" }
+                            spacing: 10
+
+                            Rectangle {
+                                width: (parent.width - parent.spacing) * 0.54
+                                height: 42
+                                radius: 10
+                                color: "#1A16C784"
+                                border.color: applyMoveArea.containsMouse ? "#6616C784" : "#4D16C784"
+                                border.width: 1
+
+                                Behavior on border.color { ColorAnimation { duration: 140 } }
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "Apply Transform"
+                                    color: "#16C784"
+                                    font.pixelSize: 12
+                                    font.weight: 700
+                                    font.family: "Outfit"
+                                }
+
+                                MouseArea {
+                                    id: applyMoveArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                }
+                            }
+
+                            Rectangle {
+                                width: parent.width - ((parent.width - parent.spacing) * 0.54) - parent.spacing
+                                height: 42
+                                radius: 10
+                                color: resetMoveArea.pressed ? "#24242C" : resetMoveArea.containsMouse ? "#191920" : "#101014"
+                                border.color: resetMoveArea.containsMouse ? "#66FF5400" : "#26FFFFFF"
+                                border.width: 1
+
+                                Behavior on color { ColorAnimation { duration: 140 } }
+                                Behavior on border.color { ColorAnimation { duration: 140 } }
+
+                                Row {
+                                    anchors.centerIn: parent
+                                    spacing: 8
+
+                                    IconImage {
+                                        iconName: "rotate-ccw"
+                                        tone: resetMoveArea.containsMouse ? "accent" : "muted"
+                                        iconSize: 14
+                                    }
+
+                                    Text {
+                                        text: "Reset"
+                                        color: resetMoveArea.containsMouse ? "#FFFFFF" : "#D4D4D8"
+                                        font.pixelSize: 12
+                                        font.weight: 700
+                                        font.family: "Outfit"
+                                    }
+                                }
+
+                                MouseArea {
+                                    id: resetMoveArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: controller.resetPreviewTransform()
+                                }
+                            }
                         }
                     }
                 }
@@ -489,7 +550,7 @@ Rectangle {
                 Item {
                     visible: activeToolName === "transform"
                     width: parent.width
-                    height: visible ? 180 : 0
+                    height: visible ? 124 : 0
 
                     Column {
                         x: 20
@@ -533,15 +594,6 @@ Rectangle {
                             Text { anchors.horizontalCenter: parent.horizontalCenter; anchors.verticalCenter: parent.verticalCenter; text: "1.00"; color: "#FFFFFF"; font.pixelSize: 12; font.weight: 500; font.family: "JetBrains Mono" }
                         }
 
-                        Rectangle {
-                            width: parent.width
-                            height: 42
-                            radius: 10
-                            color: "#27272A"
-                            border.color: "#19FFFFFF"
-                            border.width: 1
-                            Text { anchors.centerIn: parent; text: "Reset Transformations"; color: "#FFFFFF"; font.pixelSize: 12; font.weight: 600; font.family: "Outfit" }
-                        }
                     }
                 }
 
