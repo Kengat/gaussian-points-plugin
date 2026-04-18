@@ -784,6 +784,7 @@ def build_colored_splats(
 
 def export_result(project: dict, job: dict, splats: list[dict]) -> dict:
     update_progress(job["id"], "Exporting", 0.85, "Writing the Gaussian project and SketchUp handoff package.")
+    created_at = store.utc_now()
     temp_ply_path = write_gaussian_ply(splats, result_temp_ply_path(project["id"]))
     xs = [point["position"][0] for point in splats]
     ys = [point["position"][1] for point in splats]
@@ -800,10 +801,10 @@ def export_result(project: dict, job: dict, splats: list[dict]) -> dict:
     )
 
     export_stem = safe_export_stem(project["name"])
-    export_dir = paths.exports_root()
+    export_dir = paths.export_session_dir(project["name"], created_at)
     export_dir.mkdir(parents=True, exist_ok=True)
-    exported_ply = export_dir / f"{export_stem}.ply"
-    exported_gasp = export_dir / f"{export_stem}.gasp"
+    exported_ply = export_dir / "scene.ply"
+    exported_gasp = export_dir / "scene.gasp"
     shutil.copy2(workspace_gasp, exported_gasp)
     export_ply_from_gaussian_gasp(workspace_gasp, exported_ply)
     temp_ply_path.unlink(missing_ok=True)
@@ -813,7 +814,7 @@ def export_result(project: dict, job: dict, splats: list[dict]) -> dict:
         "project_id": project["id"],
         "project_name": project["name"],
         "backend": project["backend"],
-        "created_at": store.utc_now(),
+        "created_at": created_at,
         "point_count": len(splats),
         "scene_ply": str(exported_ply),
         "scene_gasp": str(exported_gasp),
@@ -826,14 +827,14 @@ def export_result(project: dict, job: dict, splats: list[dict]) -> dict:
             "source_gasp": str(exported_gasp),
         },
     }
-    manifest_path = export_dir / f"{export_stem}_manifest.json"
+    manifest_path = export_dir / "scene_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    package_path = export_dir / f"{export_stem}.gspkg"
+    package_path = export_dir / "scene_package.gspkg"
     with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(exported_ply, arcname=f"{export_stem}.ply")
-        archive.write(exported_gasp, arcname=f"{export_stem}.gasp")
-        archive.write(manifest_path, arcname=f"{export_stem}_manifest.json")
+        archive.write(exported_ply, arcname="scene.ply")
+        archive.write(exported_gasp, arcname="scene.gasp")
+        archive.write(manifest_path, arcname="scene_manifest.json")
 
     paths.write_latest_export(
         {

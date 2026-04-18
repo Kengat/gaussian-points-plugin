@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -218,9 +219,16 @@ def _save_state(state: dict[str, Any]) -> None:
 
 
 def init_db() -> None:
+    paths.ensure_runtime_dirs()
+    migrated_paths = paths.migrate_legacy_exports()
     with _state_lock():
         if not _store_path().exists():
             _save_state(_default_state())
+        elif migrated_paths:
+            state = _load_state()
+            remapped = paths.remap_payload_paths(state, migrated_paths)
+            if remapped != state:
+                _save_state(remapped)
 
 
 def create_project(name: str, backend: str = "gsplat_colmap", note: str | None = None) -> dict[str, Any]:
@@ -497,7 +505,15 @@ def update_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
     return result
 
 
-def delete_project(project_id: str) -> bool:
+def delete_project(project_id: str, *, delete_files: bool = False) -> bool:
+    project_snapshot: dict[str, Any] | None = None
+    with _state_lock():
+        state = _load_state()
+        project_snapshot = dict(state["projects"].get(project_id) or {})
+        if not project_snapshot:
+            return False
+    if delete_files and project_snapshot:
+        _delete_project_files(project_snapshot)
     with _state_lock():
         state = _load_state()
         if project_id not in state["projects"]:
@@ -508,6 +524,134 @@ def delete_project(project_id: str) -> bool:
             del state["jobs"][jid]
         _save_state(state)
     return True
+
+
+def _delete_project_files(project: dict[str, Any]) -> None:
+    workspace_dir = Path(str(project.get("workspace_dir") or ""))
+    if workspace_dir.exists() and paths.is_within_dir(workspace_dir, paths.projects_root()):
+        _remove_path(workspace_dir)
+
+    scratch_dir = paths.project_scratch_dir(str(project.get("id") or ""))
+    if scratch_dir.exists() and paths.is_within_dir(scratch_dir, paths.scratch_root()):
+        _remove_path(scratch_dir)
+
+    for target in _project_export_targets(project):
+        if not target.exists():
+            continue
+        _remove_path(target)
+
+    _delete_latest_export_reference(str(project.get("id") or ""))
+
+
+def _project_export_targets(project: dict[str, Any]) -> list[Path]:
+    targets: list[Path] = []
+    seen: set[str] = set()
+
+    def add_target(path: Path | None) -> None:
+        if path is None:
+            return
+        key = str(path.resolve() if path.exists() else path).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(path)
+
+    manifest_value = str(project.get("last_manifest_path") or "").strip()
+    if manifest_value:
+        for target in _targets_from_manifest_path(Path(manifest_value)):
+            add_target(target)
+
+    for manifest_path in _find_project_export_manifests(str(project.get("id") or "")):
+        for target in _targets_from_manifest_path(manifest_path):
+            add_target(target)
+
+    return targets
+
+
+def _find_project_export_manifests(project_id: str) -> list[Path]:
+    if not project_id:
+        return []
+    manifests: list[Path] = []
+    seen: set[str] = set()
+    for root in paths.managed_export_roots():
+        if not root.exists():
+            continue
+        candidates = list(root.rglob("scene_manifest.json")) + list(root.glob("*_manifest.json"))
+        for manifest_path in candidates:
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            manifest_project_id = str(payload.get("project_id") or payload.get("projectId") or "").strip()
+            if manifest_project_id != project_id:
+                continue
+            key = str(manifest_path.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            manifests.append(manifest_path)
+    return manifests
+
+
+def _targets_from_manifest_path(manifest_path: Path) -> list[Path]:
+    parent = manifest_path.parent
+    if manifest_path.name.lower() == "scene_manifest.json" and _is_managed_export_container(parent):
+        return [parent]
+
+    if any(parent.resolve() == root.resolve() for root in paths.managed_export_roots() if root.exists()):
+        stem = manifest_path.stem
+        if stem.endswith("_manifest"):
+            stem = stem[: -len("_manifest")]
+        return [
+            parent / f"{stem}.ply",
+            parent / f"{stem}.compressed.ply",
+            parent / f"{stem}.gasp",
+            parent / f"{stem}.spz",
+            parent / f"{stem}.gspkg",
+            parent / f"{stem}_manifest.json",
+        ]
+
+    return []
+
+
+def _is_managed_export_container(path: Path) -> bool:
+    for root in paths.managed_export_roots():
+        if root.exists() and path != root and paths.is_within_dir(path, root):
+            return True
+    return False
+
+
+def _delete_latest_export_reference(project_id: str) -> None:
+    for latest_path in (paths.latest_export_path(), paths.bridge_latest_export_path()):
+        if not latest_path.exists():
+            continue
+        try:
+            payload = json.loads(latest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(payload.get("project_id") or "") != project_id:
+            continue
+        try:
+            latest_path.unlink()
+        except OSError:
+            pass
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=False, onerror=_retry_remove_with_chmod)
+        return
+    try:
+        path.unlink()
+    except PermissionError:
+        os.chmod(path, 0o666)
+        path.unlink()
+
+
+def _retry_remove_with_chmod(func, path, exc_info) -> None:
+    _error = exc_info[1]
+    os.chmod(path, 0o777)
+    func(path)
 
 
 def request_job_stop(job_id: str) -> None:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import traceback
@@ -14,12 +16,13 @@ from PIL import Image
 from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
 from . import paths, store
-from .gaussian_gasp import read_gaussian_gasp_metadata
+from .gaussian_gasp import export_ply_from_gaussian_gasp, read_gaussian_gasp_metadata, safe_export_stem
 from .native_preview import preview_runtime_available, preview_runtime_error
 from .pipeline import ensure_project_camera_manifests, ingest_media_sources, list_project_images
 from .ply import read_preview_points
 from .preview_scene import preview_scene_path
 from .scene_import import IMPORT_MODE_CONVERT, IMPORT_MODE_DIRECT, import_gaussian_scene_file
+from .sketchup_bridge import list_sessions as list_sketchup_sessions, request_import as request_sketchup_import
 from .splat_transform import snapshot_from_payload, snapshot_to_payload
 
 
@@ -234,15 +237,240 @@ class DeleteProjectDialog(ThemedDialog):
         self.header_badge.setStyleSheet("QFrame{background:rgba(244,63,94,0.12); border-radius:8px;}")
         self.set_header_icon("trash-2", "rose")
         message = QtWidgets.QLabel(
-            f'Are you sure you want to delete "{project_name}"? This removes the project entry but keeps files on disk.'
+            f'Are you sure you want to delete "{project_name}"?'
         )
         message.setWordWrap(True)
         message.setStyleSheet("font-size:13px; color:#A1A1AA;")
         self.body.insertWidget(0, message)
+        self.delete_files_checkbox = QtWidgets.QCheckBox("Delete project files too")
+        self.delete_files_checkbox.setStyleSheet(
+            "QCheckBox{color:#FAFAFA; font-size:13px; font-weight:600; spacing:10px;}"
+            "QCheckBox::indicator{width:18px; height:18px; border-radius:6px; border:1px solid rgba(255,255,255,0.16); background:#111116;}"
+            "QCheckBox::indicator:checked{background:#FF5400; border:1px solid #FF5400;}"
+        )
+        self.body.insertWidget(1, self.delete_files_checkbox)
+        detail = QtWidgets.QLabel(
+            "This also removes imported media, logs, intermediate training data, and managed PLY/GASP exports for this project."
+        )
+        detail.setWordWrap(True)
+        detail.setStyleSheet("font-size:12px; color:#71717A; padding-left:2px;")
+        self.body.insertWidget(2, detail)
         self.cancel_button = self.add_button("Cancel")
         self.delete_button = self.add_button("Delete", accent="danger")
         self.cancel_button.clicked.connect(self.reject)
         self.delete_button.clicked.connect(self.accept)
+
+    @property
+    def delete_files(self) -> bool:
+        return self.delete_files_checkbox.isChecked()
+
+
+class AlertDialog(ThemedDialog):
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        *,
+        tone: str = "accent",
+        icon_name: str = "alert-circle",
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(title, parent)
+        badge_styles = {
+            "accent": "QFrame{background:rgba(255,84,0,0.12); border-radius:8px;}",
+            "rose": "QFrame{background:rgba(244,63,94,0.12); border-radius:8px;}",
+            "green": "QFrame{background:rgba(22,199,132,0.12); border-radius:8px;}",
+            "cyan": "QFrame{background:rgba(0,240,255,0.12); border-radius:8px;}",
+        }
+        self.header_badge.setStyleSheet(badge_styles.get(tone, badge_styles["accent"]))
+        self.set_header_icon(icon_name, tone)
+        self.setMinimumWidth(520)
+
+        message_label = QtWidgets.QLabel(message)
+        message_label.setWordWrap(True)
+        message_label.setStyleSheet("font-size:13px; color:#E4E4E7; line-height:1.35;")
+        self.body.insertWidget(0, message_label)
+
+        accent = "danger" if tone == "rose" else "primary"
+        self.ok_button = self.add_button("OK", accent=accent)
+        self.ok_button.clicked.connect(self.accept)
+        self.set_initial_focus(self.ok_button)
+
+
+class SketchUpSessionOption(QtWidgets.QFrame):
+    activated = QtCore.Signal(str)
+
+    def __init__(self, session: dict[str, Any], parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.session = dict(session)
+        self._selected = False
+        self._hovered = False
+        self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.setObjectName("sketchupSessionOption")
+        self.setStyleSheet("QFrame#sketchupSessionOption{border:none; border-radius:12px;}")
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(12)
+
+        self.radio_outer = QtWidgets.QFrame()
+        self.radio_outer.setFixedSize(16, 16)
+        self.radio_outer.setStyleSheet("QFrame{border:1px solid #52525B; border-radius:8px; background:transparent;}")
+        radio_layout = QtWidgets.QVBoxLayout(self.radio_outer)
+        radio_layout.setContentsMargins(0, 0, 0, 0)
+        radio_layout.setSpacing(0)
+        self.radio_dot = QtWidgets.QFrame()
+        self.radio_dot.setFixedSize(8, 8)
+        self.radio_dot.setStyleSheet("QFrame{background:#FF5400; border:none; border-radius:4px;}")
+        self.radio_dot.hide()
+        radio_layout.addWidget(self.radio_dot, 0, QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.radio_outer, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        text_layout = QtWidgets.QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(4)
+        self.name_label = QtWidgets.QLabel(str(self.session.get("name") or "Untitled.skp"))
+        self.name_label.setStyleSheet("font-size:13px; font-weight:700; color:#D4D4D8;")
+        self.name_label.setWordWrap(False)
+        self.name_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        text_layout.addWidget(self.name_label)
+
+        self.desc_label = QtWidgets.QLabel(str(self.session.get("description") or "SketchUp"))
+        self.desc_label.setStyleSheet("font-size:10px; color:#71717A;")
+        text_layout.addWidget(self.desc_label)
+        layout.addLayout(text_layout, 1)
+
+        self.preview_label = QtWidgets.QLabel()
+        self.preview_label.setFixedSize(64, 44)
+        self.preview_label.setStyleSheet(
+            "QLabel{background:#050505; border:1px solid rgba(255,255,255,0.10); border-radius:8px;}"
+        )
+        self.preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.preview_label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        self._set_preview_pixmap()
+        self.set_selected(False)
+
+    @property
+    def session_id(self) -> str:
+        return str(self.session.get("id") or "")
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = bool(selected)
+        self._update_visuals()
+
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        self._hovered = True
+        self._update_visuals()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self._hovered = False
+        self._update_visuals()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.activated.emit(self.session_id)
+        super().mousePressEvent(event)
+
+    def _set_preview_pixmap(self) -> None:
+        preview_path = str(self.session.get("preview_path") or "")
+        if preview_path and Path(preview_path).exists():
+            pixmap = QtGui.QPixmap(preview_path)
+            if not pixmap.isNull():
+                self.preview_label.setPixmap(
+                    pixmap.scaled(
+                        self.preview_label.size(),
+                        QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        QtCore.Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                return
+        fallback = QtGui.QPixmap(self.preview_label.size())
+        fallback.fill(QtGui.QColor("#050505"))
+        painter = QtGui.QPainter(fallback)
+        painter.fillRect(fallback.rect(), QtGui.QColor("#0B0B0F"))
+        painter.setPen(QtGui.QColor("#27272A"))
+        painter.drawRect(fallback.rect().adjusted(0, 0, -1, -1))
+        icon_path = Path(__file__).resolve().parent / "assets" / "icons_png" / "box-muted.png"
+        if icon_path.exists():
+            icon = QtGui.QPixmap(str(icon_path)).scaled(
+                18,
+                18,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (fallback.width() - icon.width()) // 2
+            y = (fallback.height() - icon.height()) // 2
+            painter.drawPixmap(x, y, icon)
+        painter.end()
+        self.preview_label.setPixmap(fallback)
+
+    def _update_visuals(self) -> None:
+        if self._selected:
+            self.setStyleSheet(
+                "QFrame#sketchupSessionOption{background:rgba(255,84,0,0.10); border:1px solid rgba(255,84,0,0.50); border-radius:12px;}"
+            )
+            self.radio_outer.setStyleSheet("QFrame{border:1px solid #FF5400; border-radius:8px; background:transparent;}")
+            self.radio_dot.show()
+            self.name_label.setStyleSheet("font-size:13px; font-weight:700; color:#FFFFFF;")
+            return
+        border = "rgba(255,255,255,0.18)" if self._hovered else "rgba(255,255,255,0.06)"
+        self.setStyleSheet(
+            f"QFrame#sketchupSessionOption{{background:rgba(255,255,255,0.02); border:1px solid {border}; border-radius:12px;}}"
+        )
+        self.radio_outer.setStyleSheet("QFrame{border:1px solid #52525B; border-radius:8px; background:transparent;}")
+        self.radio_dot.hide()
+        self.name_label.setStyleSheet("font-size:13px; font-weight:700; color:#D4D4D8;")
+
+
+class SketchUpSessionDialog(ThemedDialog):
+    def __init__(self, sessions: list[dict[str, Any]], parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__("Target SketchUp Instance", parent)
+        self.setMinimumWidth(430)
+        self.header_badge.setStyleSheet("QFrame{background:rgba(255,84,0,0.12); border-radius:8px;}")
+        self.set_header_icon("box", "accent")
+        self._sessions = [dict(session) for session in sessions]
+        self.selected_session_id = str((self._sessions[0] if self._sessions else {}).get("id") or "")
+        self._options: list[SketchUpSessionOption] = []
+
+        subtitle = QtWidgets.QLabel(
+            "Select the open SketchUp project to receive the trained splat geometry."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("font-size:12px; color:#A1A1AA; line-height:1.35;")
+        self.body.insertWidget(0, subtitle)
+
+        options_box = QtWidgets.QVBoxLayout()
+        options_box.setContentsMargins(0, 0, 0, 0)
+        options_box.setSpacing(10)
+        for session in self._sessions:
+            option = SketchUpSessionOption(session, self)
+            option.activated.connect(self._select_session)
+            options_box.addWidget(option)
+            self._options.append(option)
+        self.body.insertLayout(1, options_box)
+
+        self.cancel_button = self.add_button("Cancel")
+        self.export_button = self.add_button("Start Export", accent="primary")
+        self.cancel_button.clicked.connect(self.reject)
+        self.export_button.clicked.connect(self.accept)
+        self._select_session(self.selected_session_id)
+        self.set_initial_focus(self.export_button)
+
+    @property
+    def selected_session(self) -> dict[str, Any] | None:
+        for session in self._sessions:
+            if str(session.get("id") or "") == self.selected_session_id:
+                return dict(session)
+        return None
+
+    def _select_session(self, session_id: str) -> None:
+        self.selected_session_id = str(session_id or "")
+        for option in self._options:
+            option.set_selected(option.session_id == self.selected_session_id)
+        self.export_button.setEnabled(bool(self.selected_session_id))
 
 
 class SplatImportModeDialog(ThemedDialog):
@@ -767,6 +995,10 @@ class QtStateController(QtCore.QObject):
         self._menu_close_timer.setSingleShot(True)
         self._menu_close_timer.setInterval(160)
         self._menu_close_timer.timeout.connect(self._close_menus_if_pointer_outside)
+        self._sketchup_export_state = "idle"
+        self._sketchup_export_reset_timer = QtCore.QTimer(self)
+        self._sketchup_export_reset_timer.setSingleShot(True)
+        self._sketchup_export_reset_timer.timeout.connect(self._reset_sketchup_export_state)
         self.refresh()
 
     @QtCore.Property("QVariantMap", notify=stateChanged)
@@ -935,8 +1167,8 @@ class QtStateController(QtCore.QObject):
             return
 
         export_menu = [
-            self._menu_item("Export as .ply", icon="download"),
-            self._menu_item("Export to SketchUp", icon="arrow-up-right"),
+            self._menu_item("Export as .ply", icon="download", action="exportPly"),
+            self._menu_item("Export to SketchUp", icon="arrow-up-right", action="exportSketchUp"),
             self._menu_separator(),
             self._menu_item("Export Sequence", icon="film"),
         ]
@@ -1025,6 +1257,14 @@ class QtStateController(QtCore.QObject):
         if action_key == "redoPreviewTransform":
             self.closeAllMenus()
             self.redoPreviewTransform()
+            return
+        if action_key == "exportPly":
+            self.closeAllMenus()
+            self.exportLatestPlyFile()
+            return
+        if action_key == "exportSketchUp":
+            self.closeAllMenus()
+            self.exportDirectlyToSketchUp()
             return
         self.closeAllMenus()
 
@@ -1191,11 +1431,19 @@ class QtStateController(QtCore.QObject):
     def showDeleteDialog(self, project_id: str, project_name: str) -> None:
         dialog = DeleteProjectDialog(project_name, self._app_window())
         if dialog.run() == QtWidgets.QDialog.DialogCode.Accepted:
-            self.deleteProject(project_id)
+            self.deleteProject(project_id, dialog.delete_files)
 
-    @QtCore.Slot(str)
-    def deleteProject(self, project_id: str) -> None:
-        store.delete_project(project_id)
+    @QtCore.Slot(str, bool)
+    def deleteProject(self, project_id: str, delete_files: bool = False) -> None:
+        try:
+            store.delete_project(project_id, delete_files=bool(delete_files))
+        except Exception as error:
+            self._show_alert(
+                "Delete failed",
+                f"{type(error).__name__}: {error}",
+                tone="rose",
+            )
+            return
         if self._active_project_id == project_id:
             self._active_project_id = None
         self.closeDialog()
@@ -1203,6 +1451,37 @@ class QtStateController(QtCore.QObject):
     @QtCore.Slot()
     def closeDialog(self) -> None:
         self._state["dialog"] = {"kind": "none", "projectId": "", "projectName": ""}
+        self.refresh()
+
+    def _show_alert(
+        self,
+        title: str,
+        message: str,
+        *,
+        tone: str = "accent",
+        icon_name: str = "alert-circle",
+    ) -> None:
+        dialog = AlertDialog(
+            title,
+            message,
+            tone=tone,
+            icon_name=icon_name,
+            parent=self._app_window(),
+        )
+        dialog.run()
+
+    def _set_sketchup_export_state(self, state: str, *, auto_reset_ms: int | None = None) -> None:
+        self._sketchup_export_reset_timer.stop()
+        self._sketchup_export_state = state
+        self.refresh()
+        QtWidgets.QApplication.processEvents()
+        if auto_reset_ms and state != "loading":
+            self._sketchup_export_reset_timer.start(int(auto_reset_ms))
+
+    def _reset_sketchup_export_state(self) -> None:
+        if self._sketchup_export_state == "idle":
+            return
+        self._sketchup_export_state = "idle"
         self.refresh()
 
     @QtCore.Slot()
@@ -1240,10 +1519,10 @@ class QtStateController(QtCore.QObject):
             result = import_gaussian_scene_file(filename, mode=mode)
         except Exception as error:
             traceback.print_exc()
-            QtWidgets.QMessageBox.warning(
-                self._app_window(),
+            self._show_alert(
                 "Import failed",
                 f"{type(error).__name__}: {error}",
+                tone="rose",
             )
             return
         self._active_project_id = result["project"]["id"]
@@ -1322,11 +1601,10 @@ class QtStateController(QtCore.QObject):
         self.refresh()
 
     def _show_training_start_error(self, error: Exception) -> None:
-        parent = self._app_window()
-        QtWidgets.QMessageBox.warning(
-            parent,
+        self._show_alert(
             "Training could not start",
             f"{type(error).__name__}: {error}",
+            tone="rose",
         )
 
     @staticmethod
@@ -1361,8 +1639,138 @@ class QtStateController(QtCore.QObject):
         if not self._active_project_id:
             return
         project = store.get_project(self._active_project_id)
-        if project and project.get("last_manifest_path"):
-            os.startfile(Path(project["last_manifest_path"]).parent)  # type: ignore[attr-defined]
+        if not project:
+            return
+        assets = self._latest_export_assets(project)
+        export_dir = assets.get("export_dir")
+        if isinstance(export_dir, Path) and export_dir.exists():
+            os.startfile(export_dir)  # type: ignore[attr-defined]
+            return
+        self._show_alert(
+            "No export folder",
+            "Run training first so the companion app can generate an export folder.",
+            tone="accent",
+        )
+
+    @QtCore.Slot()
+    def exportLatestPlyFile(self) -> None:
+        if not self._active_project_id:
+            return
+        project = store.get_project(self._active_project_id)
+        if not project:
+            return
+
+        assets = self._latest_export_assets(project)
+        source_ply = assets.get("scene_ply")
+        source_gasp = assets.get("scene_gasp")
+        if not isinstance(source_ply, Path):
+            source_ply = None
+        if not isinstance(source_gasp, Path):
+            source_gasp = None
+        if (source_ply is None or not source_ply.exists()) and (source_gasp is None or not source_gasp.exists()):
+            self._show_alert(
+                "No export yet",
+                "Run training first so the companion app can generate a PLY export.",
+                tone="accent",
+            )
+            return
+
+        default_dir = assets.get("export_dir") if isinstance(assets.get("export_dir"), Path) else paths.exports_root()
+        default_name = f"{safe_export_stem(project.get('name'))}.ply"
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self._app_window(),
+            "Export PLY",
+            str(default_dir / default_name),
+            "Gaussian PLY (*.ply);;All files (*.*)",
+        )
+        if not filename:
+            return
+
+        destination = Path(filename)
+        if destination.suffix.lower() != ".ply":
+            destination = destination.with_suffix(".ply")
+
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source_ply is not None and source_ply.exists():
+                if source_ply.resolve() != destination.resolve():
+                    shutil.copy2(source_ply, destination)
+            else:
+                assert source_gasp is not None
+                export_ply_from_gaussian_gasp(source_gasp, destination)
+        except Exception as error:
+            self._show_alert(
+                "PLY export failed",
+                f"{type(error).__name__}: {error}",
+                tone="rose",
+            )
+            return
+
+        self._show_alert(
+            "PLY exported",
+            f"Saved to:\n{destination}",
+            tone="green",
+            icon_name="check-circle-2",
+        )
+
+    @QtCore.Slot()
+    def exportDirectlyToSketchUp(self) -> None:
+        if not self._active_project_id:
+            return
+        if self._sketchup_export_state == "loading":
+            return
+        project = store.get_project(self._active_project_id)
+        if not project:
+            return
+
+        assets = self._latest_export_assets(project)
+        source_gasp = assets.get("scene_gasp")
+        if not isinstance(source_gasp, Path) or not source_gasp.exists():
+            self._show_alert(
+                "No GASP export yet",
+                "Run training first so the companion app can generate a GASP file for SketchUp.",
+                tone="accent",
+            )
+            return
+
+        sessions = list_sketchup_sessions()
+        if not sessions:
+            self._set_sketchup_export_state("failed")
+            self._show_alert(
+                "No SketchUp windows",
+                "No open SketchUp projects were found. Open a SketchUp project and make sure the Gaussian Points plugin is loaded.",
+                tone="rose",
+            )
+            self._reset_sketchup_export_state()
+            return
+
+        session_id: str | None = None
+        if len(sessions) > 1:
+            dialog = SketchUpSessionDialog(sessions, self._app_window())
+            if dialog.run() != QtWidgets.QDialog.DialogCode.Accepted or not dialog.selected_session_id:
+                self._reset_sketchup_export_state()
+                return
+            session_id = dialog.selected_session_id
+        else:
+            session_id = str(sessions[0].get("id") or "")
+
+        self._set_sketchup_export_state("loading")
+        ok, message = request_sketchup_import(
+            source_gasp,
+            session_id=session_id,
+            scene_name=f"{project.get('name') or source_gasp.stem}.gasp",
+            process_events=lambda: QtWidgets.QApplication.processEvents(),
+        )
+        if ok:
+            self._set_sketchup_export_state("success", auto_reset_ms=2500)
+            return
+        self._set_sketchup_export_state("failed")
+        self._show_alert(
+            "SketchUp export failed",
+            message,
+            tone="rose",
+        )
+        self._reset_sketchup_export_state()
 
     @QtCore.Slot()
     def openDataFolder(self) -> None:
@@ -1414,11 +1822,16 @@ class QtStateController(QtCore.QObject):
         train_metrics = training_summary.get("metrics") or {}
         validation_metrics = training_summary.get("validation_metrics") or {}
         diagnostics = training_summary.get("dataset_diagnostics") or {}
+        assets = self._latest_export_assets(project)
+        export_dir = assets.get("export_dir") if isinstance(assets.get("export_dir"), Path) else None
+        export_folder = str(export_dir or paths.exports_root())
         properties = [
             {"label": "Source Directory", "value": project["workspace_dir"], "copyable": True},
             {"label": "Image Count", "value": f"{len(images)} Frames"},
             {"label": "Resolution", "value": resolution},
         ]
+        if export_dir is not None:
+            properties.append({"label": "Export Folder", "value": export_folder, "copyable": True})
         if int(import_aggregate.get("source_videos") or 0) > 0:
             properties.append({"label": "Video Sources", "value": str(int(import_aggregate["source_videos"]))})
             properties.append(
@@ -1471,7 +1884,15 @@ class QtStateController(QtCore.QObject):
             "preview": preview,
             "statusPanel": {"progress": percent, "progressLabel": f"{percent}%", "statusText": latest["status"].capitalize() if latest else "Ready", "stage": latest["stage"] if latest else "Ready", "timeTotal": self._job_duration(latest), "finalLoss": last_loss},
             "propertiesPanel": {"items": properties},
-            "exportPanel": {"body": "Trained splats are compiled and ready. Choose a destination format to export the geometry." if project.get("last_manifest_path") else "Run a project first to generate the exported splat package."},
+            "exportPanel": {
+                "body": (
+                    f"Final PLY/GASP files are stored in:\n{export_folder}\n\n"
+                    "Use Export to .ply file to save a copy anywhere you want."
+                    if export_dir is not None
+                    else "Run a project first to generate the exported splat package."
+                ),
+                "sketchupState": self._sketchup_export_state,
+            },
             "logs": logs,
             "liveMonitor": live_monitor,
             "consoleRows": self._console_rows(logs),
@@ -1488,6 +1909,53 @@ class QtStateController(QtCore.QObject):
                 ),
                 "url": video_tile_url,
             },
+        }
+
+    def _latest_export_assets(self, project: dict[str, Any]) -> dict[str, Any]:
+        manifest_path = Path(str(project.get("last_manifest_path") or "")).expanduser() if project.get("last_manifest_path") else None
+        manifest_payload: dict[str, Any] = {}
+        if manifest_path is not None and manifest_path.exists():
+            try:
+                manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest_payload = {}
+
+        def pick_path(*values: Any) -> Path | None:
+            for value in values:
+                text = str(value or "").strip()
+                if not text:
+                    continue
+                candidate = Path(text).expanduser()
+                if candidate.exists():
+                    return candidate
+            return None
+
+        sketchup_import = manifest_payload.get("sketchup_import") if isinstance(manifest_payload.get("sketchup_import"), dict) else {}
+        scene_ply = pick_path(
+            manifest_payload.get("scene_ply"),
+            manifest_payload.get("workspace_scene_ply"),
+            project.get("last_result_ply"),
+        )
+        scene_gasp = pick_path(
+            manifest_payload.get("scene_gasp"),
+            sketchup_import.get("source_gasp"),
+            manifest_payload.get("workspace_scene_gasp"),
+            project.get("last_result_gasp"),
+        )
+        export_dir = None
+        if manifest_path is not None and manifest_path.exists():
+            export_dir = manifest_path.parent
+        elif scene_gasp is not None:
+            export_dir = scene_gasp.parent
+        elif scene_ply is not None:
+            export_dir = scene_ply.parent
+
+        return {
+            "manifest_path": manifest_path,
+            "manifest": manifest_payload,
+            "scene_ply": scene_ply,
+            "scene_gasp": scene_gasp,
+            "export_dir": export_dir,
         }
 
     def _preview_payload(self, project: dict[str, Any], latest: dict[str, Any] | None, images: list[Path]) -> dict[str, Any]:

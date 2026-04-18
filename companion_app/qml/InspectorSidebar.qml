@@ -21,6 +21,7 @@ Rectangle {
     readonly property bool consoleRunning: !!detail.consoleRunning
     readonly property string liveState: liveMonitor.state || "idle"
     readonly property string liveLabel: liveMonitor.label || liveLabelFallback(liveState)
+    readonly property string sketchUpExportState: exportPanel.sketchupState || "idle"
     property int currentTab: 0
 
     function liveLabelFallback(state) {
@@ -57,6 +58,27 @@ Rectangle {
         if (state === "stale") return "#40FBBF24"
         if (state === "silent" || state === "failed") return "#4DFB7185"
         return "#26FFFFFF"
+    }
+
+    function sketchUpExportLabel(state) {
+        if (state === "loading") return "Processing..."
+        if (state === "success") return "Export Complete"
+        if (state === "failed") return "Export Failed"
+        return "Export directly to SketchUp"
+    }
+
+    function sketchUpExportIcon(state) {
+        if (state === "loading") return "loader-2"
+        if (state === "success") return "check-circle-2"
+        if (state === "failed") return "alert-triangle"
+        return "arrow-up-right"
+    }
+
+    function sketchUpExportIconTone(state) {
+        if (state === "loading") return "accent"
+        if (state === "success") return "green"
+        if (state === "failed") return "rose"
+        return "white"
     }
 
     ColumnLayout {
@@ -371,6 +393,7 @@ Rectangle {
                     }
 
                     Item {
+                        id: exportPanelCard
                         Layout.fillWidth: true
                         implicitHeight: exportCol.implicitHeight + 40
                         property bool exportHovered: false
@@ -417,7 +440,7 @@ Rectangle {
                             color: "#751E1618"
                             border.color: "#14FFFFFF"
                             border.width: 1
-                            visible: false
+                            visible: true
                             layer.enabled: true
 
                             ColumnLayout {
@@ -444,51 +467,142 @@ Rectangle {
                                     Layout.bottomMargin: 4
                                 }
 
-                                Repeater {
-                                    model: [
-                                        { text: "Export to .ply file", accent: false, icon: "download" },
-                                        { text: "Export directly to SketchUp", accent: true, icon: "arrow-up-right" }
-                                    ]
-                                    delegate: Rectangle {
-                                        required property var modelData
-                                        property bool btnHovered: false
-                                        radius: 10
-                                        color: modelData.accent ? "transparent" : btnHovered ? "#14FFFFFF" : "#06FFFFFF"
-                                        border.color: modelData.accent ? "transparent" : btnHovered ? "#33FFFFFF" : "#0DFFFFFF"
-                                        border.width: 1
-                                        implicitHeight: 38
-                                        Layout.fillWidth: true
-                                        opacity: ((detail.toolbar || {}).canExport) ? 1.0 : 0.45
-                                        Behavior on color { ColorAnimation { duration: 200 } }
-                                        Behavior on border.color { ColorAnimation { duration: 200 } }
+                                Rectangle {
+                                    id: exportPlyButton
+                                    property bool btnHovered: false
+                                    radius: 10
+                                    color: btnHovered ? "#14FFFFFF" : "#06FFFFFF"
+                                    border.color: btnHovered ? "#33FFFFFF" : "#0DFFFFFF"
+                                    border.width: 1
+                                    implicitHeight: 38
+                                    Layout.fillWidth: true
+                                    opacity: ((detail.toolbar || {}).canExport) ? 1.0 : 0.45
+                                    Behavior on color { ColorAnimation { duration: 200 } }
+                                    Behavior on border.color { ColorAnimation { duration: 200 } }
 
-                                        gradient: Gradient {
-                                            orientation: Gradient.Horizontal
-                                            GradientStop { position: 0.0; color: modelData.accent ? (btnHovered ? "#FF6A22" : "#FF5400") : "transparent" }
-                                            GradientStop { position: 1.0; color: modelData.accent ? (btnHovered ? "#FF4AA0" : "#FF2E93") : "transparent" }
+                                    RowLayout {
+                                        anchors.centerIn: parent
+                                        spacing: 8
+                                        IconImage { iconName: "download"; tone: "muted"; iconSize: 16 }
+                                        Text {
+                                            text: "Export to .ply file"
+                                            color: "#FFFFFF"
+                                            font.pixelSize: 13
+                                            font.weight: 700
+                                            font.family: "Outfit"
+                                            verticalAlignment: Text.AlignVCenter
                                         }
+                                    }
 
-                                        RowLayout {
-                                            anchors.centerIn: parent
-                                            spacing: 8
-                                            IconImage { iconName: modelData.icon; tone: modelData.accent ? "white" : "muted"; iconSize: 16 }
-                                            Text {
-                                                text: modelData.text
-                                                color: "#FFFFFF"
-                                                font.pixelSize: 13
-                                                font.weight: 700
-                                                font.family: "Outfit"
-                                                verticalAlignment: Text.AlignVCenter
-                                            }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        enabled: ((detail.toolbar || {}).canExport)
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onEntered: parent.btnHovered = true
+                                        onExited: parent.btnHovered = false
+                                        onClicked: controller.exportLatestPlyFile()
+                                    }
+                                }
+
+                                Rectangle {
+                                    id: sketchUpExportButton
+                                    property bool btnHovered: false
+                                    property real shakeOffset: 0
+                                    property string exportState: root.sketchUpExportState
+                                    radius: 10
+                                    border.width: exportState === "idle" ? 0 : 1
+                                    border.color: exportState === "loading" ? "#1AFFFFFF"
+                                                                              : exportState === "success" ? "#4D16C784"
+                                                                              : exportState === "failed" ? "#4DFF2E93"
+                                                                              : "transparent"
+                                    implicitHeight: 42
+                                    Layout.fillWidth: true
+                                    opacity: ((detail.toolbar || {}).canExport)
+                                             ? ((sketchUpExportButton.exportState === "loading" || sketchUpExportButton.exportState === "success") ? 0.55 : 1.0)
+                                             : 0.45
+                                    transform: Translate { x: sketchUpExportButton.shakeOffset }
+                                    gradient: Gradient {
+                                        orientation: Gradient.Horizontal
+                                        GradientStop {
+                                            position: 0.0
+                                            color: sketchUpExportButton.exportState === "loading" ? "#0DFFFFFF"
+                                                                                                   : sketchUpExportButton.exportState === "success" ? "#3316C784"
+                                                                                                   : sketchUpExportButton.exportState === "failed" ? "#33F43F5E"
+                                                                                                   : sketchUpExportButton.btnHovered ? "#FF6A22" : "#FF5400"
                                         }
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            enabled: ((detail.toolbar || {}).canExport)
-                                            hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                                            onEntered: parent.btnHovered = true
-                                            onExited: parent.btnHovered = false
-                                            onClicked: controller.openExportFolder()
+                                        GradientStop {
+                                            position: 1.0
+                                            color: sketchUpExportButton.exportState === "loading" ? "#0DFFFFFF"
+                                                                                                   : sketchUpExportButton.exportState === "success" ? "#2216C784"
+                                                                                                   : sketchUpExportButton.exportState === "failed" ? "#22FF2E93"
+                                                                                                   : sketchUpExportButton.btnHovered ? "#FF4AA0" : "#FF2E93"
                                         }
+                                    }
+                                    Behavior on border.color { ColorAnimation { duration: 180 } }
+
+                                    onExportStateChanged: {
+                                        if (exportState === "failed") {
+                                            shakeAnim.restart()
+                                        }
+                                        if (exportState !== "loading") {
+                                            sketchUpIcon.rotation = 0
+                                        }
+                                    }
+
+                                    SequentialAnimation {
+                                        id: shakeAnim
+                                        running: false
+                                        NumberAnimation { target: sketchUpExportButton; property: "shakeOffset"; to: -4; duration: 45 }
+                                        NumberAnimation { target: sketchUpExportButton; property: "shakeOffset"; to: 4; duration: 70 }
+                                        NumberAnimation { target: sketchUpExportButton; property: "shakeOffset"; to: -3; duration: 60 }
+                                        NumberAnimation { target: sketchUpExportButton; property: "shakeOffset"; to: 3; duration: 55 }
+                                        NumberAnimation { target: sketchUpExportButton; property: "shakeOffset"; to: 0; duration: 45 }
+                                    }
+
+                                    RowLayout {
+                                        anchors.centerIn: parent
+                                        spacing: 8
+
+                                        IconImage {
+                                            id: sketchUpIcon
+                                            iconName: root.sketchUpExportIcon(sketchUpExportButton.exportState)
+                                            tone: root.sketchUpExportIconTone(sketchUpExportButton.exportState)
+                                            iconSize: 16
+                                            transformOrigin: Item.Center
+                                        }
+                                        NumberAnimation {
+                                            id: sketchUpLoadingSpin
+                                            target: sketchUpIcon
+                                            property: "rotation"
+                                            from: 0
+                                            to: 360
+                                            duration: 1000
+                                            loops: Animation.Infinite
+                                            easing.type: Easing.Linear
+                                            running: sketchUpExportButton.exportState === "loading"
+                                        }
+                                        Text {
+                                            text: root.sketchUpExportLabel(sketchUpExportButton.exportState)
+                                            color: sketchUpExportButton.exportState === "loading" ? "#D4D4D8"
+                                                                                                  : sketchUpExportButton.exportState === "success" ? "#86EFAC"
+                                                                                                  : sketchUpExportButton.exportState === "failed" ? "#FDA4AF"
+                                                                                                  : "#FFFFFF"
+                                            font.pixelSize: 13
+                                            font.weight: 700
+                                            font.family: "Outfit"
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        enabled: ((detail.toolbar || {}).canExport) && sketchUpExportButton.exportState === "idle"
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onEntered: parent.btnHovered = true
+                                        onExited: parent.btnHovered = false
+                                        onClicked: controller.exportDirectlyToSketchUp()
                                     }
                                 }
                             }
@@ -502,6 +616,7 @@ Rectangle {
                         }
 
                         OpacityMask {
+                            visible: false
                             anchors.fill: parent
                             source: exportContent
                             maskSource: exportMask
@@ -509,9 +624,10 @@ Rectangle {
 
                         MouseArea {
                             anchors.fill: parent
+                            acceptedButtons: Qt.NoButton
                             hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                            onEntered: exportHovered = true
-                            onExited: exportHovered = false
+                            onEntered: exportPanelCard.exportHovered = true
+                            onExited: exportPanelCard.exportHovered = false
                         }
                     }
                 }

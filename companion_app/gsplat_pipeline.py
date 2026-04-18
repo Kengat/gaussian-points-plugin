@@ -6709,6 +6709,7 @@ def _export_handoff(
 ) -> dict:
     _update(job["id"], "Exporting", 0.9, "Writing the trained splat project and SketchUp handoff package.")
     _log_line(job, "Starting final export handoff.")
+    created_at = store.utc_now()
     workspace_compressed_ply = Path(
         str(
             training_summary.pop(
@@ -6734,13 +6735,13 @@ def _export_handoff(
         extra_manifest={"bounds": bounds, "training_summary": training_summary},
     )
     export_stem = safe_export_stem(project["name"])
-    export_dir = paths.exports_root()
+    export_dir = paths.export_session_dir(project["name"], created_at)
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    exported_ply = export_dir / f"{export_stem}.ply"
-    exported_compressed_ply = export_dir / f"{export_stem}.compressed.ply"
-    exported_gasp = export_dir / f"{export_stem}.gasp"
-    exported_spz = export_dir / f"{export_stem}.spz"
+    exported_ply = export_dir / "scene.ply"
+    exported_compressed_ply = export_dir / "scene.compressed.ply"
+    exported_gasp = export_dir / "scene.gasp"
+    exported_spz = export_dir / "scene.spz"
     _update(job["id"], "Exporting", 0.93, "Copying export assets to the public exports folder.")
     _log_line(job, f"Copying export assets to {export_dir}.")
     shutil.copy2(workspace_gasp, exported_gasp)
@@ -6774,7 +6775,7 @@ def _export_handoff(
         "project_id": project["id"],
         "project_name": project["name"],
         "backend": project["backend"],
-        "created_at": store.utc_now(),
+        "created_at": created_at,
         "point_count": point_count,
         "scene_ply": str(exported_ply),
         "scene_compressed_ply": str(exported_compressed_ply) if exported_compressed_ply.exists() else None,
@@ -6795,20 +6796,20 @@ def _export_handoff(
         "training_summary_path": str(summary_path),
         "training_summary": summary_payload,
     }
-    manifest_path = export_dir / f"{export_stem}_manifest.json"
+    manifest_path = export_dir / "scene_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    package_path = export_dir / f"{export_stem}.gspkg"
+    package_path = export_dir / "scene_package.gspkg"
     _update(job["id"], "Exporting", 0.97, "Packaging final export bundle.")
     _log_line(job, f"Packaging final export bundle at {package_path}.")
     with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(exported_ply, arcname=f"{export_stem}.ply")
+        archive.write(exported_ply, arcname="scene.ply")
         if exported_compressed_ply.exists():
-            archive.write(exported_compressed_ply, arcname=f"{export_stem}.compressed.ply")
+            archive.write(exported_compressed_ply, arcname="scene.compressed.ply")
         if exported_spz.exists():
-            archive.write(exported_spz, arcname=f"{export_stem}.spz")
-        archive.write(exported_gasp, arcname=f"{export_stem}.gasp")
-        archive.write(manifest_path, arcname=f"{export_stem}_manifest.json")
+            archive.write(exported_spz, arcname="scene.spz")
+        archive.write(exported_gasp, arcname="scene.gasp")
+        archive.write(manifest_path, arcname="scene_manifest.json")
 
     paths.write_latest_export(
         {
