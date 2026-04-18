@@ -270,7 +270,46 @@
       const [sketchUpExportState, setSketchUpExportState] = useState('idle'); // idle, loading, success, failed
       const [selectedProcess, setSelectedProcess] = useState('skp1');
       const [exportErrorMsg, setExportErrorMsg] = useState(null);
+      const [lossHoverData, setLossHoverData] = useState(null);
       const logsEndRef = useRef(null);
+
+      const handleLossMouseMove = (e) => {
+        const svgPoints = [
+          {x: 0, y: 10, loss: 0.300}, {x: 5, y: 25, loss: 0.250}, {x: 10, y: 60, loss: 0.120},
+          {x: 15, y: 75, loss: 0.075}, {x: 20, y: 83, loss: 0.051}, {x: 25, y: 80, loss: 0.060},
+          {x: 30, y: 86, loss: 0.042}, {x: 35, y: 82, loss: 0.054}, {x: 40, y: 84, loss: 0.048},
+          {x: 45, y: 83, loss: 0.051}, {x: 50, y: 85, loss: 0.045}, {x: 55, y: 75, loss: 0.075},
+          {x: 60, y: 86, loss: 0.042}, {x: 65, y: 84, loss: 0.048}, {x: 70, y: 85, loss: 0.045},
+          {x: 75, y: 90, loss: 0.030}, {x: 80, y: 85, loss: 0.045}, {x: 85, y: 92, loss: 0.024},
+          {x: 90, y: 88, loss: 0.036}, {x: 95, y: 97, loss: 0.009}, {x: 100, y: 99, loss: 0.002}
+        ];
+        const rect = e.currentTarget.getBoundingClientRect();
+        const xCursor = e.clientX - rect.left;
+        const pct = Math.max(0, Math.min(1, xCursor / rect.width)) * 100;
+        
+        let loss = 0;
+        let yPos = 0;
+        for (let i = 0; i < svgPoints.length - 1; i++) {
+          if (pct >= svgPoints[i].x && pct <= svgPoints[i+1].x) {
+            const rangePct = (pct - svgPoints[i].x) / 5;
+            loss = svgPoints[i].loss + (svgPoints[i+1].loss - svgPoints[i].loss) * rangePct;
+            yPos = svgPoints[i].y + (svgPoints[i+1].y - svgPoints[i].y) * rangePct;
+            break;
+          }
+        }
+        
+        const totalMins = 80;
+        const curMins = Math.floor((pct/100) * totalMins);
+        const curH = Math.floor(curMins / 60);
+        const curM = (curMins % 60).toString().padStart(2, '0');
+
+        setLossHoverData({
+          xPct: pct,
+          yPct: yPos,
+          time: `${curH}h ${curM}m`,
+          loss: loss.toFixed(4)
+        });
+      };
 
       const getToolbarBtnClass = (id) => {
         const isActive = activeLeftTab === id;
@@ -1116,6 +1155,72 @@
                                   <div className="flex-1 py-1.5 text-center text-[10px] font-bold rounded bg-[#050505] text-zinc-600 border border-white/5 flex items-center justify-center gap-1">
                                     Lv 3
                                   </div>
+                               </div>
+                            </div>
+
+                            <div className="h-px w-full bg-white/5" />
+
+                            {/* Training Loss Graph */}
+                            <div>
+                               <div className="text-[10px] text-zinc-500 uppercase tracking-widest font-bold mb-3 flex items-center justify-between">
+                                  <span>Training Loss</span>
+                                  <span className="text-[#FF5400] flex items-center gap-1 font-mono"><TrendingUp className="w-3 h-3 transform rotate-180" /> 0.002 MIN</span>
+                               </div>
+                               <div 
+                                 className="h-28 bg-[#050505] shadow-inner border border-white/5 rounded-lg relative overflow-hidden flex items-end cursor-crosshair"
+                                 onMouseMove={handleLossMouseMove}
+                                 onMouseLeave={() => setLossHoverData(null)}
+                               >
+                                  {/* Grid lines */}
+                                  <div className="absolute inset-0 flex flex-col justify-between pointer-events-none py-2 px-0 opacity-20">
+                                    <div className="w-full h-px border-b border-dashed border-white/30 relative"><span className="absolute left-2 -top-1.5 text-[8px] font-mono text-white/50">0.30</span></div>
+                                    <div className="w-full h-px border-b border-dashed border-white/30 relative"><span className="absolute left-2 -top-1.5 text-[8px] font-mono text-white/50">0.15</span></div>
+                                    <div className="w-full h-px border-b border-dashed border-white/30 relative"><span className="absolute left-2 -top-1.5 text-[8px] font-mono text-white/50">0.00</span></div>
+                                  </div>
+                                  
+                                  {/* SVG Graph */}
+                                  <svg className="w-full h-full absolute inset-0 pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
+                                    <defs>
+                                      <linearGradient id="lossGradient" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="0%" stopColor="#FF5400" stopOpacity="0.3" />
+                                        <stop offset="100%" stopColor="#FF5400" stopOpacity="0.0" />
+                                      </linearGradient>
+                                    </defs>
+                                    <polygon 
+                                       points="0,10 5,25 10,60 15,75 20,83 25,80 30,86 35,82 40,84 45,83 50,85 55,75 60,86 65,84 70,85 75,90 80,85 85,92 90,88 95,97 100,99 100,100 0,100" 
+                                       fill="url(#lossGradient)" 
+                                    />
+                                    <polyline 
+                                       points="0,10 5,25 10,60 15,75 20,83 25,80 30,86 35,82 40,84 45,83 50,85 55,75 60,86 65,84 70,85 75,90 80,85 85,92 90,88 95,97 100,99" 
+                                       fill="none" 
+                                       stroke="#FF5400" 
+                                       strokeWidth="2" 
+                                       strokeLinejoin="round"
+                                       strokeLinecap="round"
+                                       vectorEffect="non-scaling-stroke"
+                                    />
+                                  </svg>
+                                  
+                                  {/* Hover indicator layer */}
+                                  {lossHoverData && (
+                                    <div className="absolute inset-0 pointer-events-none z-10 transition-opacity">
+                                        <div className="w-px h-full bg-[#FF5400]/50 absolute border-l border-dashed border-[#FF5400]/80" style={{left: `${lossHoverData.xPct}%`}}></div>
+                                        
+                                        <div 
+                                          className={`absolute top-2 flex flex-col text-[10px] font-mono font-bold text-white shadow-lg bg-[#0A0A0D]/90 border border-[#FF5400]/40 px-2 py-1.5 rounded-lg backdrop-blur ${lossHoverData.xPct > 80 ? 'right-auto -translate-x-[110%]' : 'translate-x-[10px]'}`} 
+                                          style={{left: `${lossHoverData.xPct}%`}}
+                                        >
+                                          <div className="text-[#FF5400] mb-0.5"><span className="text-zinc-500 font-sans text-[8px] uppercase tracking-wider mr-1">Loss</span>{lossHoverData.loss}</div>
+                                          <div className="text-zinc-300"><span className="text-zinc-500 font-sans text-[8px] uppercase tracking-wider mr-1">Time</span>{lossHoverData.time}</div>
+                                        </div>
+
+                                        {/* Indicator Dot */}
+                                        <div 
+                                          className="absolute w-2 h-2 rounded-full bg-white border-2 border-[#FF5400] transform -translate-x-1/2 -translate-y-1/2 shadow-[0_0_10px_#FF5400]" 
+                                          style={{left: `${lossHoverData.xPct}%`, top: `${lossHoverData.yPct}%`}}
+                                        ></div>
+                                    </div>
+                                  )}
                                </div>
                             </div>
 

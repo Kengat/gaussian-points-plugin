@@ -1824,16 +1824,33 @@ class QtStateController(QtCore.QObject):
         diagnostics = training_summary.get("dataset_diagnostics") or {}
         assets = self._latest_export_assets(project)
         export_dir = assets.get("export_dir") if isinstance(assets.get("export_dir"), Path) else None
-        export_folder = str(export_dir or paths.exports_root())
-        properties = [
+        export_folder = str(export_dir) if export_dir is not None else ""
+        basic_properties = [
             {"label": "Source Directory", "value": project["workspace_dir"], "copyable": True},
             {"label": "Image Count", "value": f"{len(images)} Frames"},
             {"label": "Resolution", "value": resolution},
         ]
+        properties = list(basic_properties)
+        workspace_rows: list[dict[str, Any]] = []
+        capture_rows = [
+            {"label": "Camera Setup", "value": camera, "icon": "camera", "tone": "muted"},
+        ]
+        quality_rows: list[dict[str, Any]] = []
+        summary_cards: list[dict[str, Any]] = []
         if export_dir is not None:
             properties.append({"label": "Export Folder", "value": export_folder, "copyable": True})
+            workspace_rows.append({"label": "Export Folder", "value": export_folder, "copyable": True, "icon": "download", "tone": "accent"})
         if int(import_aggregate.get("source_videos") or 0) > 0:
             properties.append({"label": "Video Sources", "value": str(int(import_aggregate["source_videos"]))})
+            capture_rows.append(
+                {
+                    "label": "Video Sources",
+                    "value": str(int(import_aggregate["source_videos"])),
+                    "icon": "film",
+                    "tone": "accent",
+                    "mono": True,
+                }
+            )
             properties.append(
                 {
                     "label": "Video Keyframes",
@@ -1841,6 +1858,18 @@ class QtStateController(QtCore.QObject):
                         f"{int(import_aggregate.get('video_selected_frames') or 0)} kept / "
                         f"{int(import_aggregate.get('video_candidate_frames') or 0)} candidates"
                     ),
+                }
+            )
+            capture_rows.append(
+                {
+                    "label": "Video Keyframes",
+                    "value": (
+                        f"{int(import_aggregate.get('video_selected_frames') or 0)} kept / "
+                        f"{int(import_aggregate.get('video_candidate_frames') or 0)} candidates"
+                    ),
+                    "icon": "film",
+                    "tone": "accent",
+                    "mono": True,
                 }
             )
             if import_aggregate.get("selected_overlap_mean") is not None:
@@ -1853,14 +1882,73 @@ class QtStateController(QtCore.QObject):
                         ),
                     }
                 )
+                capture_rows.append(
+                    {
+                        "label": "Keyframe Overlap",
+                        "value": (
+                            f"{float(import_aggregate['selected_overlap_mean']) * 100.0:.1f}% avg, "
+                            f"{float(import_aggregate.get('selected_overlap_min') or 0.0) * 100.0:.1f}% min"
+                        ),
+                        "icon": "users",
+                        "tone": "accent",
+                        "mono": True,
+                    }
+                )
         if train_metrics.get("psnr") is not None:
             properties.append({"label": "Train PSNR", "value": f"{float(train_metrics['psnr']):.3f}"})
+            quality_rows.append(
+                {
+                    "label": "Train PSNR",
+                    "value": f"{float(train_metrics['psnr']):.3f}",
+                    "icon": "activity",
+                    "tone": "muted",
+                    "mono": True,
+                }
+            )
         if validation_metrics.get("psnr") is not None:
             properties.append({"label": "Val PSNR", "value": f"{float(validation_metrics['psnr']):.3f}"})
+            quality_rows.append(
+                {
+                    "label": "Validation PSNR",
+                    "value": f"{float(validation_metrics['psnr']):.3f}",
+                    "icon": "activity",
+                    "tone": "cyan",
+                    "mono": True,
+                }
+            )
         if validation_metrics.get("ssim") is not None:
             properties.append({"label": "Val SSIM", "value": f"{float(validation_metrics['ssim']):.4f}"})
+            quality_rows.append(
+                {
+                    "label": "Validation SSIM",
+                    "value": f"{float(validation_metrics['ssim']):.4f}",
+                    "icon": "check-circle-2",
+                    "tone": "cyan",
+                    "mono": True,
+                }
+            )
         if diagnostics.get("quality_score") is not None:
             properties.append({"label": "Dataset Score", "value": f"{float(diagnostics['quality_score']):.1f}/100"})
+            score = max(0.0, min(float(diagnostics["quality_score"]) / 100.0, 1.0))
+            summary_cards.append(
+                {
+                    "label": "Dataset Score",
+                    "value": f"{float(diagnostics['quality_score']):.1f}",
+                    "unit": "/100",
+                    "progress": score,
+                    "icon": "activity",
+                    "tone": "cyan",
+                }
+            )
+            quality_rows.append(
+                {
+                    "label": "Dataset Score",
+                    "value": f"{float(diagnostics['quality_score']):.1f} / 100",
+                    "icon": "activity",
+                    "tone": "cyan",
+                    "mono": True,
+                }
+            )
         if diagnostics.get("selected_overlap_mean") is not None:
             properties.append(
                 {
@@ -1871,8 +1959,47 @@ class QtStateController(QtCore.QObject):
                     ),
                 }
             )
+            quality_rows.append(
+                {
+                    "label": "Dataset Overlap",
+                    "value": (
+                        f"{float(diagnostics['selected_overlap_mean']) * 100.0:.1f}% avg, "
+                        f"{float(diagnostics.get('selected_overlap_min') or 0.0) * 100.0:.1f}% min"
+                    ),
+                    "icon": "users",
+                    "tone": "accent",
+                    "mono": True,
+                }
+            )
         if diagnostics.get("registered_view_ratio") is not None:
             properties.append({"label": "Registered Views", "value": f"{float(diagnostics['registered_view_ratio']) * 100.0:.1f}%"})
+            registered_views = max(0.0, min(float(diagnostics["registered_view_ratio"]), 1.0))
+            summary_cards.append(
+                {
+                    "label": "Registered Views",
+                    "value": f"{registered_views * 100.0:.1f}",
+                    "unit": "%",
+                    "progress": registered_views,
+                    "icon": "camera",
+                    "tone": "accent",
+                }
+            )
+            quality_rows.append(
+                {
+                    "label": "Registered Views",
+                    "value": f"{registered_views * 100.0:.1f}%",
+                    "icon": "camera",
+                    "tone": "accent",
+                    "mono": True,
+                }
+            )
+        property_sections: list[dict[str, Any]] = []
+        if workspace_rows:
+            property_sections.append({"title": "Workspace", "rows": workspace_rows})
+        if capture_rows:
+            property_sections.append({"title": "Capture", "rows": capture_rows})
+        if quality_rows:
+            property_sections.append({"title": "Quality", "rows": quality_rows})
         first_video = import_videos[0] if import_videos else {}
         first_video_frame = (first_video.get("selected_frames") or [{}])[0] if first_video else {}
         video_tile_url = ""
@@ -1883,11 +2010,16 @@ class QtStateController(QtCore.QObject):
             "toolbar": {"canTrain": bool(images) and not (latest and latest["status"] == "running"), "canStop": bool(latest and latest["status"] == "running"), "canExport": bool(project.get("last_manifest_path"))},
             "preview": preview,
             "statusPanel": {"progress": percent, "progressLabel": f"{percent}%", "statusText": latest["status"].capitalize() if latest else "Ready", "stage": latest["stage"] if latest else "Ready", "timeTotal": self._job_duration(latest), "finalLoss": last_loss},
-            "propertiesPanel": {"items": properties},
+            "trainingLoss": self._loss_chart_payload(logs),
+            "propertiesPanel": {
+                "items": properties,
+                "basicItems": basic_properties,
+                "summaryCards": summary_cards,
+                "sections": property_sections,
+            },
             "exportPanel": {
                 "body": (
-                    f"Final PLY/GASP files are stored in:\n{export_folder}\n\n"
-                    "Use Export to .ply file to save a copy anywhere you want."
+                    "Trained splats are compiled and ready. Choose a destination format to export the geometry."
                     if export_dir is not None
                     else "Run a project first to generate the exported splat package."
                 ),
@@ -2020,6 +2152,89 @@ class QtStateController(QtCore.QObject):
     def _extract_last_loss(self, logs: str) -> str | None:
         matches = [line.split("loss=", 1)[1].split(",", 1)[0] for line in logs.splitlines() if "loss=" in line]
         return matches[-1] if matches else None
+
+    @staticmethod
+    def _format_loss_value(value: float, *, decimals: int | None = None) -> str:
+        if decimals is None:
+            if abs(value) >= 0.1:
+                decimals = 2
+            else:
+                decimals = 3
+        return f"{value:.{decimals}f}"
+
+    @staticmethod
+    def _downsample_series(items: list[dict[str, Any]], max_points: int) -> list[dict[str, Any]]:
+        if len(items) <= max_points:
+            return items
+        if max_points <= 2:
+            return [items[0], items[-1]]
+        sampled: list[dict[str, Any]] = []
+        last_index = -1
+        total = len(items) - 1
+        for step in range(max_points):
+            index = round(step * total / (max_points - 1))
+            if index == last_index:
+                continue
+            sampled.append(items[index])
+            last_index = index
+        if sampled[-1] is not items[-1]:
+            sampled[-1] = items[-1]
+        return sampled
+
+    def _loss_chart_payload(self, logs: str, *, max_points: int = 21) -> dict[str, Any]:
+        samples: list[dict[str, Any]] = []
+        for raw_line in logs.splitlines():
+            if "loss=" not in raw_line:
+                continue
+            match = re.search(r"loss=([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)", raw_line)
+            if not match:
+                continue
+            try:
+                value = float(match.group(1))
+            except ValueError:
+                continue
+            parsed = self._log_line_datetime(raw_line.strip())
+            samples.append(
+                {
+                    "value": value,
+                    "time": parsed.strftime("%H:%M:%S") if parsed is not None else "",
+                }
+            )
+
+        if not samples:
+            return {
+                "points": [],
+                "minValue": "--",
+                "topLabel": "--",
+                "midLabel": "--",
+                "bottomLabel": "--",
+            }
+
+        sampled = self._downsample_series(samples, max_points=max_points)
+        max_value = max(float(sample["value"]) for sample in sampled)
+        padded_top = max(max_value * 1.08, 0.001)
+        best_value = min(float(sample["value"]) for sample in samples)
+        points: list[dict[str, Any]] = []
+        denominator = max(1, len(sampled) - 1)
+        for index, sample in enumerate(sampled):
+            value = float(sample["value"])
+            points.append(
+                {
+                    "xPct": (index / denominator) * 100.0,
+                    "yPct": max(0.0, min(99.0, 100.0 - ((value / padded_top) * 100.0))),
+                    "loss": self._format_loss_value(value),
+                    "time": sample["time"] or f"Sample {index + 1}",
+                    "value": value,
+                }
+            )
+
+        return {
+            "points": points,
+            "minValue": self._format_loss_value(best_value),
+            "topLabel": self._format_loss_value(max_value, decimals=2),
+            "midLabel": self._format_loss_value(max_value / 2.0, decimals=2),
+            "bottomLabel": self._format_loss_value(0.0, decimals=2),
+        }
 
     def _log_line_datetime(self, line: str) -> datetime | None:
         if "Worker heartbeat:" in line:

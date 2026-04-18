@@ -9,6 +9,20 @@ from .qt_native_preview import NativePreviewHost
 from .splat_transform import snapshot_from_payload, snapshot_to_payload, snapshots_equal
 
 
+def _rounded_region(width: int, height: int, radius: float) -> QtGui.QRegion:
+    if width <= 0 or height <= 0:
+        return QtGui.QRegion()
+    bitmap = QtGui.QBitmap(width, height)
+    bitmap.fill(QtCore.Qt.GlobalColor.color0)
+    painter = QtGui.QPainter(bitmap)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(QtCore.Qt.PenStyle.NoPen)
+    painter.setBrush(QtCore.Qt.GlobalColor.color1)
+    painter.drawRoundedRect(QtCore.QRectF(0.5, 0.5, width - 1.0, height - 1.0), radius, radius)
+    painter.end()
+    return QtGui.QRegion(bitmap)
+
+
 class ViewportWidget(QtWidgets.QWidget):
     def __init__(self, controller: QtCore.QObject, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -36,7 +50,7 @@ class ViewportWidget(QtWidgets.QWidget):
         self._splat_value = self._make_value("#00F0FF")
         self._perf_value = self._make_value("#F4F4F5")
         hud_layout.addLayout(self._metric("Splats", self._splat_value))
-        hud_layout.addWidget(self._divider())
+        hud_layout.addSpacing(12)
         hud_layout.addLayout(self._metric("Performance", self._perf_value))
         self._last_fps = 0.0
         self._fps_timer = QtCore.QTimer(self)
@@ -143,6 +157,7 @@ class ViewportWidget(QtWidgets.QWidget):
         self._host.setGeometry(preview_rect)
         self._placeholder.setGeometry(preview_rect)
         self._hud.adjustSize()
+        self._apply_overlay_masks()
         self._hud.move(28, 28)
         self._fit_button.move(self.width() - self._fit_button.width() - 28, 28)
         footer_width = max(160, self.width() - 56)
@@ -185,7 +200,7 @@ class ViewportWidget(QtWidgets.QWidget):
 
     def _make_value(self, color: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel("0.0 FPS" if color == "#F4F4F5" else "0")
-        label.setStyleSheet(f"color:{color};")
+        label.setStyleSheet(f"color:{color}; background:transparent; border:none;")
         font = self._mono_font(14, 600)
         label.setFont(font)
         return label
@@ -206,7 +221,7 @@ class ViewportWidget(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         title_label = QtWidgets.QLabel(title.upper())
-        title_label.setStyleSheet("color:#71717A; letter-spacing:1.5px;")
+        title_label.setStyleSheet("color:#71717A; letter-spacing:1.5px; background:transparent; border:none;")
         font = self._mono_font(9, 800)
         title_label.setFont(font)
         layout.addWidget(title_label)
@@ -219,12 +234,6 @@ class ViewportWidget(QtWidgets.QWidget):
         font.setWeight(QtGui.QFont.Weight(weight))
         return font
 
-    def _divider(self) -> QtWidgets.QFrame:
-        divider = QtWidgets.QFrame()
-        divider.setFrameShape(QtWidgets.QFrame.Shape.VLine)
-        divider.setStyleSheet("color:rgba(255,255,255,0.08);")
-        return divider
-
     def _button_css(self) -> str:
         return (
             "QPushButton{background:rgba(16,16,22,0.60); border:1px solid rgba(255,255,255,0.08);"
@@ -234,6 +243,10 @@ class ViewportWidget(QtWidgets.QWidget):
 
     def _asset(self, name: str) -> str:
         return str(Path(__file__).resolve().parent / "assets" / "icons_png" / name)
+
+    def _apply_overlay_masks(self) -> None:
+        self._hud.setMask(_rounded_region(self._hud.width(), self._hud.height(), 12.0))
+        self._fit_button.setMask(_rounded_region(self._fit_button.width(), self._fit_button.height(), 12.0))
 
     def _persist_snapshot(self, snapshot: dict[str, object] | None) -> bool:
         if snapshot is None or not self._current_project_id or not self._current_scene_path:
